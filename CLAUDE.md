@@ -51,7 +51,7 @@ python scripts/susep_harvest.py --all-versions # full version history
 python scripts/susep_harvest.py --limit 5      # smoke test
 ```
 
-**Scripts use paths relative to `scripts/`** (e.g. `--out` defaults to `../data/corpus`, manifest at `../data/corpus/corpus_manifest.json`). Run them from inside `scripts/`, or pass absolute `--out`/`--index-cache`, otherwise output lands outside the repo.
+**Script defaults are anchored to the repo root** via `Path(__file__).resolve().parent.parent`, so they read/write `data/corpus/` correctly regardless of CWD (run them from anywhere; override with `--out`/`--index-cache`).
 
 **The PDFs are gitignored** (`data/corpus/*.pdf`) — large and public. Only `corpus_manifest.json` is committed; it records per-version provenance (process, internal id, insurer, CNPJ, url, sha256, dates, `has_text`) and lets anyone re-download and verify the corpus by hash. The download endpoint keys on an **internal numeric id**, while the index keys on **process number** (`15414.NNNNNN/AAAA-DD`) — bridging the two is what the resolve step does.
 

@@ -19,8 +19,10 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-MANIFEST = Path("../data/corpus/corpus_manifest.json")
-OUT = Path("../data/pilot_extraction.json")
+# Ancorado na raiz do repo (scripts/..), pra funcionar de qualquer CWD.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+MANIFEST = REPO_ROOT / "data" / "corpus" / "corpus_manifest.json"
+OUT = REPO_ROOT / "data" / "pilot_extraction.json"
 
 # Coberturas lidas do texto das CGs. franquia_tipo/base_calculo refletem o que a
 # CG DIZ — o valor numérico em si é "definido na apólice" (não está na CG).
@@ -69,7 +71,16 @@ EXTRACAO = {
 
 
 def main():
+    if not MANIFEST.exists():
+        raise SystemExit(
+            f"manifesto ausente: {MANIFEST}\n"
+            "Rode o harvester primeiro: python scripts/susep_harvest.py")
     manifest = {d["id"]: d for d in json.loads(MANIFEST.read_text())["documentos"]}
+    faltando = [did for did in EXTRACAO if did not in manifest]
+    if faltando:
+        raise SystemExit(
+            f"ids do piloto ausentes no manifesto: {faltando}\n"
+            f"Garanta que o harvester baixou esses processos (sem --limit que os exclua).")
     docs, coverages = [], []
     for did, ext in EXTRACAO.items():
         m = manifest[did]

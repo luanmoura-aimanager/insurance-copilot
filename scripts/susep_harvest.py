@@ -64,6 +64,9 @@ DOWNLOAD = ("https://www2.susep.gov.br/safe/menumercado/REP2/"
 
 RAMO_RESIDENCIAL = "01 | COMPREENSIVO RESIDENCIAL"
 
+# Defaults ancorados na raiz do repo (scripts/..), pra funcionar de qualquer CWD.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
 HEADERS = {"User-Agent": "insurance-copilot-research/0.1 (corpus SUSEP residencial; contato: luanmisaelmoura@gmail.com)"}
 RATE_LIMIT_SECONDS = 1.0          # 1 req/s global (educado)
 SCAN_TEXT_THRESHOLD = 300         # < isso de texto extraído => provável scan/OCR
@@ -251,8 +254,10 @@ def analisar_pdf(pdf_bytes, max_pages=5):
 # ---- main --------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description="Harvester SUSEP — seguro residencial")
-    ap.add_argument("--out", default="../data/corpus", help="pasta dos PDFs + manifesto")
-    ap.add_argument("--index-cache", default="../data/index/dados_produtos.json")
+    ap.add_argument("--out", default=str(REPO_ROOT / "data" / "corpus"),
+                    help="pasta dos PDFs + manifesto")
+    ap.add_argument("--index-cache",
+                    default=str(REPO_ROOT / "data" / "index" / "dados_produtos.json"))
     ap.add_argument("--refresh-index", action="store_true", help="rebaixa o índice OData")
     ap.add_argument("--all-versions", action="store_true",
                     help="baixa todas as versões (padrão: só a vigente por processo)")

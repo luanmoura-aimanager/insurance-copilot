@@ -112,7 +112,8 @@ def main():
                     help="amostra aleatória dentro de [start, start+span]")
     ap.add_argument("--ids", type=str, default=None,
                     help="lista de IDs específicos separados por vírgula (ignora start/count)")
-    ap.add_argument("--out", type=str, default="../data/corpus",
+    ap.add_argument("--out", type=str,
+                    default=str(Path(__file__).resolve().parent.parent / "data" / "corpus"),
                     help="pasta pra salvar os PDFs residenciais")
     ap.add_argument("--save-residencial", action="store_true",
                     help="salvar os PDFs classificados como residencial")
