@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/pip install *)",
+      "Bash(gh auth *)",
+      "Bash(gh --version)",
+      "Bash(gh repo *)",
+      "Bash(git ls-remote *)",
+      "Bash(git checkout *)",
+      "Bash(git add *)"
+    ]
+  }
+}

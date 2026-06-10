@@ -1,0 +1,160 @@
+{
+  "policy_document": [
+    {
+      "id": 482868,
+      "seguradora": "PORTO SEGURO COMPANHIA DE SEGUROS GERAIS",
+      "produto": "Porto Seguro Residência (Residencial Fácil)",
+      "susep_processo": "15414.100639/2004-31",
+      "versao_vigencia": "05/12/2025",
+      "tipo_imovel": [
+        "habitual",
+        "veraneio"
+      ],
+      "pdf_url": "https://www2.susep.gov.br/safe/menumercado/REP2/Produto.aspx/DownloadConsultaPublica/482868",
+      "pdf_hash": "fdb4f3063af02fe79b5e9d273abe0932b3e969a5cd53d4f6d943b98f537e505b",
+      "extracted_at": "2026-06-09T18:10:13.176013+00:00"
+    },
+    {
+      "id": 502775,
+      "seguradora": "ALLIANZ SEGUROS S.A.",
+      "produto": "Allianz Coletivo Patrimonial – Residência",
+      "susep_processo": "15414.002283/2007-14",
+      "versao_vigencia": "12/03/2026",
+      "tipo_imovel": [
+        "habitual"
+      ],
+      "pdf_url": "https://www2.susep.gov.br/safe/menumercado/REP2/Produto.aspx/DownloadConsultaPublica/502775",
+      "pdf_hash": "d0bedfc501d2b8224ee8c7f494bb7f84b58649b537edb115edbe70a27371d688",
+      "extracted_at": "2026-06-09T18:10:13.176153+00:00"
+    }
+  ],
+  "coverage": [
+    {
+      "document_id": 482868,
+      "nome_cobertura": "Incêndio, explosão, implosão, fumaça e queda de aeronaves",
+      "tipo": "basica",
+      "franquia_tipo": "misto",
+      "franquia_regra_texto": "POS por cobertura, valor ou percentual definido na apólice",
+      "base_calculo": "sobre prejuizo",
+      "exclusoes_principais": null
+    },
+    {
+      "document_id": 482868,
+      "nome_cobertura": "Danos elétricos",
+      "tipo": "adicional",
+      "franquia_tipo": "misto",
+      "franquia_regra_texto": "POS definida na apólice",
+      "base_calculo": "sobre prejuizo",
+      "exclusoes_principais": null
+    },
+    {
+      "document_id": 482868,
+      "nome_cobertura": "Perda ou pagamento de aluguel",
+      "tipo": "adicional",
+      "franquia_tipo": "sem_franquia",
+      "franquia_regra_texto": "cobertura indenitária por aluguel; sem POS típica",
+      "base_calculo": "sobre LMI",
+      "exclusoes_principais": null
+    },
+    {
+      "document_id": 482868,
+      "nome_cobertura": "Quebra de vidros",
+      "tipo": "adicional",
+      "franquia_tipo": "misto",
+      "franquia_regra_texto": "POS definida na apólice",
+      "base_calculo": "sobre prejuizo",
+      "exclusoes_principais": null
+    },
+    {
+      "document_id": 482868,
+      "nome_cobertura": "Responsabilidade civil familiar (danos a terceiros)",
+      "tipo": "adicional",
+      "franquia_tipo": "sem_franquia",
+      "franquia_regra_texto": "RC sem POS na CG",
+      "base_calculo": "sobre LMI",
+      "exclusoes_principais": null
+    },
+    {
+      "document_id": 482868,
+      "nome_cobertura": "Subtração de bens (roubo/furto qualificado)",
+      "tipo": "adicional",
+      "franquia_tipo": "misto",
+      "franquia_regra_texto": "POS definida na apólice",
+      "base_calculo": "sobre prejuizo",
+      "exclusoes_principais": null
+    },
+    {
+      "document_id": 482868,
+      "nome_cobertura": "Vendaval, furacão, ciclone, tornado e queda de granizo",
+      "tipo": "adicional",
+      "franquia_tipo": "misto",
+      "franquia_regra_texto": "POS definida na apólice",
+      "base_calculo": "sobre prejuizo",
+      "exclusoes_principais": null
+    },
+    {
+      "document_id": 502775,
+      "nome_cobertura": "Incêndio, raio e explosão",
+      "tipo": "basica",
+      "franquia_tipo": "misto",
+      "franquia_regra_texto": "Franquia e/ou POS: valor ou percentual definido na apólice",
+      "base_calculo": "sobre prejuizo",
+      "exclusoes_principais": null
+    },
+    {
+      "document_id": 502775,
+      "nome_cobertura": "Danos elétricos",
+      "tipo": "adicional",
+      "franquia_tipo": "misto",
+      "franquia_regra_texto": "Franquia/POS definida na apólice",
+      "base_calculo": "sobre prejuizo",
+      "exclusoes_principais": null
+    },
+    {
+      "document_id": 502775,
+      "nome_cobertura": "Vendaval, granizo, fumaça e impacto de veículos",
+      "tipo": "adicional",
+      "franquia_tipo": "misto",
+      "franquia_regra_texto": "Franquia/POS definida na apólice",
+      "base_calculo": "sobre prejuizo",
+      "exclusoes_principais": null
+    },
+    {
+      "document_id": 502775,
+      "nome_cobertura": "Roubo e/ou furto qualificado de bens",
+      "tipo": "adicional",
+      "franquia_tipo": "misto",
+      "franquia_regra_texto": "Franquia/POS definida na apólice",
+      "base_calculo": "sobre prejuizo",
+      "exclusoes_principais": null
+    },
+    {
+      "document_id": 502775,
+      "nome_cobertura": "Responsabilidade civil familiar",
+      "tipo": "adicional",
+      "franquia_tipo": "sem_franquia",
+      "franquia_regra_texto": "RC sem franquia na CG",
+      "base_calculo": "sobre LMI",
+      "exclusoes_principais": null
+    },
+    {
+      "document_id": 502775,
+      "nome_cobertura": "Desmoronamento",
+      "tipo": "adicional",
+      "franquia_tipo": "misto",
+      "franquia_regra_texto": "Franquia/POS definida na apólice",
+      "base_calculo": "sobre prejuizo",
+      "exclusoes_principais": null
+    },
+    {
+      "document_id": 502775,
+      "nome_cobertura": "Alagamento / tumulto",
+      "tipo": "adicional",
+      "franquia_tipo": "misto",
+      "franquia_regra_texto": "Franquia/POS definida na apólice",
+      "base_calculo": "sobre prejuizo",
+      "exclusoes_principais": null
+    }
+  ],
+  "nota": "Piloto manual — valida schema v0; ver scripts/pilot_extraction.py"
+}

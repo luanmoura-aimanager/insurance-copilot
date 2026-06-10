@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: insurance-copilot-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: insurance
+      POSTGRES_PASSWORD: insurance
+      POSTGRES_DB: insurance
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U insurance"]
+      interval: 5s
+      retries: 5
+volumes:
+  pgdata:
