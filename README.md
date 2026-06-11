@@ -107,7 +107,7 @@ insurance-copilot/
 - [x] Corpus harvester (SUSEP, residential)
 - [x] Extraction schema validated against real policies
 - [x] Service skeleton — FastAPI + Postgres, health checks
-- [ ] Models + Alembic migrations (the schema above)
+- [ ] Models + Alembic migrations (the schema above) — `policy_document` model done; remaining tables and migrations pending
 - [ ] Test suite (testcontainers)
 - [ ] Production extraction (LLM → tables)
 - [ ] Agent layer (supervisor + SQL/RAG/extraction workers)
