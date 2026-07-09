@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>insurance-copilot — Schema (v1)</title>
+<style>
+  :root{
+    --bg:#faf9f7; --card:#fff; --ink:#1f1f1f; --muted:#6b6b6b;
+    --line:#d9d6d1; --pk:#7a5af5; --fk:#c2410c; --accent:#0f766e;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:32px;background:var(--bg);color:var(--ink);
+       font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}
+  h1{font-size:22px;margin:0 0 4px}
+  .sub{color:var(--muted);margin:0 0 28px;max-width:70ch}
+  .legend{display:flex;gap:18px;flex-wrap:wrap;margin-bottom:24px;font-size:13px;color:var(--muted)}
+  .chip{display:inline-flex;align-items:center;gap:6px}
+  .dot{width:10px;height:10px;border-radius:2px;display:inline-block}
+  .wrap{position:relative}
+  svg{width:100%;height:auto;display:block}
+  .tbl-title{font:600 14px ui-monospace,SFMono-Regular,Menlo,monospace;fill:var(--ink)}
+  .tbl-note{font:11px -apple-system,sans-serif;fill:var(--muted)}
+  .col{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;fill:var(--ink)}
+  .col-type{font:11px ui-monospace,Menlo,monospace;fill:var(--muted)}
+  .badge{font:600 9px ui-monospace,Menlo,monospace}
+  .edge{stroke:var(--line);stroke-width:1.6;fill:none}
+  .edge-label{font:10px -apple-system,sans-serif;fill:var(--muted)}
+  .box{fill:var(--card);stroke:var(--line);stroke-width:1.2}
+  .hdr{fill:#f2efeb}
+  details{background:var(--card);border:1px solid var(--line);border-radius:8px;
+          padding:14px 16px;margin-top:12px}
+  summary{cursor:pointer;font-weight:600;font-size:14px}
+  table{border-collapse:collapse;width:100%;margin-top:10px;font-size:13px}
+  th,td{text-align:left;padding:6px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-weight:600;font-size:12px}
+  code{font:12px ui-monospace,Menlo,monospace;background:#f2efeb;padding:1px 5px;border-radius:3px}
+  .k-pk{color:var(--pk);font-weight:700}
+  .k-fk{color:var(--fk);font-weight:700}
+  .why{margin-top:32px;padding:16px 18px;background:#fff;border:1px solid var(--line);
+       border-radius:8px;max-width:78ch}
+  .why h2{font-size:15px;margin:0 0 8px}
+  .why p{margin:0 0 10px;color:#333}
+</style>
+</head>
+<body>
+
+<h1>insurance-copilot — schema v1</h1>
+<p class="sub">Cinco tabelas que estruturam as condições gerais de seguro residencial (SUSEP).
+O grão da extração é <strong>(seguradora × cobertura)</strong>, e as coberturas são canonizadas
+<strong>por perigo</strong>, não por nome comercial.</p>
+
+<div class="legend">
+  <span class="chip"><span class="dot" style="background:var(--pk)"></span> PK — chave primária</span>
+  <span class="chip"><span class="dot" style="background:var(--fk)"></span> FK — chave estrangeira</span>
+  <span class="chip"><span class="dot" style="background:var(--line)"></span> seta: filho → pai (a FK mora no lado "muitos")</span>
+</div>
+
+<div class="wrap">
+<svg viewBox="0 0 980 720" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#d9d6d1"/>
+    </marker>
+  </defs>
+
+  <!-- ============ policy_document (pai) ============ -->
+  <g transform="translate(330,20)">
+    <rect class="box" x="0" y="0" width="300" height="196" rx="8"/>
+    <rect class="hdr" x="0" y="0" width="300" height="34" rx="8"/>
+    <rect class="hdr" x="0" y="24" width="300" height="10"/>
+    <text class="tbl-title" x="14" y="22">policy_document</text>
+    <text class="tbl-note" x="200" y="22">1 documento</text>
+
+    <text class="col" x="14" y="54">id</text><text class="badge" x="46" y="54" fill="#7a5af5">PK</text>
+    <text class="col-type" x="230" y="54">int</text>
+
+    <text class="col" x="14" y="72">insurer</text><text class="col-type" x="230" y="72">text</text>
+    <text class="col" x="14" y="90">product</text><text class="col-type" x="230" y="90">text</text>
+    <text class="col" x="14" y="108">susep_process</text><text class="col-type" x="230" y="108">text</text>
+    <text class="col" x="14" y="126">version</text><text class="col-type" x="222" y="126">text?</text>
+    <text class="col" x="14" y="144">property_type</text><text class="col-type" x="222" y="144">text?</text>
+    <text class="col" x="14" y="162">pdf_url · pdf_hash</text><text class="col-type" x="230" y="162">text</text>
+    <text class="col" x="14" y="180">extracted_at</text><text class="col-type" x="212" y="180">timestamp</text>
+  </g>
+
+  <!-- ============ coverage ============ -->
+  <g transform="translate(60,330)">
+    <rect class="box" x="0" y="0" width="290" height="160" rx="8"/>
+    <rect class="hdr" x="0" y="0" width="290" height="34" rx="8"/>
+    <rect class="hdr" x="0" y="24" width="290" height="10"/>
+    <text class="tbl-title" x="14" y="22">coverage</text>
+    <text class="tbl-note" x="185" y="22">1 cobertura</text>
+
+    <text class="col" x="14" y="54">id</text><text class="badge" x="46" y="54" fill="#7a5af5">PK</text>
+    <text class="col" x="14" y="74">document_id</text><text class="badge" x="112" y="74" fill="#c2410c">FK</text>
+    <text class="col" x="14" y="94">coverage_name</text><text class="col-type" x="222" y="94">text</text>
+    <text class="col" x="14" y="112">kind</text><text class="col-type" x="150" y="112">basic | additional</text>
+    <text class="col" x="14" y="130">deductible_type</text><text class="col-type" x="222" y="130">text?</text>
+    <text class="col" x="14" y="148">deductible_rule_text</text><text class="col-type" x="222" y="148">text?</text>
+  </g>
+
+  <!-- ============ exclusion ============ -->
+  <g transform="translate(640,330)">
+    <rect class="box" x="0" y="0" width="290" height="142" rx="8"/>
+    <rect class="hdr" x="0" y="0" width="290" height="34" rx="8"/>
+    <rect class="hdr" x="0" y="24" width="290" height="10"/>
+    <text class="tbl-title" x="14" y="22">exclusion</text>
+    <text class="tbl-note" x="185" y="22">1 exclusão</text>
+
+    <text class="col" x="14" y="54">id</text><text class="badge" x="46" y="54" fill="#7a5af5">PK</text>
+    <text class="col" x="14" y="74">document_id</text><text class="badge" x="112" y="74" fill="#c2410c">FK</text>
+    <text class="col" x="14" y="94">coverage_id</text><text class="badge" x="112" y="94" fill="#c2410c">FK</text>
+    <text class="col-type" x="150" y="94">nullable</text>
+    <text class="col" x="14" y="112">scope</text><text class="col-type" x="150" y="112">general | coverage</text>
+    <text class="col" x="14" y="130">clause_text</text><text class="col-type" x="230" y="130">text</text>
+  </g>
+
+  <!-- ============ coverage_peril (junção) ============ -->
+  <g transform="translate(60,590)">
+    <rect class="box" x="0" y="0" width="290" height="96" rx="8"/>
+    <rect class="hdr" x="0" y="0" width="290" height="34" rx="8"/>
+    <rect class="hdr" x="0" y="24" width="290" height="10"/>
+    <text class="tbl-title" x="14" y="22">coverage_peril</text>
+    <text class="tbl-note" x="170" y="22">junção N:N</text>
+
+    <text class="col" x="14" y="56">coverage_id</text>
+    <text class="badge" x="112" y="56" fill="#7a5af5">PK</text>
+    <text class="badge" x="136" y="56" fill="#c2410c">FK</text>
+
+    <text class="col" x="14" y="78">peril_id</text>
+    <text class="badge" x="82" y="78" fill="#7a5af5">PK</text>
+    <text class="badge" x="106" y="78" fill="#c2410c">FK</text>
+  </g>
+
+  <!-- ============ peril ============ -->
+  <g transform="translate(640,590)">
+    <rect class="box" x="0" y="0" width="290" height="96" rx="8"/>
+    <rect class="hdr" x="0" y="0" width="290" height="34" rx="8"/>
+    <rect class="hdr" x="0" y="24" width="290" height="10"/>
+    <text class="tbl-title" x="14" y="22">peril</text>
+    <text class="tbl-note" x="160" y="22">1 perigo canônico</text>
+
+    <text class="col" x="14" y="56">id</text><text class="badge" x="46" y="56" fill="#7a5af5">PK</text>
+    <text class="col" x="14" y="78">name</text><text class="col-type" x="150" y="78">incêndio, vendaval…</text>
+  </g>
+
+  <!-- ================= EDGES ================= -->
+  <!-- coverage.document_id -> policy_document.id -->
+  <path class="edge" marker-end="url(#arrow)"
+        d="M 205 330 C 205 270, 380 260, 420 220"/>
+  <text class="edge-label" x="196" y="292">N coberturas → 1 documento</text>
+
+  <!-- exclusion.document_id -> policy_document.id -->
+  <path class="edge" marker-end="url(#arrow)"
+        d="M 785 330 C 785 270, 600 260, 545 220"/>
+  <text class="edge-label" x="620" y="292">N exclusões → 1 documento</text>
+
+  <!-- exclusion.coverage_id -> coverage.id (nullable) -->
+  <path class="edge" marker-end="url(#arrow)" stroke-dasharray="5 4"
+        d="M 640 400 L 355 400"/>
+  <text class="edge-label" x="415" y="392">exclusão de cobertura (opcional)</text>
+
+  <!-- coverage_peril.coverage_id -> coverage.id -->
+  <path class="edge" marker-end="url(#arrow)" d="M 205 590 L 205 495"/>
+  <text class="edge-label" x="215" y="548">N:N</text>
+
+  <!-- coverage_peril.peril_id -> peril.id -->
+  <path class="edge" marker-end="url(#arrow)" d="M 350 638 L 635 638"/>
+  <text class="edge-label" x="450" y="630">N:N</text>
+</svg>
+</div>
+
+<details open>
+  <summary>O que cada tabela guarda</summary>
+  <table>
+    <tr><th>Tabela</th><th>Grão (o que é 1 linha)</th><th>Por que existe</th></tr>
+    <tr>
+      <td><code>policy_document</code></td>
+      <td>Um documento de condições gerais</td>
+      <td>Tabela-pai. Descreve o <em>produto</em> (não a apólice do cliente). Guarda proveniência: <code>pdf_url</code>, <code>pdf_hash</code>, processo SUSEP.</td>
+    </tr>
+    <tr>
+      <td><code>coverage</code></td>
+      <td>Uma cobertura de um documento</td>
+      <td>Uma CG não tem "uma franquia" — tem regra por cobertura. Por isso o grão é (seguradora × cobertura).</td>
+    </tr>
+    <tr>
+      <td><code>peril</code></td>
+      <td>Um perigo canônico</td>
+      <td>Seguradoras empacotam perigos diferente. O perigo é a entidade real; o nome comercial é ruído.</td>
+    </tr>
+    <tr>
+      <td><code>coverage_peril</code></td>
+      <td>Um par (cobertura, perigo)</td>
+      <td>Junção N:N. Permite perguntar "quem cobre vendaval?" independente de como cada seguradora nomeou o pacote.</td>
+    </tr>
+    <tr>
+      <td><code>exclusion</code></td>
+      <td>Uma exclusão</td>
+      <td>Exclusões gerais (do documento) e específicas (de uma cobertura) convivem — por isso <code>coverage_id</code> é nullable.</td>
+    </tr>
+  </table>
+</details>
+
+<details>
+  <summary>Colunas, uma a uma</summary>
+  <table>
+    <tr><th>Coluna</th><th>Tabela</th><th>O que é</th></tr>
+    <tr><td><code>id</code> <span class="k-pk">PK</span></td><td>todas</td><td>Identifica a linha de forma única.</td></tr>
+    <tr><td><code>insurer</code></td><td>policy_document</td><td>Seguradora que registrou o produto.</td></tr>
+    <tr><td><code>product</code></td><td>policy_document</td><td>Nome comercial do produto.</td></tr>
+    <tr><td><code>susep_process</code></td><td>policy_document</td><td>Número do processo SUSEP — identificador regulatório.</td></tr>
+    <tr><td><code>version</code></td><td>policy_document</td><td>Versão do documento (nullable: nem toda CG traz).</td></tr>
+    <tr><td><code>property_type</code></td><td>policy_document</td><td>Tipo de imóvel aceito (casa, apartamento…).</td></tr>
+    <tr><td><code>pdf_url</code> · <code>pdf_hash</code></td><td>policy_document</td><td>Proveniência e integridade — de onde veio e se é o mesmo arquivo.</td></tr>
+    <tr><td><code>extracted_at</code></td><td>policy_document</td><td>Quando foi extraído. Default preenchido pelo Postgres.</td></tr>
+    <tr><td><code>document_id</code> <span class="k-fk">FK</span></td><td>coverage, exclusion</td><td>Aponta pro documento dono. A FK mora no lado "muitos".</td></tr>
+    <tr><td><code>coverage_name</code></td><td>coverage</td><td>Nome comercial da cobertura — <em>não</em> é canônico (ver <code>peril</code>).</td></tr>
+    <tr><td><code>kind</code></td><td>coverage</td><td><code>basic</code> ou <code>additional</code>. Alimenta o worker SQL.</td></tr>
+    <tr><td><code>deductible_type</code></td><td>coverage</td><td>Categórica: <code>none</code>, <code>percentage</code>, <code>fixed_amount</code>, <code>defined_in_policy</code>. Alimenta SQL.</td></tr>
+    <tr><td><code>deductible_rule_text</code></td><td>coverage</td><td>Texto literal da regra de POS/franquia. Alimenta RAG.</td></tr>
+    <tr><td><code>name</code></td><td>peril</td><td>Perigo canônico: incêndio, vendaval, granizo, danos elétricos…</td></tr>
+    <tr><td><code>coverage_id</code> · <code>peril_id</code> <span class="k-pk">PK</span><span class="k-fk">FK</span></td><td>coverage_peril</td><td>As duas juntas formam a PK composta — impede o mesmo par entrar duas vezes.</td></tr>
+    <tr><td><code>coverage_id</code> <span class="k-fk">FK</span></td><td>exclusion</td><td>Nullable: exclusão geral não pertence a cobertura nenhuma.</td></tr>
+    <tr><td><code>scope</code></td><td>exclusion</td><td><code>general</code> ou <code>coverage</code>.</td></tr>
+    <tr><td><code>clause_text</code></td><td>exclusion</td><td>Texto literal da cláusula. Alimenta RAG.</td></tr>
+  </table>
+</details>
+
+<div class="why">
+  <h2>Duas decisões que explicam o desenho</h2>
+  <p><strong>Canonizar por perigo.</strong> A Porto vende "Vendaval + Granizo"; a Allianz vende "Vendaval + Granizo + Fumaça + Impacto de veículos". Comparar por nome de cobertura não funciona. Por isso <code>peril</code> virou tabela própria e <code>coverage ↔ peril</code> é muitos-para-muitos — daí a junção <code>coverage_peril</code>.</p>
+  <p><strong>Categórica alimenta SQL, texto alimenta RAG.</strong> <code>deductible_type</code> permite <code>GROUP BY</code> e agregação; <code>deductible_rule_text</code> permite explicar a regra em linguagem natural. Guardar os dois é o que justifica ter os dois workers.</p>
+  <p><strong>Nota de escopo:</strong> o corpus são condições gerais — descrevem o produto. O <em>valor</em> da franquia vive na apólice individual do cliente, fora deste schema. Por isso <code>deductible_type</code> tem a categoria <code>defined_in_policy</code>.</p>
+</div>
+
+</body>
+</html>

@@ -92,7 +92,10 @@ curl localhost:8000/health/db   # {"db":"ok"}  — API ↔ Postgres OK
 insurance-copilot/
 ├── app/
 │   ├── main.py             # FastAPI app + health endpoints
-│   └── db.py               # async engine + session (SQLAlchemy 2.0)
+│   ├── db.py               # async engine + session (SQLAlchemy 2.0)
+│   └── models.py           # ORM models: PolicyDocument, Coverage, Peril, CoveragePeril, Exclusion
+├── docs/
+│   └── schema.html         # visual schema diagram (open in browser)
 ├── scripts/
 │   └── susep_harvest.py    # SUSEP corpus harvester
 ├── data/
@@ -107,7 +110,8 @@ insurance-copilot/
 - [x] Corpus harvester (SUSEP, residential)
 - [x] Extraction schema validated against real policies
 - [x] Service skeleton — FastAPI + Postgres, health checks
-- [ ] Models + Alembic migrations (the schema above) — `policy_document` model done; remaining tables and migrations pending
+- [x] ORM models — all 5 tables: `policy_document`, `coverage`, `peril`, `coverage_peril`, `exclusion`
+- [ ] Alembic migrations
 - [ ] Test suite (testcontainers)
 - [ ] Production extraction (LLM → tables)
 - [ ] Agent layer (supervisor + SQL/RAG/extraction workers)
