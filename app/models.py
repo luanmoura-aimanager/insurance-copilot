@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import ForeignKey, func
+from sqlalchemy import CheckConstraint, ForeignKey, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -13,6 +13,7 @@ class PolicyDocument(Base):
     """One SUSEP general-terms document (a product, not a customer policy)."""
 
     __tablename__ = "policy_document"
+    __table_args__ = (UniqueConstraint("susep_process", "version"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     insurer: Mapped[str]
@@ -29,12 +30,19 @@ class Coverage(Base):
     """One coverage within a document. Grain: (insurer x coverage)."""
 
     __tablename__ = "coverage"
+    __table_args__ = (
+        CheckConstraint("kind IN ('basic', 'additional')", name="ck_coverage_kind"),
+        CheckConstraint(
+            "deductible_type IN ('sem_franquia', 'percentual', 'valor_fixo', 'definido_na_apolice')",
+            name="ck_coverage_deductible_type",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     document_id: Mapped[int] = mapped_column(ForeignKey("policy_document.id"))
     coverage_name: Mapped[str]                  # commercial name (not canonical — see Peril)
     kind: Mapped[str]                           # basic | additional
-    deductible_type: Mapped[str | None]         # none | percentage | fixed_amount | defined_in_policy
+    deductible_type: Mapped[str | None]         # sem_franquia | percentual | valor_fixo | definido_na_apolice
     deductible_rule_text: Mapped[str | None]    # verbatim POS/deductible rule (feeds RAG)
 
 
@@ -44,7 +52,7 @@ class Peril(Base):
     __tablename__ = "peril"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    name: Mapped[str]
+    name: Mapped[str] = mapped_column(unique=True)
 
 
 class CoveragePeril(Base):
@@ -60,6 +68,13 @@ class Exclusion(Base):
     """One exclusion. Scope is either general (document-wide) or tied to a coverage."""
 
     __tablename__ = "exclusion"
+    __table_args__ = (
+        CheckConstraint("scope IN ('general', 'coverage')", name="ck_exclusion_scope"),
+        CheckConstraint(
+            "(scope = 'general' AND coverage_id IS NULL) OR (scope = 'coverage' AND coverage_id IS NOT NULL)",
+            name="ck_exclusion_scope_coverage_id",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     document_id: Mapped[int] = mapped_column(ForeignKey("policy_document.id"))

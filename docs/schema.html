@@ -218,7 +218,7 @@ O grão da extração é <strong>(seguradora × cobertura)</strong>, e as cobert
     <tr><td><code>document_id</code> <span class="k-fk">FK</span></td><td>coverage, exclusion</td><td>Aponta pro documento dono. A FK mora no lado "muitos".</td></tr>
     <tr><td><code>coverage_name</code></td><td>coverage</td><td>Nome comercial da cobertura — <em>não</em> é canônico (ver <code>peril</code>).</td></tr>
     <tr><td><code>kind</code></td><td>coverage</td><td><code>basic</code> ou <code>additional</code>. Alimenta o worker SQL.</td></tr>
-    <tr><td><code>deductible_type</code></td><td>coverage</td><td>Categórica: <code>none</code>, <code>percentage</code>, <code>fixed_amount</code>, <code>defined_in_policy</code>. Alimenta SQL.</td></tr>
+    <tr><td><code>deductible_type</code></td><td>coverage</td><td>Categórica: <code>sem_franquia</code>, <code>percentual</code>, <code>valor_fixo</code>, <code>definido_na_apolice</code>. Alimenta SQL.</td></tr>
     <tr><td><code>deductible_rule_text</code></td><td>coverage</td><td>Texto literal da regra de POS/franquia. Alimenta RAG.</td></tr>
     <tr><td><code>name</code></td><td>peril</td><td>Perigo canônico: incêndio, vendaval, granizo, danos elétricos…</td></tr>
     <tr><td><code>coverage_id</code> · <code>peril_id</code> <span class="k-pk">PK</span><span class="k-fk">FK</span></td><td>coverage_peril</td><td>As duas juntas formam a PK composta — impede o mesmo par entrar duas vezes.</td></tr>
