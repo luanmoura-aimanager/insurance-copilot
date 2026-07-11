@@ -58,7 +58,7 @@ FastAPI · Postgres (+ pgvector) · SQLAlchemy 2.0 (async) · Alembic · Docker 
 
 ## Getting started
 
-**Prerequisites:** Docker (or Colima on macOS) and Python 3.11+.
+**Prerequisites:** Docker (or Colima on macOS) and Python 3.11+ (the code uses `str | None` annotations, which require 3.10+).
 
 ```bash
 # 1. clone and create a virtual environment
@@ -75,7 +75,10 @@ cp .env.example .env        # then edit if needed
 # 4. start Postgres
 docker compose up -d        # serves Postgres on localhost:5433
 
-# 5. run the API
+# 5. create the tables
+alembic upgrade head
+
+# 6. run the API
 uvicorn app.main:app --reload
 ```
 
@@ -94,6 +97,8 @@ insurance-copilot/
 │   ├── main.py             # FastAPI app + health endpoints
 │   ├── db.py               # async engine + session (SQLAlchemy 2.0)
 │   └── models.py           # ORM models: PolicyDocument, Coverage, Peril, CoveragePeril, Exclusion
+├── alembic/
+│   └── versions/           # migrations (alembic upgrade head)
 ├── docs/
 │   └── schema.html         # visual schema diagram (open in browser)
 ├── scripts/
@@ -111,7 +116,7 @@ insurance-copilot/
 - [x] Extraction schema validated against real policies
 - [x] Service skeleton — FastAPI + Postgres, health checks
 - [x] ORM models — all 5 tables: `policy_document`, `coverage`, `peril`, `coverage_peril`, `exclusion`
-- [ ] Alembic migrations
+- [x] Alembic migrations
 - [ ] Test suite (testcontainers)
 - [ ] Production extraction (LLM → tables)
 - [ ] Agent layer (supervisor + SQL/RAG/extraction workers)
