@@ -33,7 +33,7 @@ class Coverage(Base):
     __table_args__ = (
         CheckConstraint("kind IN ('basic', 'additional')", name="ck_coverage_kind"),
         CheckConstraint(
-            "deductible_type IN ('sem_franquia', 'percentual', 'valor_fixo', 'definido_na_apolice')",
+            "deductible_type IN ('none', 'percentage', 'fixed_amount', 'defined_in_policy')",
             name="ck_coverage_deductible_type",
         ),
     )
@@ -42,7 +42,7 @@ class Coverage(Base):
     document_id: Mapped[int] = mapped_column(ForeignKey("policy_document.id"))
     coverage_name: Mapped[str]                  # commercial name (not canonical — see Peril)
     kind: Mapped[str]                           # basic | additional
-    deductible_type: Mapped[str | None]         # sem_franquia | percentual | valor_fixo | definido_na_apolice
+    deductible_type: Mapped[str | None]         # none | percentage | fixed_amount | defined_in_policy
     deductible_rule_text: Mapped[str | None]    # verbatim POS/deductible rule (feeds RAG)
 
 
