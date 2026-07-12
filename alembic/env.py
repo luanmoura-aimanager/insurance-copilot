@@ -8,17 +8,18 @@ from sqlalchemy import pool
 from alembic import context
 
 from app.models import Base
+from app.db_url import normalize_url
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
 
-# Read DATABASE_URL from the environment and use a SYNC driver for migrations.
-# The app runs async (postgresql+asyncpg), but Alembic runs synchronously, so we
-# swap asyncpg -> psycopg2 just here.
+# Read DATABASE_URL from the environment and normalize to a SYNC driver.
+# The app runs async (asyncpg), but Alembic runs synchronously, so migrations use
+# psycopg2. Railway may hand us postgres:// or postgresql://; normalize all cases.
 load_dotenv()
-db_url = os.environ["DATABASE_URL"].replace("+asyncpg", "+psycopg2")
-config.set_main_option("sqlalchemy.url", db_url)
+
+config.set_main_option("sqlalchemy.url", normalize_url(os.environ["DATABASE_URL"], "psycopg2"))
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
