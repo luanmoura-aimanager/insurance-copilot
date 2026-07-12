@@ -117,7 +117,7 @@ insurance-copilot/
 - [x] Service skeleton — FastAPI + Postgres, health checks
 - [x] ORM models — all 5 tables: `policy_document`, `coverage`, `peril`, `coverage_peril`, `exclusion`
 - [x] Alembic migrations
-- [ ] Test suite (testcontainers)
+- [x] Test suite (testcontainers)
 - [ ] Production extraction (LLM → tables)
 - [ ] Agent layer (supervisor + SQL/RAG/extraction workers)
 - [ ] WhatsApp surface + cost attribution
