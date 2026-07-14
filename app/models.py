@@ -41,6 +41,7 @@ class Coverage(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     document_id: Mapped[int] = mapped_column(ForeignKey("policy_document.id"))
     coverage_name: Mapped[str]                  # commercial name (not canonical — see Peril)
+    plan: Mapped[str | None]                    # commercial tier (Essencial/Fácil); free text, insurer-specific
     kind: Mapped[str]                           # basic | additional
     deductible_type: Mapped[str | None]         # none | percentage | fixed_amount | defined_in_policy
     deductible_rule_text: Mapped[str | None]    # verbatim POS/deductible rule (feeds RAG)
