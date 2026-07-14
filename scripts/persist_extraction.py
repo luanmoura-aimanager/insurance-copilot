@@ -39,6 +39,7 @@ async def run(json_path: Path, pdf_path: Path) -> None:
             return
 
         pd_id = await persist_document(session, doc, row)
+        await session.commit()  # o script é dono da transação (persist_document só dá flush)
         print(f"[ok] policy_document.id = {pd_id}")
 
         # Verificação: conta o que entrou pra este documento.

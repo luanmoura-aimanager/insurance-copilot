@@ -49,7 +49,9 @@ async def persist_document(
     """Insere uma CG extraída nas 5 tabelas e devolve o policy_document.id.
 
     manifest_row: a linha do corpus_manifest.json (proveniência autoritativa).
-    Commita ao final; assume que o guard de idempotência já foi checado pelo chamador.
+    NÃO commita — só dá flush pra gerar os ids. O CHAMADOR é dono da transação
+    (o script commita; o teste faz rollback pra isolar; o batch controla por doc).
+    Assume que o guard de idempotência já foi checado pelo chamador.
     """
     pd = PolicyDocument(
         insurer=manifest_row["seguradora"],       # autoritativo (manifesto), não a leitura do LLM
@@ -90,5 +92,5 @@ async def persist_document(
             Exclusion(document_id=pd.id, coverage_id=None, scope="general", clause_text=clause)
         )
 
-    await session.commit()
+    await session.flush()  # garante que tudo foi pro banco e pd.id está resolvido
     return pd.id
