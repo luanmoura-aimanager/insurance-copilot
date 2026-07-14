@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A multi-agent system that turns Brazilian home-insurance *condições gerais* (general terms registered with SUSEP) into a queryable knowledge base. It answers **coverage-structure** questions ("which insurers cover windstorm without a deductible?"), not pricing — the corpus describes products, and prices live in individual customer policies which are out of scope.
 
-The project is mid-build: the data pipeline (harvester + validated extraction schema) and a FastAPI/Postgres skeleton exist; the LLM extraction pipeline, ORM models/migrations, agent layer, and WhatsApp surface do not yet. See the Roadmap in `README.md` for current state before assuming a component exists.
+The project is mid-build: the data pipeline (harvester + validated extraction schema), a FastAPI/Postgres skeleton, the LLM extraction pipeline (`app/extraction/`), the ORM models + Alembic migrations (`app/models.py`), and a testcontainers-backed test suite exist; the agent layer and WhatsApp surface do not yet. See the Roadmap in `README.md` for current state before assuming a component exists.
 
 ## Commands
 
@@ -23,9 +23,16 @@ docker compose up -d
 uvicorn app.main:app --reload
 curl localhost:8000/health      # {"status":"ok"}
 curl localhost:8000/health/db   # {"db":"ok"} — verifies API ↔ Postgres
+
+# Migrations (Alembic; env.py reads DATABASE_URL and swaps asyncpg→sync)
+alembic upgrade head
+alembic revision --autogenerate -m "message"
+
+# Tests (boots a throwaway Postgres via testcontainers — Docker must be running)
+pytest -q
 ```
 
-There is **no test suite, linter, or migration tooling wired up yet** despite `README.md` listing pytest/testcontainers/Alembic in the intended stack — they are roadmap items. Don't invent commands for them.
+`pytest` and `python -m pytest` both work (`pytest.ini` sets `pythonpath = .`). There is **no linter wired up yet** — that's still a roadmap item; don't invent commands for it.
 
 ## Architecture & key decisions
 
@@ -33,7 +40,7 @@ There is **no test suite, linter, or migration tooling wired up yet** despite `R
 
 **Port 5433.** docker-compose maps Postgres to host `5433` (not the default 5432) to avoid colliding with a local Postgres; `.env.example` reflects this.
 
-**The corpus is general terms, not policies.** This is the central scoping decision and it shapes the schema: a document describes a *product*. The extraction grain is therefore **(insurer × coverage)**, and coverages are normalized **by peril, not by commercial name**, because insurers bundle perils differently. That makes `coverage ↔ peril` many-to-many. Intended tables: `policy_document`, `coverage`, `peril`, `coverage_peril` (join), `exclusion` (scope = general or per-coverage). Categorical columns feed the future SQL worker; raw-text columns feed the future RAG worker.
+**The corpus is general terms, not policies.** This is the central scoping decision and it shapes the schema: a document describes a *product*. The extraction grain is therefore **(insurer × coverage)**, and coverages are normalized **by peril, not by commercial name**, because insurers bundle perils differently. That makes `coverage ↔ peril` many-to-many. The tables are built in `app/models.py`: `policy_document`, `coverage` (includes a nullable `plan` free-text commercial tier), `peril`, `coverage_peril` (join), `exclusion` (scope = general or per-coverage). Categorical columns feed the future SQL worker; raw-text columns feed the future RAG worker.
 
 **Deductible terminology.** In residential CGs the term is **POS (Participação Obrigatória do Segurado)**, treated as a synonym for "franquia". The dominant pattern is "valor ou percentual definido na apólice" — the CG fixes the *structure*, the number lives in the customer policy. The validated `franquia_tipo` enum is `{sem_franquia, percentual, valor_fixo, definido_na_apolice}`. See `data/pilot_findings.md` for the reasoning behind every schema choice — read it before modeling tables.
 
@@ -54,6 +61,8 @@ python scripts/susep_harvest.py --limit 5      # smoke test
 **Script defaults are anchored to the repo root** via `Path(__file__).resolve().parent.parent`, so they read/write `data/corpus/` correctly regardless of CWD (run them from anywhere; override with `--out`/`--index-cache`).
 
 **The PDFs are gitignored** (`data/corpus/*.pdf`) — large and public. Only `corpus_manifest.json` is committed; it records per-version provenance (process, internal id, insurer, CNPJ, url, sha256, dates, `has_text`) and lets anyone re-download and verify the corpus by hash. The download endpoint keys on an **internal numeric id**, while the index keys on **process number** (`15414.NNNNNN/AAAA-DD`) — bridging the two is what the resolve step does.
+
+The extraction pipeline drives two scripts, split so persistence can be re-run without paying for the LLM again: `run_extraction.py <pdf> --out <json>` (pdfplumber → Anthropic forced tool-use → validated nested output, cross-checked against the manifest) and `persist_extraction.py <json> --pdf <pdf>` (deterministic flatten into the 5 tables; provenance from the manifest, not the LLM read). The extracted JSON under `data/extractions/` is gitignored derived output, like the PDFs. `run_extraction.py` needs `ANTHROPIC_API_KEY`; `persist_extraction.py` needs `DATABASE_URL`.
 
 The other scripts are one-off, not production: `susep_probe.py` (blind-sampling viability probe that established corpus volume) and `pilot_extraction.py` (manual hand-read extraction of 2 CGs that validated the schema — produces `data/pilot_extraction.json`, summarized in `data/pilot_findings.md`).
 
