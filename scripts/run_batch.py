@@ -123,12 +123,15 @@ async def main() -> None:
 
             msg = outcome.message
             in_tok, out_tok = msg.usage.input_tokens, msg.usage.output_tokens
+            # Precifica pelo modelo que de fato serviu a chamada (é o que foi cobrado),
+            # não por args.model — mesma razão do reconcile no rescue.
+            billed_model = getattr(msg, "model", None) or args.model
 
             # A chamada foi cobrada — grava o custo ANTES de tentar parsear.
             event = await record_cost_event(
                 session,
                 agent_name="extraction",
-                model=args.model,
+                model=billed_model,
                 input_tokens=in_tok,
                 output_tokens=out_tok,
                 label=outcome.custom_id,
@@ -152,12 +155,23 @@ async def main() -> None:
 
             # Substituição atômica: apaga o antigo e grava o novo na MESMA transação.
             # Se o INSERT falhar, o rollback devolve o dado antigo — nunca fica o buraco.
-            if args.force:
-                old_id = await delete_document_by_hash(session, row["sha256"])
-                if old_id:
-                    print(f"  [force] substituindo doc_id={old_id}")
-            pd_id = await persist_document(session, doc, row)
-            await session.commit()
+            #
+            # E um erro inesperado no persist (constraint, etc.) NÃO pode derrubar o loop:
+            # o custo deste doc já foi commitado acima, e os docs seguintes — também já
+            # cobrados pelo batch — ainda precisam registrar o custo deles. Abortar aqui
+            # deixaria essas chamadas pagas sem linha em cost_event.
+            try:
+                if args.force:
+                    old_id = await delete_document_by_hash(session, row["sha256"])
+                    if old_id:
+                        print(f"  [force] substituindo doc_id={old_id}")
+                pd_id = await persist_document(session, doc, row)
+                await session.commit()
+            except Exception as exc:
+                await session.rollback()  # descarta delete+persist parciais; o cost_event já está gravado
+                print(f"  [{outcome.custom_id}] persist falhou (custo já registrado): {str(exc)[:120]}")
+                n_fail += 1
+                continue
             n_ok += 1
             print(f"  [{outcome.custom_id}] ok  doc_id={pd_id}  "
                   f"coberturas={len(doc.coverages)}  US$ {event.cost_usd}")

@@ -15,6 +15,7 @@ import json
 from decimal import Decimal
 from pathlib import Path
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import CostEvent
@@ -82,3 +83,58 @@ async def record_cost_event(
     session.add(event)
     await session.flush()
     return event
+
+
+async def cost_event_exists_by_label(
+    session: AsyncSession, label: str, *, batch: bool | None = None
+) -> bool:
+    """Já existe uma linha de custo pra essa chamada (identificada por `label`)?
+
+    `batch` restringe a busca ao tipo de chamada: o MESMO doc pode ter uma linha da eval
+    (batch=False, label=stem) e uma do batch (batch=True, mesmo label). O doc do golden é
+    fixado em todo batch E é o que a eval roda, então essa colisão de label é real — sem o
+    filtro, uma linha da eval mascararia o custo faltante de uma chamada de batch.
+    """
+    q = select(CostEvent.id).where(CostEvent.label == label)
+    if batch is not None:
+        q = q.where(CostEvent.batch == batch)
+    hit = await session.scalar(q)
+    return hit is not None
+
+
+async def reconcile_cost_event(
+    session: AsyncSession,
+    *,
+    agent_name: str,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    label: str,
+    pricing: dict | None = None,
+    batch: bool = False,
+) -> CostEvent | None:
+    """Grava a linha de custo SÓ se ainda não houver uma pra essa chamada (por `label`).
+
+    É o que fecha a lacuna do resgate: se o run original morreu antes de registrar o
+    custo (ex.: TimeoutError no batch.wait), o resgate preenche; se o custo já foi
+    registrado, não conta o mesmo dinheiro duas vezes. Devolve o evento novo ou None.
+
+    Reconcilia por (`label`, `batch`): a existência é checada só contra linhas do MESMO
+    tipo de chamada, senão uma linha da eval (batch=False) mascararia o custo faltante de
+    uma chamada de batch (batch=True) do mesmo doc — colisão real no doc do golden. Uma
+    re-extração via --force gera uma chamada nova com o MESMO (label, batch): se um run
+    anterior já deixou linha, esta reconciliação não grava a nova. É o trade-off consciente
+    do resgate: preferimos nunca contar em dobro a garantir cada centavo de re-extrações.
+    """
+    if await cost_event_exists_by_label(session, label, batch=batch):
+        return None
+    return await record_cost_event(
+        session,
+        agent_name=agent_name,
+        model=model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        label=label,
+        pricing=pricing,
+        batch=batch,
+    )
