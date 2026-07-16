@@ -8,6 +8,7 @@ o bloco tool_use direto no Pydantic. Sem regex, sem JSON solto no meio do texto.
 
 import os
 import sys
+from dataclasses import dataclass
 
 import anthropic
 
@@ -19,6 +20,20 @@ MODEL = os.getenv("EXTRACTION_MODEL", "claude-sonnet-5")
 MAX_TOKENS = int(os.getenv("EXTRACTION_MAX_TOKENS", "32000"))
 
 _TOOL_NAME = "record_extraction"
+
+
+@dataclass(frozen=True)
+class ExtractionResult:
+    """O documento extraído + o que a chamada consumiu.
+
+    O uso de tokens vem junto de propósito: quem faz a chamada é quem sabe o custo dela.
+    Descartar isso aqui obrigaria a adivinhar depois (ver app/cost.py).
+    """
+
+    document: ExtractedDocument
+    model: str
+    input_tokens: int
+    output_tokens: int
 
 SYSTEM_PROMPT = """\
 Você extrai dados estruturados de Condições Gerais (CG) de seguro residencial \
@@ -49,8 +64,8 @@ exclusões específicas de uma cobertura (→ exclusions daquela coverage). Copi
 """
 
 
-def extract_document(text: str) -> ExtractedDocument:
-    """Roda a extração sobre o texto de UMA CG e devolve o objeto validado."""
+def extract_document(text: str) -> ExtractionResult:
+    """Roda a extração sobre o texto de UMA CG e devolve o objeto validado + o uso."""
     client = anthropic.Anthropic()  # lê ANTHROPIC_API_KEY do ambiente
 
     tool = {
@@ -91,4 +106,9 @@ def extract_document(text: str) -> ExtractedDocument:
 
     # Com tool_choice forçado, o primeiro (e único) bloco é o tool_use.
     tool_use = next(b for b in resp.content if b.type == "tool_use")
-    return ExtractedDocument.model_validate(tool_use.input)
+    return ExtractionResult(
+        document=ExtractedDocument.model_validate(tool_use.input),
+        model=MODEL,
+        input_tokens=resp.usage.input_tokens,
+        output_tokens=resp.usage.output_tokens,
+    )
