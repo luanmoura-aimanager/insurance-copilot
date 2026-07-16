@@ -12,6 +12,12 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 MANIFEST = ROOT / "data" / "corpus" / "corpus_manifest.json"
 
 
+def load_manifest_docs(path: str | Path | None = None) -> list[dict]:
+    """Todas as linhas do manifesto (uma por versão de documento baixada)."""
+    data = json.loads(Path(path or MANIFEST).read_text())
+    return data.get("documentos", [])
+
+
 def manifest_row_for_pdf(pdf_path: str | Path) -> dict | None:
     """Acha a linha do manifesto pro arquivo em disco (susep_<id>.pdf)."""
     if not MANIFEST.exists():

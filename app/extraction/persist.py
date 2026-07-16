@@ -11,7 +11,7 @@ Proveniência (pdf_url, pdf_hash, insurer, susep_process) vem do MANIFESTO, não
 do LLM — o manifesto é o ground truth (o LLM encurtou "Porto Seguro", perdeu "veraneio" etc.).
 """
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Coverage, CoveragePeril, Exclusion, Peril, PolicyDocument
@@ -33,7 +33,12 @@ async def _get_or_create_peril(session: AsyncSession, name: str) -> Peril:
 
 
 async def document_exists(session: AsyncSession, susep_process: str, version: str | None) -> bool:
-    """Guard de idempotência: (susep_process, version) é UNIQUE em policy_document."""
+    """Guard de idempotência: (susep_process, version) é UNIQUE em policy_document.
+
+    Atenção: `version` só se conhece DEPOIS de extrair (vem da leitura do LLM), então
+    este guard não evita gasto — serve pra barrar o INSERT duplicado. Pra decidir ANTES
+    de pagar a chamada, use `document_exists_by_hash`.
+    """
     hit = await session.scalar(
         select(PolicyDocument.id).where(
             PolicyDocument.susep_process == susep_process,
@@ -41,6 +46,46 @@ async def document_exists(session: AsyncSession, susep_process: str, version: st
         )
     )
     return hit is not None
+
+
+async def document_exists_by_hash(session: AsyncSession, pdf_hash: str) -> bool:
+    """Guard PRÉ-chamada: o sha256 vem do manifesto e identifica o arquivo exato.
+
+    É este que economiza dinheiro no batch — dá pra pular o doc antes de gastar a
+    extração, coisa que o guard por (processo, versão) não consegue fazer.
+    """
+    hit = await session.scalar(
+        select(PolicyDocument.id).where(PolicyDocument.pdf_hash == pdf_hash)
+    )
+    return hit is not None
+
+
+async def delete_document_by_hash(session: AsyncSession, pdf_hash: str) -> int | None:
+    """Apaga um documento e tudo que pende dele. Devolve o id apagado (ou None).
+
+    Ordem filho→pai obrigatória: as FKs recusam apagar um pai com filhos vivos. É a
+    mesma restrição de integridade que protege o banco, agora atrapalhando de propósito
+    — não existe DELETE CASCADE aqui, então a ordem é explícita.
+
+    Usado só pra re-extrair um doc (ex.: extração que saiu incompleta).
+    """
+    doc_id = await session.scalar(
+        select(PolicyDocument.id).where(PolicyDocument.pdf_hash == pdf_hash)
+    )
+    if doc_id is None:
+        return None
+
+    coverage_ids = (
+        await session.scalars(select(Coverage.id).where(Coverage.document_id == doc_id))
+    ).all()
+    if coverage_ids:
+        await session.execute(
+            delete(CoveragePeril).where(CoveragePeril.coverage_id.in_(coverage_ids))
+        )
+    await session.execute(delete(Exclusion).where(Exclusion.document_id == doc_id))
+    await session.execute(delete(Coverage).where(Coverage.document_id == doc_id))
+    await session.execute(delete(PolicyDocument).where(PolicyDocument.id == doc_id))
+    return doc_id
 
 
 async def persist_document(

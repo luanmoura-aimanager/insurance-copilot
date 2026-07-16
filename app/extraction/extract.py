@@ -11,6 +11,7 @@ import sys
 from dataclasses import dataclass
 
 import anthropic
+from pydantic import ValidationError
 
 from .schema import ExtractedDocument
 
@@ -20,6 +21,49 @@ MODEL = os.getenv("EXTRACTION_MODEL", "claude-sonnet-5")
 MAX_TOKENS = int(os.getenv("EXTRACTION_MAX_TOKENS", "32000"))
 
 _TOOL_NAME = "record_extraction"
+
+
+class ExtractionFailed(Exception):
+    """A chamada aconteceu (e foi COBRADA), mas a resposta não virou objeto válido.
+
+    Carrega o uso de tokens de propósito: o custo é incorrido na CHAMADA, não no parse.
+    Sem isso, uma falha de validação viraria gasto invisível — dinheiro que saiu e não
+    aparece em cost_event. Também carrega o payload cru pra debugar sem re-chamar a API.
+    """
+
+    def __init__(self, message: str, model: str, input_tokens: int, output_tokens: int, raw):
+        super().__init__(message)
+        self.model = model
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.raw = raw
+
+
+_REQUIRED = {"insurer", "product", "susep_process", "coverages"}
+
+
+def _looks_like_document(value) -> bool:
+    """O objeto tem a cara do nosso documento (traz os campos obrigatórios)?"""
+    return isinstance(value, dict) and _REQUIRED.issubset(value.keys())
+
+
+def _unwrap(payload):
+    """Acha o documento quando a resposta vem embrulhada.
+
+    Duas variantes já vistas em produção, ambas do modelo (não do nosso código):
+      {"$PARAMETER_NAME": {...documento...}}          -> 1 chave
+      {"pdf_url": "...", "record": {...documento...}} -> 2 chaves, doc aninhado em uma
+
+    A regra é conservadora: só desce se o objeto aninhado REALMENTE tiver os campos
+    obrigatórios do schema. Sem isso, um unwrap esperto demais aceitaria silenciosamente
+    qualquer lixo aninhado — e a gente prefere falhar barulhento a gravar dado errado.
+    """
+    if not isinstance(payload, dict) or _looks_like_document(payload):
+        return payload
+    for value in payload.values():
+        if _looks_like_document(value):
+            return value
+    return payload
 
 
 @dataclass(frozen=True)
@@ -42,6 +86,11 @@ brasileiro registradas na SUSEP. A CG descreve um PRODUTO, não a apólice de um
 Regras de extração:
 - GRÃO: uma entrada por COBERTURA (não uma por documento). Liste todas as coberturas, \
 básicas e adicionais.
+- CONDIÇÕES ESPECIAIS: muitas CGs descrevem a cobertura BÁSICA no corpo das Condições \
+Gerais e as ADICIONAIS numa seção de "Condições Especiais" mais adiante, no MESMO \
+documento. Percorra o documento INTEIRO e liste as coberturas das duas partes. Parar na \
+cobertura básica é o erro mais comum nesta tarefa: se o documento tem seção de Condições \
+Especiais, cada cobertura descrita lá também vira uma entrada.
 - PLANOS: se a CG separa as coberturas em planos/tiers comerciais (ex.: "Essencial", "Fácil"), \
 ponha o nome do plano no campo `plan` e mantenha `coverage_name` LIMPO, sem o sufixo do plano. \
 `plan` deve conter APENAS o(s) nome(s) do plano — sem descrições, parênteses ou notas \
@@ -64,31 +113,59 @@ exclusões específicas de uma cobertura (→ exclusions daquela coverage). Copi
 """
 
 
-def extract_document(text: str) -> ExtractionResult:
-    """Roda a extração sobre o texto de UMA CG e devolve o objeto validado + o uso."""
-    client = anthropic.Anthropic()  # lê ANTHROPIC_API_KEY do ambiente
-
-    tool = {
-        "name": _TOOL_NAME,
-        "description": "Registra os dados estruturados extraídos de uma CG de seguro residencial.",
-        "input_schema": ExtractedDocument.model_json_schema(),
+def build_params(text: str, model: str | None = None) -> dict:
+    """Monta os parâmetros da chamada — UMA definição só, usada pelo caminho síncrono
+    e pelo batch. Se cada caminho montasse o seu, o prompt divergiria com o tempo e a
+    eval passaria a comparar coisas diferentes sem ninguém perceber.
+    """
+    return {
+        "model": model or MODEL,
+        "max_tokens": MAX_TOKENS,
+        "system": SYSTEM_PROMPT,
+        "tools": [
+            {
+                "name": _TOOL_NAME,
+                "description": (
+                    "Registra os dados estruturados extraídos de uma CG de seguro residencial."
+                ),
+                "input_schema": ExtractedDocument.model_json_schema(),
+            }
+        ],
+        "tool_choice": {"type": "tool", "name": _TOOL_NAME},
+        "messages": [
+            {"role": "user", "content": f"Extraia os dados desta CG:\n\n<cg>\n{text}\n</cg>"}
+        ],
     }
+
+
+def parse_response(content, model: str, in_tok: int, out_tok: int) -> ExtractedDocument:
+    """Extrai o documento validado dos blocos de resposta. Compartilhado por síncrono e batch.
+
+    Toda falha aqui carrega o uso: neste ponto a chamada JÁ FOI COBRADA.
+    """
+    tool_use = next((b for b in content if b.type == "tool_use"), None)
+    if tool_use is None:
+        raise ExtractionFailed(
+            "resposta sem bloco tool_use", model, in_tok, out_tok, raw=None
+        )
+    payload = _unwrap(tool_use.input)
+    try:
+        return ExtractedDocument.model_validate(payload)
+    except ValidationError as exc:
+        raise ExtractionFailed(
+            f"tool_use.input não bate com o schema: {exc}",
+            model, in_tok, out_tok, raw=tool_use.input,
+        ) from exc
+
+
+def extract_document(text: str, model: str | None = None) -> ExtractionResult:
+    """Extração SÍNCRONA de UMA CG (1 doc, preço cheio). Para volume, use o batch."""
+    model = model or MODEL
+    client = anthropic.Anthropic()  # lê ANTHROPIC_API_KEY do ambiente
 
     # Streaming: com max_tokens alto a SDK exige stream (geração pode passar de 10 min).
     # Não usamos os eventos token-a-token — só acumulamos e pegamos a mensagem final.
-    with client.messages.stream(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        system=SYSTEM_PROMPT,
-        tools=[tool],
-        tool_choice={"type": "tool", "name": _TOOL_NAME},
-        messages=[
-            {
-                "role": "user",
-                "content": f"Extraia os dados desta CG:\n\n<cg>\n{text}\n</cg>",
-            }
-        ],
-    ) as stream:
+    with client.messages.stream(**build_params(text, model)) as stream:
         resp = stream.get_final_message()
 
     # Diagnóstico: se o output for truncado (max_tokens), o JSON do tool vem parcial/vazio.
@@ -104,11 +181,10 @@ def extract_document(text: str) -> ExtractionResult:
             file=sys.stderr,
         )
 
-    # Com tool_choice forçado, o primeiro (e único) bloco é o tool_use.
-    tool_use = next(b for b in resp.content if b.type == "tool_use")
+    in_tok, out_tok = resp.usage.input_tokens, resp.usage.output_tokens
     return ExtractionResult(
-        document=ExtractedDocument.model_validate(tool_use.input),
-        model=MODEL,
-        input_tokens=resp.usage.input_tokens,
-        output_tokens=resp.usage.output_tokens,
+        document=parse_response(resp.content, model, in_tok, out_tok),
+        model=model,
+        input_tokens=in_tok,
+        output_tokens=out_tok,
     )
