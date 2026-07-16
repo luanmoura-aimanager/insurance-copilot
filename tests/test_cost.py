@@ -174,3 +174,33 @@ async def test_reconcile_is_noop_when_already_recorded(db_session):
     assert event is None  # nada gravado
     n = await db_session.scalar(select(func.count()).select_from(CostEvent))
     assert n == 1  # continua uma só
+
+
+async def test_reconcile_ignores_eval_row_for_same_doc(db_session):
+    """Colisão de label real: o doc do golden tem uma linha da eval (batch=False) E é
+    fixado em todo batch. A reconciliação de uma chamada de BATCH não pode ser mascarada
+    pela linha da eval — senão o custo de batch faltante ficaria invisível."""
+    await record_cost_event(  # linha da eval pro mesmo doc (batch=False)
+        db_session,
+        agent_name="extraction-eval",
+        model="modelo-teste",
+        input_tokens=1000,
+        output_tokens=0,
+        label="susep_482868",
+        pricing=PRICING,
+        batch=False,
+    )
+    event = await reconcile_cost_event(  # chamada de batch faltante, MESMO label
+        db_session,
+        agent_name="extraction",
+        model="modelo-teste",
+        input_tokens=1_000_000,
+        output_tokens=0,
+        label="susep_482868",
+        pricing=PRICING,
+        batch=True,
+    )
+    assert event is not None  # NÃO mascarado pela linha da eval
+    assert event.batch is True
+    n = await db_session.scalar(select(func.count()).select_from(CostEvent))
+    assert n == 2  # eval (batch=False) + batch (batch=True)

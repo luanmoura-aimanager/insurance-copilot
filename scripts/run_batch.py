@@ -123,12 +123,15 @@ async def main() -> None:
 
             msg = outcome.message
             in_tok, out_tok = msg.usage.input_tokens, msg.usage.output_tokens
+            # Precifica pelo modelo que de fato serviu a chamada (é o que foi cobrado),
+            # não por args.model — mesma razão do reconcile no rescue.
+            billed_model = getattr(msg, "model", None) or args.model
 
             # A chamada foi cobrada — grava o custo ANTES de tentar parsear.
             event = await record_cost_event(
                 session,
                 agent_name="extraction",
-                model=args.model,
+                model=billed_model,
                 input_tokens=in_tok,
                 output_tokens=out_tok,
                 label=outcome.custom_id,

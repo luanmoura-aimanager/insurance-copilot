@@ -60,6 +60,9 @@ async def main() -> None:
                 continue
 
             msg = outcome.message
+            # O modelo que de fato serviu a chamada (não args.model, que pode diferir do
+            # que o run original submeteu) — é ele que foi cobrado, então é ele que precifica.
+            billed_model = getattr(msg, "model", None) or args.model
 
             # Reconcilia o custo ANTES de qualquer skip: o caso perigoso é justamente o doc
             # que já está no banco (o run persistiu e morreu antes de gravar o custo). Grava
@@ -67,7 +70,7 @@ async def main() -> None:
             event = await reconcile_cost_event(
                 session,
                 agent_name="extraction",
-                model=args.model,
+                model=billed_model,
                 input_tokens=msg.usage.input_tokens,
                 output_tokens=msg.usage.output_tokens,
                 label=outcome.custom_id,
@@ -97,8 +100,16 @@ async def main() -> None:
                 n_fail += 1
                 continue
 
-            pd_id = await persist_document(session, doc, row)
-            await session.commit()
+            # Mesmo endurecimento do run_batch: um erro inesperado no persist não pode
+            # derrubar o loop e deixar os docs seguintes sem reconciliar o custo deles.
+            try:
+                pd_id = await persist_document(session, doc, row)
+                await session.commit()
+            except Exception as exc:
+                await session.rollback()  # o cost_event já foi reconciliado/commitado acima
+                print(f"  [{outcome.custom_id}] persist falhou (custo já registrado): {str(exc)[:120]}")
+                n_fail += 1
+                continue
             n_ok += 1
             print(f"  [{outcome.custom_id}] resgatado  doc_id={pd_id}  "
                   f"coberturas={len(doc.coverages)}")
