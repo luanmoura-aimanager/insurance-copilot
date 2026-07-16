@@ -15,6 +15,7 @@ import json
 from decimal import Decimal
 from pathlib import Path
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import CostEvent
@@ -82,3 +83,45 @@ async def record_cost_event(
     session.add(event)
     await session.flush()
     return event
+
+
+async def cost_event_exists_by_label(session: AsyncSession, label: str) -> bool:
+    """Já existe uma linha de custo pra essa chamada (identificada por `label`)?"""
+    hit = await session.scalar(select(CostEvent.id).where(CostEvent.label == label))
+    return hit is not None
+
+
+async def reconcile_cost_event(
+    session: AsyncSession,
+    *,
+    agent_name: str,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    label: str,
+    pricing: dict | None = None,
+    batch: bool = False,
+) -> CostEvent | None:
+    """Grava a linha de custo SÓ se ainda não houver uma pra essa chamada (por `label`).
+
+    É o que fecha a lacuna do resgate: se o run original morreu antes de registrar o
+    custo (ex.: TimeoutError no batch.wait), o resgate preenche; se o custo já foi
+    registrado, não conta o mesmo dinheiro duas vezes. Devolve o evento novo ou None.
+
+    Reconcilia por `label` (o custom_id da chamada). Uma re-extração via --force gera
+    uma chamada nova com o MESMO label — se um run anterior já deixou linha por esse
+    label, esta reconciliação não grava a da chamada nova. É o trade-off consciente do
+    resgate: preferimos nunca contar em dobro a garantir cada centavo de re-extrações.
+    """
+    if await cost_event_exists_by_label(session, label):
+        return None
+    return await record_cost_event(
+        session,
+        agent_name=agent_name,
+        model=model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        label=label,
+        pricing=pricing,
+        batch=batch,
+    )

@@ -10,7 +10,13 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import func, select
 
-from app.cost import cost_usd, load_pricing, record_cost_event
+from app.cost import (
+    cost_event_exists_by_label,
+    cost_usd,
+    load_pricing,
+    reconcile_cost_event,
+    record_cost_event,
+)
 from app.models import CostEvent
 
 PRICING = {
@@ -104,3 +110,67 @@ async def test_two_calls_two_rows(db_session):
     total = await db_session.scalar(select(func.sum(CostEvent.cost_usd)))
     assert n == 2
     assert total == Decimal("4.000000")  # 2 chamadas x 1M tokens x $2
+
+
+# --- reconciliação por label (resgate de run parcial) ---
+# Fecha a lacuna: um run que morreu antes de gravar o custo deixaria uma chamada paga
+# sem linha. O resgate grava a linha que falta, mas NUNCA conta o mesmo dinheiro 2x.
+
+
+async def test_exists_by_label_reflects_the_row(db_session):
+    assert await cost_event_exists_by_label(db_session, "susep_777") is False
+    await record_cost_event(
+        db_session,
+        agent_name="extraction",
+        model="modelo-teste",
+        input_tokens=1000,
+        output_tokens=0,
+        label="susep_777",
+        pricing=PRICING,
+    )
+    assert await cost_event_exists_by_label(db_session, "susep_777") is True
+
+
+async def test_reconcile_records_when_missing(db_session):
+    """Custo ausente (run morreu antes de gravar) → o resgate preenche a linha."""
+    event = await reconcile_cost_event(
+        db_session,
+        agent_name="extraction",
+        model="modelo-teste",
+        input_tokens=1_000_000,
+        output_tokens=0,
+        label="susep_482868",
+        pricing=PRICING,
+        batch=True,
+    )
+    assert event is not None
+    assert event.cost_usd == Decimal("1.000000")  # 1M x $2 x 50% (batch)
+    n = await db_session.scalar(select(func.count()).select_from(CostEvent))
+    assert n == 1
+
+
+async def test_reconcile_is_noop_when_already_recorded(db_session):
+    """Custo já registrado pelo run → o resgate NÃO grava de novo (sem contar 2x)."""
+    await record_cost_event(
+        db_session,
+        agent_name="extraction",
+        model="modelo-teste",
+        input_tokens=1_000_000,
+        output_tokens=0,
+        label="susep_482868",
+        pricing=PRICING,
+        batch=True,
+    )
+    event = await reconcile_cost_event(
+        db_session,
+        agent_name="extraction",
+        model="modelo-teste",
+        input_tokens=1_000_000,
+        output_tokens=0,
+        label="susep_482868",
+        pricing=PRICING,
+        batch=True,
+    )
+    assert event is None  # nada gravado
+    n = await db_session.scalar(select(func.count()).select_from(CostEvent))
+    assert n == 1  # continua uma só
