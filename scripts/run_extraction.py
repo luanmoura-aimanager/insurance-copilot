@@ -17,6 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from app.cost import cost_usd  # noqa: E402
 from app.extraction.extract import extract_document  # noqa: E402
 from app.extraction.manifest import manifest_row_for_pdf  # noqa: E402
 from app.extraction.pdf import pdf_to_text  # noqa: E402
@@ -34,10 +35,14 @@ def main() -> None:
     print(f"      {len(text):,} chars (~{len(text)//4:,} tokens)", file=sys.stderr)
 
     print(f"[2/3] Chamando o LLM ...", file=sys.stderr)
-    doc = extract_document(text)
+    result = extract_document(text)
+    doc = result.document
 
     print(f"[3/3] {len(doc.coverages)} coberturas, "
-          f"{len(doc.general_exclusions)} exclusões gerais\n", file=sys.stderr)
+          f"{len(doc.general_exclusions)} exclusões gerais", file=sys.stderr)
+    print(f"[custo] {result.model}  in={result.input_tokens:,}  out={result.output_tokens:,}  "
+          f"= US$ {cost_usd(result.model, result.input_tokens, result.output_tokens)}\n",
+          file=sys.stderr)
 
     # Cross-check com o manifesto (ground truth de proveniência).
     row = manifest_row_for_pdf(pdf_path)

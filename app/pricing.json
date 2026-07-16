@@ -1,0 +1,12 @@
+{
+  "_note": "USD por 1M de tokens. Preço é CONFIG, não código — muda com o tempo. Sonnet 5 está em preço promocional (2/10) até 2026-08-31; depois vira 3/15. Atualizar aqui quando virar.",
+  "_source": "https://platform.claude.com/docs/en/about-claude/pricing",
+  "claude-sonnet-5": {
+    "input_per_mtok": "2",
+    "output_per_mtok": "10"
+  },
+  "claude-haiku-4-5-20251001": {
+    "input_per_mtok": "1",
+    "output_per_mtok": "5"
+  }
+}

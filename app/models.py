@@ -1,6 +1,7 @@
 from datetime import datetime
+from decimal import Decimal
 
-from sqlalchemy import CheckConstraint, ForeignKey, UniqueConstraint, func
+from sqlalchemy import CheckConstraint, ForeignKey, Numeric, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -63,6 +64,30 @@ class CoveragePeril(Base):
 
     coverage_id: Mapped[int] = mapped_column(ForeignKey("coverage.id"), primary_key=True)
     peril_id: Mapped[int] = mapped_column(ForeignKey("peril.id"), primary_key=True)
+
+
+class CostEvent(Base):
+    """One LLM call = one row. The grain is deliberate: attributing cost per call (not per
+    document or per run) is what lets us answer 'what did extraction cost per doc?' and,
+    later, 'which agent burns the budget?'.
+
+    Not part of the domain schema — this is governance/observability.
+    """
+
+    __tablename__ = "cost_event"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    agent_name: Mapped[str]                     # 'extraction' now; supervisor/sql/rag later
+    model: Mapped[str]                          # exact model string billed
+    input_tokens: Mapped[int]
+    output_tokens: Mapped[int]
+    # Numeric (not float): billing must be exact — float would drift over thousands of calls.
+    cost_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6))
+    # Batch API bills at 50%. Recording the flag makes a half-priced row self-explanatory
+    # instead of looking like a pricing bug during an audit.
+    batch: Mapped[bool] = mapped_column(default=False)
+    label: Mapped[str | None]                   # what this call was about (e.g. susep_<id>)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
 class Exclusion(Base):
