@@ -1,0 +1,221 @@
+{
+  "insurer": "Porto Seguro",
+  "product": "Porto Seguro Residência - Essencial e Fácil",
+  "susep_process": "15414.100639/2004-31",
+  "version": "05/12/2025",
+  "property_type": "habitual",
+  "coverages": [
+    {
+      "coverage_name": "Incêndio, Explosão, Implosão, Fumaça e Queda de Aeronaves",
+      "plan": "Essencial/Fácil",
+      "kind": "basic",
+      "deductible_type": "defined_in_policy",
+      "deductible_rule_text": "Em cada sinistro indenizável, parcial ou total, ocorrido nas coberturas contratadas, o segurado terá uma Participação Obrigatória, de acordo com o estabelecido na apólice. A Seguradora indenizará o valor que exceder a Participação Obrigatória do Segurado.",
+      "perils": [
+        "incendio_explosao",
+        "fumaca"
+      ],
+      "exclusions": [
+        "Danos elétricos causados a equipamentos e/ou instalações elétricas ou eletrônicas, mesmo que tenham ocorrido devido à de queda de raio",
+        "Extravio ou subtração de bens ainda que decorrentes dos eventos cobertos",
+        "Motocicletas, quadriciclos, bugues/buggy e veículos de qualquer espécie ou finalidade",
+        "Veículos de passeio que não sejam de propriedade de moradores permanentes do imóvel segurado",
+        "Veículos de passeio que possuam seguro especifico",
+        "Componentes, peças, acessórios e mercadorias",
+        "Veículos danificados, em reforma ou que já tenham sido envolvidos em acidentes e não reparados",
+        "Veículos que sofrerem danos resultantes de incêndio iniciado no próprio veículo",
+        "Implosão programada de quaisquer estruturas de construção civil, prédios, edifícios e similares, inclusive quando motivada por riscos à segurança",
+        "Incêndio e explosão consequentes do uso, guarda, manuseio ou armazenamento de artefatos explosivos, artigos pirotécnicos, fogos de artifício, pólvora, dinamite, produtos químicos e inflamáveis",
+        "Incêndio decorrente de solda realizada em inobservância às Normas Técnicas"
+      ]
+    },
+    {
+      "coverage_name": "Danos Elétricos",
+      "plan": "Essencial/Fácil",
+      "kind": "additional",
+      "deductible_type": "defined_in_policy",
+      "deductible_rule_text": "Em cada sinistro indenizável, parcial ou total, ocorrido nas coberturas contratadas, o segurado terá uma Participação Obrigatória, de acordo com o estabelecido na apólice. A Seguradora indenizará o valor que exceder a Participação Obrigatória do Segurado.",
+      "perils": [
+        "danos_eletricos"
+      ],
+      "exclusions": [
+        "Danos elétricos causados direta ou indiretamente por desgaste natural pelo uso, deterioração gradativa, erosão, corrosão, oxidação, incrustação, fadiga, umidade, mofo, maresia, vapores e vibrações",
+        "Danos mecânicos que não sejam decorrentes de danos elétricos",
+        "Danos elétricos causados por água e/ou qualquer substância líquida, salvo em decorrência de Vendaval",
+        "Baterias, fusíveis, resistências de aquecimento, lâmpadas de qualquer tipo, quaisquer componentes que por sua natureza necessitem de trocas periódicas",
+        "Danos elétricos decorrente da subtração ou da tentativa dos fios, cabos e para raios"
+      ]
+    },
+    {
+      "coverage_name": "Perda ou Pagamento de Aluguel",
+      "plan": "Essencial/Fácil",
+      "kind": "additional",
+      "deductible_type": "defined_in_policy",
+      "deductible_rule_text": "Em cada sinistro indenizável, parcial ou total, ocorrido nas coberturas contratadas, o segurado terá uma Participação Obrigatória, de acordo com o estabelecido na apólice. A Seguradora indenizará o valor que exceder a Participação Obrigatória do Segurado.",
+      "perils": [
+        "perda_aluguel"
+      ],
+      "exclusions": [
+        "A cobertura não se aplicará para imóveis desocupados e/ou desabitados"
+      ]
+    },
+    {
+      "coverage_name": "Quebra de Vidros",
+      "plan": "Essencial/Fácil",
+      "kind": "additional",
+      "deductible_type": "defined_in_policy",
+      "deductible_rule_text": "Em cada sinistro indenizável, parcial ou total, ocorrido nas coberturas contratadas, o segurado terá uma Participação Obrigatória, de acordo com o estabelecido na apólice. A Seguradora indenizará o valor que exceder a Participação Obrigatória do Segurado.",
+      "perils": [
+        "quebra_vidros"
+      ],
+      "exclusions": [
+        "Incêndio, danos físicos ao local de risco segurado pelo impacto de queda de raio ou explosão, ocorridos no local onde estão instalados os vidros, espelhos, louças sanitárias, mármores, corian's, granitos e similares",
+        "Quebras resultantes do emprego de técnicas ou materiais inadequados à instalação, substituição, remoção e falha da manutenção dos vidros, espelhos, louças sanitárias, mármores, corian's, granitos e similares",
+        "Arranhaduras ou lascas",
+        "Vidro de cristal",
+        "Móveis feitos totalmente com vidros, espelhos, mármores, corian's, granitos e similares",
+        "Móveis ou objetos atingidos pela queda ou quebra do vidro ou espelho"
+      ]
+    },
+    {
+      "coverage_name": "Subtração de Bens",
+      "plan": "Essencial/Fácil",
+      "kind": "additional",
+      "deductible_type": "defined_in_policy",
+      "deductible_rule_text": "Em cada sinistro indenizável, parcial ou total, ocorrido nas coberturas contratadas, o segurado terá uma Participação Obrigatória, de acordo com o estabelecido na apólice. A Seguradora indenizará o valor que exceder a Participação Obrigatória do Segurado.",
+      "perils": [
+        "roubo_furto_qualificado"
+      ],
+      "exclusions": [
+        "Furto não coberto: subtração de bens sem deixar vestígios materiais da sua ocorrência e sem a destruição ou rompimento de obstáculos; ocorrido mediante o uso de chave falsa, com abuso de confiança ou mediante fraude, escalada ou destreza; ocorrido quando o segurado ou outra pessoa entrega o bem voluntariamente em decorrência de manobra fraudulenta de terceiros para ludibriá-lo; quando o terceiro se apodera do bem do segurado em virtude de a posse ter sido dada pelo próprio segurado ou por outra pessoa",
+        "Bens que estiverem em áreas livres e edificações abertas e semiabertas, inclusive quando se tratar de varandas, garagens abertas e terraços, exceto máquinas de lavar e/ou secar roupas, tanquinho, centrífugas e os bens devidamente incorporados e/ou fixados ao imóvel e que, por sua própria natureza, sejam de uso exclusivo em áreas abertas ou semiabertas, tais como: ar-condicionado, câmeras de circuito fechado, geradores",
+        "Extorsão, extorsão mediante sequestro e/ou extorsão indireta, definidas conforme artigos 158 a 160 do Código Penal",
+        "Subtração de portas de abrigos de gás, água ou de luz e demais portas do imóvel; portões de entrada ou garagem, lixeira basculante do portão; janelas, grades, antenas, câmeras de circuito interno, interfone ou porteiro eletrônico, equipamentos de playground, equipamentos de piscina, qualquer tipo de bomba e medidores de água ou luz instalados ou não no imóvel segurado",
+        "Subtração cometida em razão da ocorrência de incêndio, raio, explosão, tumultos, vendaval, furacão, ciclone, tornado, queda de granizo, impacto de veículos, queda de aeronaves e engenhos aéreos",
+        "Subtração total ou parcial de quaisquer instalações elétricas, fios, cabos e para-raios, bem como os danos da prática ou tentativa de subtração",
+        "Desaparecimento, estelionato, apropriação indébita e extravio",
+        "Subtração de cano de cobre",
+        "Qualquer outra modalidade de subtração que não possua as características descritas nos riscos garantidos por essa cobertura"
+      ]
+    },
+    {
+      "coverage_name": "Vendaval, Furacão, Ciclone, Tornado e Queda de Granizo",
+      "plan": "Essencial/Fácil",
+      "kind": "additional",
+      "deductible_type": "defined_in_policy",
+      "deductible_rule_text": "Em cada sinistro indenizável, parcial ou total, ocorrido nas coberturas contratadas, o segurado terá uma Participação Obrigatória, de acordo com o estabelecido na apólice. A Seguradora indenizará o valor que exceder a Participação Obrigatória do Segurado.",
+      "perils": [
+        "vendaval",
+        "granizo"
+      ],
+      "exclusions": [
+        "Desgaste natural causado pelo uso, deterioração gradativa, vício próprio, defeito visível, corrosão, incrustação, ferrugem",
+        "Arranhões em superfícies pintadas ou polidas",
+        "Dano a qualquer tipo de veículo, com ou sem tração própria. Entende-se por veículo, qualquer meio mecânico de transporte de pessoas ou coisas",
+        "Danos causados exclusivamente pela ação da chuva ou quando não relacionados aos eventos cobertos",
+        "Inundação ou alagamento, causado por transbordamentos de rios e/ou enchentes",
+        "Danos decorrentes da entrada de água causados pela falta de conservação de telhados e calhas e/ou má conservação das instalações de água e de esgoto do imóvel",
+        "Danos causados diretamente por entrada de água de chuva e/ou granizo em aberturas naturais do imóvel segurado, tais como janelas, vitrôs, portas e frestas para ventilação natural, não decorrentes dos riscos cobertos",
+        "Danos causados por gelo derretido, bem como pelo entupimento e/ou rompimento de calhas e tubulações do imóvel segurado por qualquer causa, exceto se decorrente de queda de granizo",
+        "Quaisquer danos materiais e/ou corporais causados a terceiros",
+        "Perdas e danos a bens existentes em áreas livres, varandas, terraços e em edificações abertas ou semiabertas, exceto os bens devidamente incorporados e/ou fixados ao imóvel"
+      ]
+    },
+    {
+      "coverage_name": "Responsabilidade Civil Familiar (Danos a Terceiros)",
+      "plan": "Essencial/Fácil",
+      "kind": "additional",
+      "deductible_type": "defined_in_policy",
+      "deductible_rule_text": "Em cada sinistro indenizável, parcial ou total, ocorrido nas coberturas contratadas, o segurado terá uma Participação Obrigatória, de acordo com o estabelecido na apólice. A Seguradora indenizará o valor que exceder a Participação Obrigatória do Segurado.",
+      "perils": [
+        "rc_familiar"
+      ],
+      "exclusions": [
+        "Danos causados ao próprio segurado, ao seu cônjuge/companheiro, aos seus ascendentes e descendentes, aos parentes naturais do segurado até 3° grau ou por afinidade, nos termos da legislação vigente, demais moradores da residência e inquilinos",
+        "Danos causados aos empregados, prestadores de serviços e diaristas, exceto para os eventos mencionados como cobertos na alínea 'g' desta cobertura",
+        "Danos causados a bens de terceiros em poder do segurado",
+        "Responsabilidades assumidas por contratos ou convenções, bem como os danos consequentes de seu descumprimento",
+        "Multas, transações penais (exceto composição civil para indenização das vítimas), fianças impostas ao segurado e despesas de qualquer natureza relativas a ações ou processos criminais",
+        "Danos causados por contaminação, intoxicação e poluição, inclusive ao meio ambiente",
+        "Danos causados por infiltração e umidade na residência segurada",
+        "Danos decorrentes do exercício de atividades comerciais ou serviços profissionais, entendendo-se este último por serviços prestados por pessoas com conhecimento ou treinamento técnico especializado, habilitado por órgãos competentes, de âmbito nacional, e geralmente denominados 'profissionais liberais', por exemplo: advogados, arquitetos, auditores, corretores de seguros, contadores, dentistas, diretores e administradores de empresas, enfermeiros, engenheiros, farmacêuticos, fisioterapeutas, médicos, notários e profissionais de cartórios, veterinários, dentre outros",
+        "Danos causados por qualquer tipo de obra de reforma, ampliação, construção, reconstrução, demolição do imóvel e suas instalações e desentulho, bem como trabalhos de instalação e montagem",
+        "Danos causados a veículos, ocorridos em locais de propriedade, alugados ou controlados pelo segurado",
+        "Danos causados por veículos de propriedade ou conduzidos pelo segurado, seu cônjuge, respectivos ascendentes e descendentes, bem como a quaisquer parentes ou pessoas que com ele residam ou dele dependam economicamente e/ou empregados domésticos no exercício de suas funções",
+        "Danos decorrentes do exercício ou prática dos seguintes esportes: caça (inclusive submarina), tiro ao alvo, equitação, esqui-aquático (inclusive 'Jet-ski'), 'surf', 'windsurf', voo livre (inclusive voos em planadores, asa delta, etc.), pesca, canoagem, esgrima, balonismo, boxe, artes marciais, paraquedismo, arco e flecha e ultraleve",
+        "Danos causados por fenômenos da natureza como: microexplosão atmosférica, tempestade, erupção ou emanação vulcânica, meteoro, meteorito, ventos, vendaval, ciclone, tornado, furacão, queda de granizo, alagamento, enxurrada, enchentes, inundação, transbordamentos de rios, canais, riachos ou represas, desmoronamento, tsunami, ressaca do mar, maremoto, seca, tremor de terra, terremoto, queda de raio, neve e geada",
+        "Reclamações decorrentes de ações de regresso contra o segurado, promovidas pela Previdência Social",
+        "Reclamações resultantes do descumprimento de obrigações trabalhistas relativas à seguridade social, seguros de acidentes do trabalho, pagamentos de salários",
+        "Danos causados por drone",
+        "Perdas financeiras de qualquer causa e lucros cessantes",
+        "Despesas do segurado ou do advogado com locomoção, refeição ou estadias, custas e despesas processuais ou arbitrais, honorários periciais e advocatícios, de processos judiciais, arbitrais ou extrajudiciais",
+        "Juros, correção monetária ou qualquer outra verba que o segurado seja condenado a pagar — quando for comprovado que o segurado tenha causado o sinistro e não tenha concordado em utilizar o seguro para o terceiro. Nessa hipótese, a responsabilidade da seguradora limita-se ao valor dos prejuízos apurados na data do sinistro",
+        "Danos decorrentes de Riscos Cibernéticos",
+        "Danos punitivos ou exemplares",
+        "Danos causados pela ação de animais não domésticos ou insetos no terreno segurado, inclusive em árvores, como por exemplo: cupins, roedores, aracnídeos, abelhas, pássaros e outros",
+        "Prejuízos/danos não resultantes diretamente da responsabilidade civil do segurado",
+        "Danos e/ou prejuízos não resultantes diretamente da responsabilidade civil por danos materiais e corporais cobertos",
+        "Danos decorrentes da má conservação do imóvel segurado",
+        "Danos resultantes de dolo do segurado",
+        "Danos morais e Danos estéticos",
+        "Danos relacionados com doença profissional, doença de trabalho ou similar",
+        "Morte e Invalidez Permanente total ou parcial por doença",
+        "Morte Natural",
+        "Danos causados por/pela atividade profissional exercida na residência segurada"
+      ]
+    },
+    {
+      "coverage_name": "Roubo de Celular",
+      "plan": "Essencial",
+      "kind": "additional",
+      "deductible_type": "defined_in_policy",
+      "deductible_rule_text": "Em cada sinistro indenizável, parcial ou total, ocorrido nas coberturas contratadas, o segurado terá uma Participação Obrigatória, de acordo com o estabelecido na apólice. A Seguradora indenizará o valor que exceder a Participação Obrigatória do Segurado.",
+      "perils": [
+        "roubo_furto_qualificado"
+      ],
+      "exclusions": [
+        "Qualquer outra modalidade de furto não coberto, subtração de bens sem deixar vestígios materiais de sua ocorrência e sem destruição ou rompimento de obstáculos, ocorrido mediante uso de chave falsa, com abuso de confiança ou mediante fraude, escalada ou destreza",
+        "Desaparecimento, perda ou extravio do equipamento segurado",
+        "Quando o segurado ou usuário entrega o bem segurado voluntariamente em decorrência de manobra fraudulenta de outrem para ludibria-lo, caracterizando estelionato",
+        "Quando alguém se apodera do bem segurado em virtude de a posse ter sido dada pelo próprio segurado ou usuário, caracterizando apropriação indébita",
+        "Furto do bem segurado deixado no interior de veículos, mesmo que cometido com arrombamento e/ou rompimento de portas, vidros ou outras formas de acesso ao seu interior"
+      ]
+    }
+  ],
+  "general_exclusions": [
+    "Chuvas intensas/tempestades, erupção/emanação vulcânica, geada, maremoto, meteorito, meteoro, rajadas de vento não caracterizadas como vendaval nos termos definidos no Glossário, ressaca do mar, seca, tsunami, microexplosão atmosférica e demais fenômenos da natureza não previstos expressamente como cobertos por alguma das coberturas trazidas nestas Condições Gerais",
+    "Vendaval, ciclone, tornado, furacão, granizo, desmoronamento, terremoto e tremor de terra, salvo se contratada cobertura específica, respeitando suas garantias e exclusões",
+    "Rompimento de barragem ou de adutoras",
+    "Fenômenos da natureza que tenham como consequências o alagamento, enchente, enxurrada, inundação, transbordamento de rios, canais, riachos ou represas, salvo se contratada cobertura específica respeitando suas garantias e exclusões",
+    "Entrada de água de chuva, aguaceiro e tromba d'água, infiltração ou extravasamento de água ou esgoto, torneira ou registro aberto, entupimento, insuficiência, falta de conservação ou falha de instalação de calhas, ralos, tubulação de água ou esgoto",
+    "Ampliação, troca de material ou benfeitorias em áreas não danificadas pelo sinistro",
+    "Desarranjo /ou defeito mecânico, desgaste natural pelo uso, deterioração gradativa, defeito de fabricação, vício próprio, fim de vida útil, defeito oculto, umidade, erosão, corrosão, ferrugem, oxidação, incrustação e fadiga, falha de construção, erro de projeto",
+    "Abandono, manutenção ineficiente e/ou inadequada, operações de reparo, ajustamento ou manutenção, mau acondicionamento de bens, equipamentos e instalações",
+    "Operações de busca, recuperação e rescaldo de objetos, bens ou pessoas após a ocorrência de sinistro",
+    "Obras, reformas, construção ou reconstrução",
+    "Desaparecimento ou extravio de bens, roubo, apropriação indébita, estelionato e extorsão",
+    "Qualquer outra modalidade subtração que não possua as características descritas nos riscos garantidos",
+    "Ação paulatina (contínua, intermitente e/ou periódica), de fatores ambientais presentes nas instalações do imóvel segurado, tais como temperatura, umidade, fumaça, infiltrações, molhadura, derramamento, transbordamento, vazamento, vibrações, gases e vapores poluição ou contaminação",
+    "Dilatação de líquido em congelamento, geada e neve, bem como congelamento do sistema de painel solar",
+    "Ação de animais ou insetos no terreno segurado, inclusive em árvores, como por exemplo: cupins, roedores, aracnídeos, abelhas, pássaros e outros",
+    "Prática de atividades consideradas ilegais",
+    "Atos de autoridade pública, salvo para evitar propagação de danos cobertos por este contrato",
+    "Atos de vandalismo, motins, arruaças, conflitos sociais, protestos, manifestações, agitação, greves, e tumulto ou quaisquer outras perturbações de ordem pública ou de qualquer natureza",
+    "Explosão decorrente da confecção e/ou manuseio de fogos de artifício, pólvora ou similares no local segurado",
+    "Mau uso das instalações elétricas, ligações clandestinas ou provisórias, instalações com sobrecarga ou em desconformidade com as normas técnicas de segurança",
+    "Atos de hostilidade, guerra (declaração ou não), inimigo estrangeiro, operações bélicas, guerrilha, guerra civil, química ou bacteriológica, invasão, rebelião, insurreição, revolução, conspiração, sedição, sublevação ou ato de autoridade pública, militar ou de usurpadores de autoridade ou atos de qualquer pessoa que esteja agindo por parte de ou em ligação com qualquer organização cujas atividades visem à derrubada, pela força, do Governo 'de jure' (de direito) ou 'de facto' (de fato) ou instigar a queda do mesmo por meio de atos de terrorismo ou subversão. Atos de terrorismo não estarão cobertos, desde que tenham sido reconhecidos como atentatórios à ordem pública pela autoridade competente",
+    "Destruição, distorção, apagamento, corrupção ou alteração de dados eletrônicos, por qualquer causa, inclusive por vírus de computador, e ainda, perda de uso, redução em funcionalidade, custos e despesas de qualquer natureza resultantes destas situações, ainda que em decorrência de sinistro coberto",
+    "Radiações ionizantes, contaminação pela radioatividade de qualquer combustível nuclear, resíduos nucleares resultantes de combustão de material nuclear, material de armas nucleares, fissão nuclear, radiação nuclear, lixo nuclear decorrente do uso de combustível nuclear, explosivos nucleares ou qualquer arma nuclear bem como a contaminação radioativa ou exposição a radiações nucleares ou ionizantes. Não haverá cobertura para perda, destruição ou dano de qualquer bem, prejuízos, despesas ou ainda, dano consequente de responsabilidade legal de qualquer natureza, direta ou indiretamente causados por resultantes de ou para os quais tenham contribuído para ocorrência de tais atos",
+    "Incêndio ou explosão resultante de queima de florestas, matas ou matagal, de origem fortuita ou em razão de limpeza de terreno",
+    "Danos corporais, morais e/ou estéticos ao segurado e/ou moradores da residência segurada",
+    "Danos materiais, corporais, morais e/ou estéticos, morte ou invalidez a terceiros, quando não contratada a cobertura específica de Responsabilidade Civil Familiar",
+    "Defeitos estéticos ou arranhaduras",
+    "Despesas com a recomposição de restaurações artesanais, artística ou qualquer tipo de trabalho especializado, pinturas, gravações e inscrições inclusive em vidros e colocação de películas",
+    "Lucros cessantes, perdas financeiras, multas, juros e demais encargos financeiros, indenização por descumprimento contratual, bem como prejuízos indiretos causados ao segurado em virtude da ocorrência do sinistro",
+    "Reembolso de despesas com elaboração de laudos, orçamentos, visita técnica e deslocamento do segurado e/ou de profissionais por ele contratados",
+    "Preexistentes ao início de vigência deste seguro",
+    "Decorrentes de abandono e/ou má conservação/manutenção",
+    "Causados a programas, softwares, registros, dados e informações eletrônicas inclusive em meios magnéticos, bem como as despesas para recomposição dos mesmos",
+    "Multas, transações penais (exceto composição civil para indenização das vítimas), fianças impostas ao segurado e despesas de qualquer natureza relativas a ações ou processos criminais"
+  ]
+}
