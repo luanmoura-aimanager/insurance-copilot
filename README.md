@@ -102,13 +102,42 @@ insurance-copilot/
 ├── docs/
 │   └── schema.html         # visual schema diagram (open in browser)
 ├── scripts/
-│   └── susep_harvest.py    # SUSEP corpus harvester
+│   ├── susep_harvest.py    # SUSEP corpus harvester
+│   └── eval/               # F4 extraction eval harness (see "Extraction eval")
 ├── data/
 │   └── corpus/             # downloaded PDFs (gitignored) + corpus_manifest.json
 ├── docker-compose.yml      # local Postgres
 ├── requirements.txt
 └── .env.example
 ```
+
+## Extraction eval (F4)
+
+A zero-cost harness that checks whether the LLM extraction is faithful to the source CGs —
+no re-extraction, **no Anthropic API calls**. It runs on the Claude Code subscription: the
+scripts only read Postgres + the source PDFs, and the judging is done by Claude reading each
+CG's text against the persisted coverages.
+
+Two parts: a deterministic floor (integrity + a term-density vs coverage-count check via
+`scripts/diagnose_extraction.py`) and a per-document judge (MISSING / HALLUCINATED, with a
+verbatim source quote required for every finding).
+
+```bash
+docker compose up -d && source .venv/bin/activate
+# dump source text + persisted coverages per doc into <out_dir> (one bundle per document)
+python scripts/eval/dump_judge_bundles.py <out_dir>
+# per-doc comparison sheet: extracted coverages vs candidate headers found in the source text
+python scripts/eval/judge_sheet.py <out_dir> <slug>
+```
+
+**Result** ([`scripts/eval/f4_extraction_eval.md`](scripts/eval/f4_extraction_eval.md)):
+30 insurers judged against their source text — **29 PASS · 1 MINOR · 0 FAIL · 0 hallucination**
+(the MINOR is one accessory Assistência-24h coverage HDI skipped). Extraction is faithful at the
+coverage grain; extrapolated to the 138 eligible residential CGs, this is the confidence baseline.
+
+Open items: (1) non-deterministic scope for Assistência 24h — sometimes extracted as a coverage,
+sometimes dropped (ADR candidate); (2) provenance mismatch on XS3 (`susep_process` in DB vs the
+PDF footer).
 
 ## Roadmap
 
