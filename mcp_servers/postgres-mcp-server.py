@@ -115,11 +115,17 @@ def run_query(sql: str) -> str:
     if not rows:
         return f"Columns: {', '.join(columns)}\n(no rows returned)"
 
+    total = len(rows)
     truncated = rows[:100]
     output = f"Columns: {', '.join(columns)}\nRows:\n"
     for row in truncated:
         output += " | ".join(str(value) for value in row) + "\n"
-    output += f"\n({len(truncated)} rows)"
+    # Um LIMIT do próprio caller (> 100) escapa do LIMIT 100 que anexamos, então
+    # o fetch pode passar de 100 — reporta a truncagem em vez de escondê-la.
+    if total > 100:
+        output += f"\n(showing first 100 of {total} rows)"
+    else:
+        output += f"\n({total} rows)"
     return output
 
 
