@@ -2,7 +2,7 @@
 
 A multi-agent system that turns Brazilian home-insurance policy documents into a queryable knowledge base. It harvests *condições gerais* (general terms) registered with SUSEP, extracts their structure into Postgres, and answers coverage-comparison questions in natural language.
 
-> **Status: work in progress.** The data pipeline (SUSEP harvester + extraction schema) and the service skeleton (FastAPI + Postgres) are in place. The agent layer is under construction. See [Roadmap](#roadmap).
+> **Status: work in progress.** The data pipeline (SUSEP harvester + extraction schema) and the service skeleton (FastAPI + Postgres) are in place. The agent layer has its first real slice — an LLM supervisor routing to a single-pass SQL worker over the Postgres MCP server. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -148,7 +148,8 @@ PDF footer).
 - [x] Alembic migrations
 - [x] Test suite (testcontainers)
 - [ ] Production extraction (LLM → tables)
-- [ ] Agent layer (supervisor + SQL/RAG/extraction workers)
+- [x] Postgres MCP SQL server + read-only `insurance_ro` role
+- [~] Agent layer — LLM supervisor (structured output) + single-pass SQL worker done; RAG/extraction workers + a ReAct refinement loop pending
 - [ ] WhatsApp surface + cost attribution
 - [ ] Deploy to Railway
 

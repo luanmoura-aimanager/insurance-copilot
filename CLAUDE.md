@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A multi-agent system that turns Brazilian home-insurance *condições gerais* (general terms registered with SUSEP) into a queryable knowledge base. It answers **coverage-structure** questions ("which insurers cover windstorm without a deductible?"), not pricing — the corpus describes products, and prices live in individual customer policies which are out of scope.
 
-The project is mid-build. What exists: the data pipeline (harvester + validated extraction schema + `app/extraction/` LLM pipeline), a FastAPI/Postgres skeleton, the ORM models + Alembic migrations (`app/models.py`), per-call cost attribution (`app/cost.py` + `pricing.json`), a standalone Postgres MCP SQL server (`mcp_servers/`), and a testcontainers-backed test suite. What does *not* exist yet: the real agent graph (`app/agents/graph.py` is a fake, LLM-less LangGraph spike — see below) and the WhatsApp surface. See the Roadmap in `README.md` for current state before assuming a component exists.
+The project is mid-build. What exists: the data pipeline (harvester + validated extraction schema + `app/extraction/` LLM pipeline), a FastAPI/Postgres skeleton, the ORM models + Alembic migrations (`app/models.py`), per-call cost attribution (`app/cost.py` + `pricing.json`), a standalone Postgres MCP SQL server (`mcp_servers/`), a first real agent graph (`app/agents/graph.py`: LLM supervisor + single-pass SQL worker — see below), and a testcontainers-backed test suite. What does *not* exist yet: the extraction/RAG workers, a ReAct refinement loop in the SQL worker, and the WhatsApp surface. See the Roadmap in `README.md` for current state before assuming a component exists.
 
 ## Commands
 
@@ -33,7 +33,7 @@ pytest -q
 
 # Postgres MCP SQL server (stdio; sync psycopg3, not asyncpg). PYTHONPATH=. is
 # required — the script's own dir goes on sys.path, so `app` isn't importable otherwise.
-PYTHONPATH=. python mcp_servers/postgres-mcp-server.py   # exposes get_schema() / run_query(sql)
+PYTHONPATH=. python mcp_servers/postgres_mcp_server.py   # exposes get_schema() / run_query(sql)
 # Standalone verification (NOT pytest — no test_ functions, pytest collects 0):
 PYTHONPATH=. python mcp_servers/test_postgres_mcp.py                       # schema + SELECT + injection rejections
 RO_ROLE_PASSWORD=... PYTHONPATH=. python mcp_servers/test_readonly_role.py # proves insurance_ro can't write
@@ -55,11 +55,11 @@ RO_ROLE_PASSWORD=... PYTHONPATH=. python mcp_servers/test_readonly_role.py # pro
 
 **Cost attribution is built.** `app/cost.py` writes one `cost_event` row per LLM call. Money uses `Decimal`, never float; prices live in `app/pricing.json` (config, not code — Sonnet 5's promo pricing expires 2026-08-31) and the Batch API's 50% discount is applied via `BATCH_MULTIPLIER`. Unknown model → **fail loud** rather than record a wrong cost.
 
-**SQL worker boundary + defense in depth.** `mcp_servers/postgres-mcp-server.py` is the SQL worker's window onto the data: a stdio FastMCP server exposing `get_schema()` and `run_query(sql)` scoped to the 5 domain tables. Writes are blocked twice: (1) a text filter in `run_query` (reject stacked statements → require a leading `SELECT` → auto-append `LIMIT 100`), and (2) the physically read-only `insurance_ro` Postgres role (Alembic migration `4b285ffad59b`, `GRANT SELECT` only, password from `RO_ROLE_PASSWORD`) — so a write is impossible even if the text filter is bypassed. The folder is `mcp_servers/` (not `mcp/`) so it doesn't shadow the installed FastMCP `mcp` package.
+**SQL worker boundary + defense in depth.** `mcp_servers/postgres_mcp_server.py` is the SQL worker's window onto the data: a stdio FastMCP server exposing `get_schema()` and `run_query(sql)` scoped to the 5 domain tables. `get_schema`/`run_query` are plain module-level functions (the core logic) that are *both* registered as FastMCP tools (`mcp.tool()(fn)`) **and** imported directly by the in-process SQL worker — one implementation, two access paths. Writes are blocked twice: (1) a text filter in `run_query` (reject stacked statements → require a leading `SELECT` → auto-append `LIMIT 100`), and (2) the physically read-only `insurance_ro` Postgres role (Alembic migration `4b285ffad59b`, `GRANT SELECT` only, password from `RO_ROLE_PASSWORD`) — so a write is impossible even if the text filter is bypassed. Connections prefer `DATABASE_URL_RO` (the RO role) when set, falling back to the admin `DATABASE_URL`. `run_query` never raises: SQL *and* connection errors come back as text so the caller doesn't crash. The folder is `mcp_servers/` (not `mcp/`) so it doesn't shadow the installed FastMCP `mcp` package; the filename uses an underscore (not a hyphen) so it's importable.
 
-**Agent layer is still a spike.** `app/agents/graph.py` is a learning skeleton: a LangGraph hub-and-spoke with a *fake, LLM-less* supervisor that alternates between two stub workers, plus a mechanical iteration circuit-breaker. It runs its demo on import (`graph.invoke(...)` at module bottom). Don't import it as if it were the real router.
+**Agent layer: real supervisor + single-pass SQL worker.** `app/agents/graph.py` is a LangGraph hub-and-spoke. The **supervisor** is a real LLM call (`claude-haiku-4-5`) that decides the next hop via forced structured output — `SupervisorDecision.next` is an enum (`Literal["sql_worker","END"]`), the belt that stops the model routing to a worker that doesn't exist. `route()` fails closed (unknown `next` → `END`) and keeps a mechanical iteration circuit-breaker (`MAX_ITERATIONS`). The **SQL worker** is single-pass: question → `get_schema()` → LLM emits one `SELECT` (structured output `{"sql": ...}`) → `run_query()` through the RO role; query/connection errors return as message text so the graph never crashes. All Anthropic calls go through the `app/llm.py::get_client()` factory (the one place to later add retry/timeout/cost tracking). Importing the module no longer runs the graph — the demo `invoke` is behind `if __name__ == "__main__"` (`python -m app.agents.graph`). *Not yet:* a ReAct refinement loop in the worker, and `extraction`/`RAG` workers.
 
-**Intended (not built):** the real supervisor routing to `extraction` / `SQL` / `RAG` workers, and a HMAC-verified WhatsApp (Meta Cloud API) surface.
+**Intended (not built):** the extraction and RAG workers, a ReAct loop in the SQL worker, and a HMAC-verified WhatsApp (Meta Cloud API) surface.
 
 ## SUSEP corpus pipeline (`scripts/`)
 
