@@ -23,18 +23,26 @@ mcp = FastMCP("postgres-mcp-server")
 # As 5 tabelas do domínio — a fronteira do que o worker SQL pode enxergar.
 TABLES = ("policy_document", "coverage", "peril", "coverage_peril", "exclusion")
 
-# normalize_url devolve `postgresql+psycopg://...`; o libpq (psycopg.connect)
-# só entende o scheme puro `postgresql://`, então tiramos o `+psycopg`.
-_NORMALIZED_URL = normalize_url(os.environ["DATABASE_URL"], "psycopg")
-CONNINFO = _NORMALIZED_URL.replace("postgresql+psycopg://", "postgresql://", 1)
+
+def _conninfo() -> str:
+    """String de conexão libpq. Prefere a role read-only (`DATABASE_URL_RO`) quando
+    presente — é a garantia real de segurança: mesmo se o filtro de texto do run_query
+    for burlado, a role não tem permissão de escrever. Cai pro DATABASE_URL admin só se
+    a RO não estiver configurada."""
+    raw = os.environ.get("DATABASE_URL_RO") or os.environ["DATABASE_URL"]
+    # normalize_url devolve `postgresql+psycopg://...`; o libpq (psycopg.connect)
+    # só entende o scheme puro `postgresql://`, então tiramos o `+psycopg`.
+    normalized = normalize_url(raw, "psycopg")
+    return normalized.replace("postgresql+psycopg://", "postgresql://", 1)
 
 
 def _connect():
     """Abre uma conexão nova (read-only). Cada tool fecha a sua."""
-    return psycopg.connect(CONNINFO)
+    return psycopg.connect(_conninfo())
 
 
-@mcp.tool()
+# --- Core (funções puras): chamáveis por import direto (o worker SQL as usa no mesmo
+# processo) E registradas como tools FastMCP mais abaixo. Uma lógica só, dois acessos. ---
 def get_schema() -> str:
     """
     Retorna o schema das 5 tabelas do domínio: cada tabela e suas colunas (com tipo).
@@ -73,7 +81,6 @@ def get_schema() -> str:
     return schema_str
 
 
-@mcp.tool()
 def run_query(sql: str) -> str:
     """
     Executa uma query read-only (SELECT) e retorna até 100 linhas.
@@ -99,17 +106,19 @@ def run_query(sql: str) -> str:
     if not re.search(r"\blimit\b", body, re.IGNORECASE):
         body = f"{body} LIMIT 100"
 
-    conn = _connect()
+    # _connect() dentro do try: uma falha de conexão (senha RO errada, banco fora do ar)
+    # também volta como texto — o worker SQL conta com "run_query nunca levanta".
+    conn = None
     try:
+        conn = _connect()
         cursor = conn.cursor()
         cursor.execute(body)
         columns = [desc[0] for desc in cursor.description]
         rows = cursor.fetchall()
     except psycopg.Error as exc:
-        conn.close()
         return f"Error executing query: {exc}"
     finally:
-        if not conn.closed:
+        if conn is not None and not conn.closed:
             conn.close()
 
     if not rows:
@@ -127,6 +136,14 @@ def run_query(sql: str) -> str:
     else:
         output += f"\n({total} rows)"
     return output
+
+
+# --- Registra as funções core como tools FastMCP (a superfície do protocolo). Registrar
+# por chamada (não por @decorator) preserva os nomes de módulo apontando pras funções
+# puras, então `from mcp_servers.postgres_mcp_server import get_schema, run_query` devolve
+# as funções chamáveis diretas — não os wrappers Tool. ---
+mcp.tool()(get_schema)
+mcp.tool()(run_query)
 
 
 if __name__ == "__main__":
