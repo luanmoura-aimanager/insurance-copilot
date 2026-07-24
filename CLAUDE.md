@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A multi-agent system that turns Brazilian home-insurance *condições gerais* (general terms registered with SUSEP) into a queryable knowledge base. It answers **coverage-structure** questions ("which insurers cover windstorm without a deductible?"), not pricing — the corpus describes products, and prices live in individual customer policies which are out of scope.
 
-The project is mid-build: the data pipeline (harvester + validated extraction schema), a FastAPI/Postgres skeleton, the LLM extraction pipeline (`app/extraction/`), the ORM models + Alembic migrations (`app/models.py`), and a testcontainers-backed test suite exist; the agent layer and WhatsApp surface do not yet. See the Roadmap in `README.md` for current state before assuming a component exists.
+The project is mid-build. What exists: the data pipeline (harvester + validated extraction schema + `app/extraction/` LLM pipeline), a FastAPI/Postgres skeleton, the ORM models + Alembic migrations (`app/models.py`), per-call cost attribution (`app/cost.py` + `pricing.json`), a standalone Postgres MCP SQL server (`mcp_servers/`), and a testcontainers-backed test suite. What does *not* exist yet: the real agent graph (`app/agents/graph.py` is a fake, LLM-less LangGraph spike — see below) and the WhatsApp surface. See the Roadmap in `README.md` for current state before assuming a component exists.
 
 ## Commands
 
@@ -30,6 +30,13 @@ alembic revision --autogenerate -m "message"
 
 # Tests (boots a throwaway Postgres via testcontainers — Docker must be running)
 pytest -q
+
+# Postgres MCP SQL server (stdio; sync psycopg3, not asyncpg). PYTHONPATH=. is
+# required — the script's own dir goes on sys.path, so `app` isn't importable otherwise.
+PYTHONPATH=. python mcp_servers/postgres-mcp-server.py   # exposes get_schema() / run_query(sql)
+# Standalone verification (NOT pytest — no test_ functions, pytest collects 0):
+PYTHONPATH=. python mcp_servers/test_postgres_mcp.py                       # schema + SELECT + injection rejections
+RO_ROLE_PASSWORD=... PYTHONPATH=. python mcp_servers/test_readonly_role.py # proves insurance_ro can't write
 ```
 
 `pytest` and `python -m pytest` both work (`pytest.ini` sets `pythonpath = .`). There is **no linter wired up yet** — that's still a roadmap item; don't invent commands for it.
@@ -44,7 +51,15 @@ pytest -q
 
 **Deductible terminology.** In residential CGs the term is **POS (Participação Obrigatória do Segurado)**, treated as a synonym for "franquia". The dominant pattern is "valor ou percentual definido na apólice" — the CG fixes the *structure*, the number lives in the customer policy. The validated `franquia_tipo` enum is `{sem_franquia, percentual, valor_fixo, definido_na_apolice}`. See `data/pilot_findings.md` for the reasoning behind every schema choice — read it before modeling tables.
 
-**Intended agent layer (not built):** supervisor hub-and-spoke routing to `extraction` / `SQL` / `RAG` workers, with per-call cost attribution and a HMAC-verified WhatsApp (Meta Cloud API) surface.
+**Three Postgres drivers, one URL normalizer.** The app runs on **asyncpg** (async), Alembic on **psycopg2** (sync), and the MCP SQL server on **psycopg3** (`psycopg`, sync — one fresh connection per call, no pool). `app/db_url.py::normalize_url(url, driver)` is the single point that rewrites any provider-supplied `DATABASE_URL` (`postgres://` vs `postgresql://`, and stripping libpq-only query params like `sslmode` that asyncpg rejects) into `postgresql+<driver>://`. The MCP server then strips `+psycopg` back off for the libpq conninfo.
+
+**Cost attribution is built.** `app/cost.py` writes one `cost_event` row per LLM call. Money uses `Decimal`, never float; prices live in `app/pricing.json` (config, not code — Sonnet 5's promo pricing expires 2026-08-31) and the Batch API's 50% discount is applied via `BATCH_MULTIPLIER`. Unknown model → **fail loud** rather than record a wrong cost.
+
+**SQL worker boundary + defense in depth.** `mcp_servers/postgres-mcp-server.py` is the SQL worker's window onto the data: a stdio FastMCP server exposing `get_schema()` and `run_query(sql)` scoped to the 5 domain tables. Writes are blocked twice: (1) a text filter in `run_query` (reject stacked statements → require a leading `SELECT` → auto-append `LIMIT 100`), and (2) the physically read-only `insurance_ro` Postgres role (Alembic migration `4b285ffad59b`, `GRANT SELECT` only, password from `RO_ROLE_PASSWORD`) — so a write is impossible even if the text filter is bypassed. The folder is `mcp_servers/` (not `mcp/`) so it doesn't shadow the installed FastMCP `mcp` package.
+
+**Agent layer is still a spike.** `app/agents/graph.py` is a learning skeleton: a LangGraph hub-and-spoke with a *fake, LLM-less* supervisor that alternates between two stub workers, plus a mechanical iteration circuit-breaker. It runs its demo on import (`graph.invoke(...)` at module bottom). Don't import it as if it were the real router.
+
+**Intended (not built):** the real supervisor routing to `extraction` / `SQL` / `RAG` workers, and a HMAC-verified WhatsApp (Meta Cloud API) surface.
 
 ## SUSEP corpus pipeline (`scripts/`)
 
@@ -62,7 +77,12 @@ python scripts/susep_harvest.py --limit 5      # smoke test
 
 **The PDFs are gitignored** (`data/corpus/*.pdf`) — large and public. Only `corpus_manifest.json` is committed; it records per-version provenance (process, internal id, insurer, CNPJ, url, sha256, dates, `has_text`) and lets anyone re-download and verify the corpus by hash. The download endpoint keys on an **internal numeric id**, while the index keys on **process number** (`15414.NNNNNN/AAAA-DD`) — bridging the two is what the resolve step does.
 
-The extraction pipeline drives two scripts, split so persistence can be re-run without paying for the LLM again: `run_extraction.py <pdf> --out <json>` (pdfplumber → Anthropic forced tool-use → validated nested output, cross-checked against the manifest) and `persist_extraction.py <json> --pdf <pdf>` (deterministic flatten into the 5 tables; provenance from the manifest, not the LLM read). The extracted JSON under `data/extractions/` is gitignored derived output, like the PDFs. `run_extraction.py` needs `ANTHROPIC_API_KEY`; `persist_extraction.py` needs `DATABASE_URL`.
+The extraction logic lives in **`app/extraction/`** (importable modules: `pdf` → `extract` → `schema` → `persist`, plus `manifest`, `batch`, `sample`, `evaluate`); the `scripts/` files are thin CLI wrappers over it. The split is deliberate — persistence can be re-run without paying for the LLM again:
+- `scripts/run_extraction.py <pdf> --out <json>` — pdfplumber → Anthropic forced tool-use (single tool, `input_schema` = the Pydantic tree, `tool_choice` forced) → validated **nested** output, cross-checked against the manifest. Needs `ANTHROPIC_API_KEY`.
+- `scripts/persist_extraction.py <json> --pdf <pdf>` — deterministic flatten of the nested tree into the 5 tables; the LLM returns a tree because it doesn't know DB ids, and this layer assigns ids/FKs. Provenance comes from the manifest, not the LLM read. Needs `DATABASE_URL`.
+- `scripts/run_batch.py` / `app/extraction/batch.py` — mass extraction via the **Batch API at 50% price** (offline, nobody waiting); `sample.py` picks the corpus sample; `evaluate.py` scores a cheaper model against a hand-checked golden (`data/golden/`). `rescue_batch.py` re-reads an already-paid batch's results (they persist ~29 days) so a local *parse* failure costs nothing to retry.
+
+The extracted JSON under `data/extractions/` is gitignored derived output, like the PDFs.
 
 The other scripts are one-off, not production: `susep_probe.py` (blind-sampling viability probe that established corpus volume) and `pilot_extraction.py` (manual hand-read extraction of 2 CGs that validated the schema — produces `data/pilot_extraction.json`, summarized in `data/pilot_findings.md`).
 

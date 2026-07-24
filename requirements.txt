@@ -10,6 +10,9 @@ asyncpg>=0.29
 python-dotenv>=1.2.1
 alembic>=1.13
 psycopg2-binary>=2.9
+langgraph==1.2.9
+psycopg[binary]==3.3.4
+mcp==1.28.1
 pytest>=8.0
 pytest-asyncio>=0.23
 testcontainers[postgres]>=4.0
