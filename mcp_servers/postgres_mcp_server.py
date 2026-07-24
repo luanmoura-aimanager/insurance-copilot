@@ -106,17 +106,19 @@ def run_query(sql: str) -> str:
     if not re.search(r"\blimit\b", body, re.IGNORECASE):
         body = f"{body} LIMIT 100"
 
-    conn = _connect()
+    # _connect() dentro do try: uma falha de conexão (senha RO errada, banco fora do ar)
+    # também volta como texto — o worker SQL conta com "run_query nunca levanta".
+    conn = None
     try:
+        conn = _connect()
         cursor = conn.cursor()
         cursor.execute(body)
         columns = [desc[0] for desc in cursor.description]
         rows = cursor.fetchall()
     except psycopg.Error as exc:
-        conn.close()
         return f"Error executing query: {exc}"
     finally:
-        if not conn.closed:
+        if conn is not None and not conn.closed:
             conn.close()
 
     if not rows:

@@ -97,8 +97,13 @@ def sql_worker(state: State) -> dict:
         "",
     )
 
-    # 2. Schema numa chamada só — dá os nomes de tabela/coluna pro modelo.
-    schema = get_schema()
+    # 2. Schema numa chamada só — dá os nomes de tabela/coluna pro modelo. Se a conexão
+    #    falhar aqui, curto-circuita: sem schema não dá pra gerar SQL, então volta o erro
+    #    como mensagem (o supervisor enxerga e encerra) em vez de estourar o grafo.
+    try:
+        schema = get_schema()
+    except Exception as exc:  # noqa: BLE001 — qualquer falha de DB vira mensagem, não crash
+        return {"messages": [AIMessage(content=f"SQL error (schema): {exc}", name="sql_worker")]}
 
     # 3. LLM gera UMA query, via structured output (devolve {"sql": "..."}).
     client = get_client()
