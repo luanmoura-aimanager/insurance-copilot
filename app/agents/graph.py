@@ -1,10 +1,11 @@
+import asyncio
 from typing import TypedDict, Annotated, Literal
 from langchain_core.messages import HumanMessage, AIMessage
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel
 
-from app.llm import get_client
+from app.llm import get_async_client
 # Import direto das funções core do MCP server (mesmo processo, sem protocolo MCP).
 # run_query já carrega o guard SELECT-only + LIMIT e conecta pela role read-only.
 from mcp_servers.postgres_mcp_server import get_schema, run_query
@@ -57,11 +58,11 @@ class SqlQuery(BaseModel):
 
 
 # --- 3. Supervisor node: decide de verdade, via LLM com structured output ---
-def supervisor(state: State) -> dict:
+async def supervisor(state: State) -> dict:
     i = state["iterations"] + 1
 
-    client = get_client()
-    resp = client.messages.create(
+    client = get_async_client()
+    resp = await client.messages.create(
         model=SUPERVISOR_MODEL,
         max_tokens=512,
         system=SUPERVISOR_SYSTEM,
@@ -90,7 +91,7 @@ def supervisor(state: State) -> dict:
 
 
 # --- 4. SQL worker (single-pass): pergunta -> SQL -> run_query. Sem loop ReAct ainda. ---
-def sql_worker(state: State) -> dict:
+async def sql_worker(state: State) -> dict:
     # 1. Pega a pergunta do usuário (a última HumanMessage do histórico).
     question = next(
         (m.content for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
@@ -100,14 +101,15 @@ def sql_worker(state: State) -> dict:
     # 2. Schema numa chamada só — dá os nomes de tabela/coluna pro modelo. Se a conexão
     #    falhar aqui, curto-circuita: sem schema não dá pra gerar SQL, então volta o erro
     #    como mensagem (o supervisor enxerga e encerra) em vez de estourar o grafo.
+    #    get_schema é psycopg3 SÍNCRONO: roda numa thread pra não travar o event loop.
     try:
-        schema = get_schema()
+        schema = await asyncio.to_thread(get_schema)
     except Exception as exc:  # noqa: BLE001 — qualquer falha de DB vira mensagem, não crash
         return {"messages": [AIMessage(content=f"SQL error (schema): {exc}", name="sql_worker")]}
 
     # 3. LLM gera UMA query, via structured output (devolve {"sql": "..."}).
-    client = get_client()
-    resp = client.messages.create(
+    client = get_async_client()
+    resp = await client.messages.create(
         model=SQL_MODEL,
         max_tokens=1024,
         system=SQL_SYSTEM,
@@ -134,8 +136,9 @@ def sql_worker(state: State) -> dict:
     sql = SqlQuery.model_validate(tool_use.input).sql
 
     # 4. Executa pelo guard + role read-only. run_query nunca levanta: erros voltam como
-    #    texto, então o supervisor os enxerga em vez do grafo estourar.
-    rows = run_query(sql)
+    #    texto, então o supervisor os enxerga em vez do grafo estourar. Síncrono também
+    #    (mesma conexão psycopg3), então vai pra thread igual ao get_schema.
+    rows = await asyncio.to_thread(run_query, sql)
 
     print(f"[sql_worker] SQL: {sql}")
     return {"messages": [AIMessage(content=f"SQL: {sql}\nResult: {rows}", name="sql_worker")]}
@@ -172,9 +175,9 @@ graph = builder.compile()
 
 # --- 7. Run (só quando executado direto; importar o módulo não roda o grafo) ---
 if __name__ == "__main__":
-    final = graph.invoke({
+    final = asyncio.run(graph.ainvoke({
         "iterations": 0,
         "next": "",
         "messages": [HumanMessage(content="How many perils are there?")],
-    })
+    }))
     print("FINAL STATE:", final)

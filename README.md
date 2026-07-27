@@ -2,7 +2,7 @@
 
 A multi-agent system that turns Brazilian home-insurance policy documents into a queryable knowledge base. It harvests *condições gerais* (general terms) registered with SUSEP, extracts their structure into Postgres, and answers coverage-comparison questions in natural language.
 
-> **Status: work in progress.** The data pipeline (SUSEP harvester + extraction schema) and the service skeleton (FastAPI + Postgres) are in place. The agent layer has its first real slice — an LLM supervisor routing to a single-pass SQL worker over the Postgres MCP server. See [Roadmap](#roadmap).
+> **Status: work in progress.** The data pipeline (SUSEP harvester + extraction schema) and the service skeleton (FastAPI + Postgres) are in place. The agent layer has its first real slice — an LLM supervisor routing to a single-pass SQL worker over the Postgres MCP server, exposed at `POST /ask`. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -89,6 +89,14 @@ curl localhost:8000/health      # {"status":"ok"}
 curl localhost:8000/health/db   # {"db":"ok"}  — API ↔ Postgres OK
 ```
 
+Ask the agent graph a question (needs `ANTHROPIC_API_KEY` and a populated database — this spends money, one LLM call per supervisor hop):
+
+```bash
+curl -X POST localhost:8000/ask -H 'Content-Type: application/json' \
+  -d '{"question":"Quantos perigos existem na base?"}'
+# {"answer":"SQL: SELECT count(*) FROM peril\nResult: [(7,)]","iterations":2}
+```
+
 ## Project structure
 
 ```
@@ -149,7 +157,7 @@ PDF footer).
 - [x] Test suite (testcontainers)
 - [ ] Production extraction (LLM → tables)
 - [x] Postgres MCP SQL server + read-only `insurance_ro` role
-- [~] Agent layer — LLM supervisor (structured output) + single-pass SQL worker done; RAG/extraction workers + a ReAct refinement loop pending
+- [~] Agent layer — async LLM supervisor (structured output) + single-pass SQL worker, served at `POST /ask`; RAG/extraction workers + a ReAct refinement loop pending
 - [ ] WhatsApp surface + cost attribution
 - [ ] Deploy to Railway
 
