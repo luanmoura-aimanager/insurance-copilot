@@ -89,20 +89,46 @@ curl localhost:8000/health      # {"status":"ok"}
 curl localhost:8000/health/db   # {"db":"ok"}  — API ↔ Postgres OK
 ```
 
-Ask the agent graph a question (needs `ANTHROPIC_API_KEY` and a populated database — this spends money, one LLM call per supervisor hop):
+Ask the agent graph a question (needs `ANTHROPIC_API_KEY`, a populated database, and a token from `API_TOKENS` — this spends money, one LLM call per supervisor hop):
 
 ```bash
-curl -X POST localhost:8000/ask -H 'Content-Type: application/json' \
+curl -X POST localhost:8000/ask \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $YOUR_TOKEN" \
   -d '{"question":"Quantos perigos existem na base?"}'
 # {"answer":"SQL: SELECT count(*) FROM peril\nResult: [(7,)]","iterations":2}
 ```
+
+### Auth and rate limiting on `/ask`
+
+`POST /ask` is the only paid endpoint (each supervisor hop is an Anthropic call), so it is closed by default. `/health` and `/health/db` stay open — they are the Railway healthcheck, which sends no `Authorization` header.
+
+| env | example | meaning |
+| --- | --- | --- |
+| `API_TOKENS` | `whatsapp:abc…,dev:def…` | `name:token` pairs. The **name** identifies the caller; the token is the secret. Generate with `openssl rand -hex 32`. |
+| `ASK_RATE_LIMIT_CLIENT` | `30/hour` | Spend ceiling, keyed by the token's name. |
+| `ASK_RATE_LIMIT_IP` | `10/minute` | Burst protection, keyed by IP — still applies if a token leaks. |
+
+Tokens carry an **identity** rather than being one shared secret, which is what makes per-client limits (and revoking one caller without touching the others) possible. Comparison uses `secrets.compare_digest` over *all* tokens with no early exit, so neither the token prefix nor its position in the list leaks by timing. An unset or empty `API_TOKENS` returns **500**, not 401 — a broken deploy should not look like a bad client credential.
+
+Both limits are applied on every request, each with its own key. Exceeding either returns **429**.
+
+**Deploying behind a proxy** (Railway, and any other edge that terminates TLS): run uvicorn with
+
+```bash
+uvicorn app.main:app --proxy-headers --forwarded-allow-ips='*'
+```
+
+Without it every request arrives with the proxy's IP as `request.client.host`, so the per-IP limit counts the whole internet as a single caller and the first burst locks out everyone. Prefer the proxy's actual address over `'*'` when you know it — `--forwarded-allow-ips` decides who is trusted to set `X-Forwarded-For`, and trusting everyone lets a client forge its own IP (which, here, only lets it *dodge* the IP limit; the per-client limit is unaffected).
 
 ## Project structure
 
 ```
 insurance-copilot/
 ├── app/
-│   ├── main.py             # FastAPI app + health endpoints
+│   ├── main.py             # FastAPI app + health endpoints + POST /ask
+│   ├── auth.py             # Bearer auth with identity (API_TOKENS: name -> token)
+│   ├── limits.py           # slowapi limiter: per-client + per-IP keys
 │   ├── db.py               # async engine + session (SQLAlchemy 2.0)
 │   └── models.py           # ORM models: PolicyDocument, Coverage, Peril, CoveragePeril, Exclusion
 ├── alembic/
@@ -158,6 +184,7 @@ PDF footer).
 - [ ] Production extraction (LLM → tables)
 - [x] Postgres MCP SQL server + read-only `insurance_ro` role
 - [~] Agent layer — async LLM supervisor (structured output) + single-pass SQL worker, served at `POST /ask`; RAG/extraction workers + a ReAct refinement loop pending
+- [x] `POST /ask` hardening — Bearer auth with identity + per-client and per-IP rate limits
 - [ ] WhatsApp surface + cost attribution
 - [ ] Deploy to Railway
 

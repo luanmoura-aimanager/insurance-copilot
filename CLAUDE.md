@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A multi-agent system that turns Brazilian home-insurance *condições gerais* (general terms registered with SUSEP) into a queryable knowledge base. It answers **coverage-structure** questions ("which insurers cover windstorm without a deductible?"), not pricing — the corpus describes products, and prices live in individual customer policies which are out of scope.
 
-The project is mid-build. What exists: the data pipeline (harvester + validated extraction schema + `app/extraction/` LLM pipeline), a FastAPI/Postgres skeleton, the ORM models + Alembic migrations (`app/models.py`), per-call cost attribution (`app/cost.py` + `pricing.json`), a standalone Postgres MCP SQL server (`mcp_servers/`), a first real agent graph (`app/agents/graph.py`: LLM supervisor + single-pass SQL worker — see below) served at `POST /ask`, and a testcontainers-backed test suite. What does *not* exist yet: the extraction/RAG workers, a ReAct refinement loop in the SQL worker, and the WhatsApp surface. See the Roadmap in `README.md` for current state before assuming a component exists.
+The project is mid-build. What exists: the data pipeline (harvester + validated extraction schema + `app/extraction/` LLM pipeline), a FastAPI/Postgres skeleton, the ORM models + Alembic migrations (`app/models.py`), per-call cost attribution (`app/cost.py` + `pricing.json`), a standalone Postgres MCP SQL server (`mcp_servers/`), a first real agent graph (`app/agents/graph.py`: LLM supervisor + single-pass SQL worker — see below) served at `POST /ask` (protected by Bearer auth + rate limiting — `app/auth.py`, `app/limits.py`), and a testcontainers-backed test suite. What does *not* exist yet: the extraction/RAG workers, a ReAct refinement loop in the SQL worker, and the WhatsApp surface. See the Roadmap in `README.md` for current state before assuming a component exists.
 
 ## Commands
 
@@ -23,8 +23,10 @@ docker compose up -d
 uvicorn app.main:app --reload
 curl localhost:8000/health      # {"status":"ok"}
 curl localhost:8000/health/db   # {"db":"ok"} — verifies API ↔ Postgres
-# POST /ask roda o grafo de agentes (custa dinheiro: 1 chamada LLM por hop do supervisor)
+# POST /ask roda o grafo de agentes (custa dinheiro: 1 chamada LLM por hop do supervisor).
+# Exige Bearer token cadastrado em API_TOKENS (ver .env.example).
 curl -X POST localhost:8000/ask -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $YOUR_TOKEN" \
   -d '{"question":"Quantos perigos existem na base?"}'
 
 # Migrations (Alembic; env.py reads DATABASE_URL and swaps asyncpg→sync)
@@ -65,6 +67,8 @@ RO_ROLE_PASSWORD=... PYTHONPATH=. python mcp_servers/test_readonly_role.py # pro
 **The graph nodes are async; the SQL access is not.** `supervisor` and `sql_worker` are `async def` so they don't block FastAPI's event loop on LLM calls. `get_schema()`/`run_query()` stay **psycopg3 sync** (one fresh connection per call, no pool) and are called through `asyncio.to_thread(...)` — deliberately: swapping the MCP server to an async driver would fork the one implementation the stdio server and the in-process worker share. `route()` stays sync — it only reads `State`, no I/O.
 
 **`POST /ask` (`app/main.py`).** `{question: str (3..500)}` → `{answer, iterations}`, invoking `graph.ainvoke`. `_final_answer()` scans `state["messages"]` **backwards** for the last `AIMessage` with `name == "sql_worker"` — `messages[-1]` is the supervisor's reasoning (it always runs last, to decide `END`), not the answer. When no worker ran, it returns the `NO_ANSWER` fallback rather than inventing one. `tests/test_ask.py` exercises the whole graph with a fake async client (dispatching on the forced tool name) plus fake `get_schema`/`run_query`, so **no test spends money**; the load-bearing case is the circuit breaker — a supervisor that never chooses `END` must stop at `MAX_ITERATIONS`.
+
+**Auth + rate limit on `/ask` (`app/auth.py`, `app/limits.py`).** `/ask` is the only paid endpoint, so it's closed; `/health` and `/health/db` stay **open** (Railway's healthcheck sends no `Authorization`). `API_TOKENS` is `"nome:token,nome2:token2"` — tokens carry an **identity**, not one shared secret, which is what makes per-client limits and single-client revocation possible. `_load_tokens()` reads the env **inside the function** (importing `app.main` must not require env vars, and tokens can rotate without a rebuild). Fail-closed on config: missing/empty `API_TOKENS` → **500**, not 401 — a 401 would disguise a broken deploy as a bad client credential. Token comparison uses `secrets.compare_digest` over **all** tokens with **no `break`** (`==` leaks the correct prefix by timing; a `break` would leak the position in the list). The token is never logged, not even on failure. Two slowapi limits are stacked on the route: per-client (`ASK_RATE_LIMIT_CLIENT`, default `30/hour`, key = `client_name`) and per-IP (`ASK_RATE_LIMIT_IP`, default `10/minute`, key = remote address); both are read from env through **callables**, so they're re-evaluated per request and the tests can tighten them. `require_client` writes `request.state.client_name` **itself** — FastAPI resolves dependencies before invoking the endpoint, and slowapi's wrapper (which builds the key) runs at endpoint-call time, so an assignment in the route body would land too late for the client key. Deploying behind a proxy needs `uvicorn --proxy-headers --forwarded-allow-ips=<proxy>`, otherwise every request carries the proxy's IP and the per-IP limit treats all callers as one.
 
 **Intended (not built):** the extraction and RAG workers, a ReAct loop in the SQL worker, and a HMAC-verified WhatsApp (Meta Cloud API) surface.
 
