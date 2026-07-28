@@ -111,7 +111,7 @@ curl -X POST localhost:8000/ask \
 
 Tokens carry an **identity** rather than being one shared secret, which is what makes per-client limits (and revoking one caller without touching the others) possible. Comparison uses `secrets.compare_digest` over *all* tokens with no early exit, so neither the token prefix nor its position in the list leaks by timing. An unset or empty `API_TOKENS` returns **500**, not 401 — a broken deploy should not look like a bad client credential.
 
-Both limits are applied on every request, each with its own key. Exceeding either returns **429**.
+Both limits are applied on every request, each with its own key. Exceeding either returns **429**. A limit string that doesn't parse falls back to the default with a logged warning — slowapi's own behaviour is to swallow the parse error and apply *no* limit, so a typo in the env would silently remove the spend ceiling.
 
 **Deploying behind a proxy** (Railway, and any other edge that terminates TLS): run uvicorn with
 

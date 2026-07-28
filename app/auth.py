@@ -65,9 +65,14 @@ def require_client(
     # compare_digest (tempo constante) em vez de `==`: comparação normal sai no
     # primeiro byte diferente e vaza o prefixo correto por timing. E iteramos TODOS
     # os tokens SEM break — um break vazaria a posição do token na lista.
+    #
+    # Comparamos em BYTES: compare_digest sobre str explode com TypeError se houver
+    # caractere não-ASCII, e a credencial vem do header (o cliente escolhe o que
+    # mandar). Em str, um token com acento viraria 500 em vez de 401.
+    presented = creds.credentials.encode("utf-8")
     matched: str | None = None
     for token, name in tokens.items():
-        if secrets.compare_digest(creds.credentials, token):
+        if secrets.compare_digest(presented, token.encode("utf-8")):
             matched = name
 
     if matched is None:

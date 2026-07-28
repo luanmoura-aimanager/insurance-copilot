@@ -67,6 +67,22 @@ async def test_token_invalido_401(client):
     assert "nao-e-esse" not in r.text
 
 
+async def test_token_nao_ascii_401(client):
+    """Credencial com acento é 401, não 500.
+
+    A credencial vem do header (o cliente escolhe o que mandar) e compare_digest
+    sobre str explode com TypeError em não-ASCII — por isso a comparação é em bytes.
+
+    O header vai em bytes crus porque o httpx se recusa a codificar não-ASCII; o
+    Starlette decodifica como latin-1, que é o que um cliente de verdade produziria.
+    """
+    r = await client.post(
+        "/ask", json=QUESTION, headers={b"Authorization": "Bearer tökén".encode("latin-1")}
+    )
+
+    assert r.status_code == 401
+
+
 async def test_token_valido_200(client):
     r = await client.post("/ask", json=QUESTION, headers=AUTH)
 
@@ -98,6 +114,25 @@ async def test_limite_por_ip_429(monkeypatch, protected_client):
 
     async with await protected_client() as c:
         assert (await c.post("/ask", json=QUESTION, headers=AUTH)).status_code == 200
+
+        r = await c.post("/ask", json=QUESTION, headers=AUTH)
+
+    assert r.status_code == 429
+
+
+async def test_limite_malformado_cai_no_default(monkeypatch, protected_client):
+    """Typo no env não pode DESLIGAR o limite.
+
+    O slowapi engole o erro de parse e segue sem limite nenhum (fail open); o guard
+    em _limit_from_env cai no default. Aqui o default por IP (10/minute) é o que
+    barra a 11ª requisição — se o guard sumir, as 11 passam.
+    """
+    monkeypatch.setenv("ASK_RATE_LIMIT_IP", "dez por minuto")
+    monkeypatch.setenv("ASK_RATE_LIMIT_CLIENT", "1000/minute")
+
+    async with await protected_client() as c:
+        for _ in range(10):
+            assert (await c.post("/ask", json=QUESTION, headers=AUTH)).status_code == 200
 
         r = await c.post("/ask", json=QUESTION, headers=AUTH)
 
