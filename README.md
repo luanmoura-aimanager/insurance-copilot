@@ -106,12 +106,24 @@ curl -X POST localhost:8000/ask \
 | env | example | meaning |
 | --- | --- | --- |
 | `API_TOKENS` | `whatsapp:abc…,dev:def…` | `name:token` pairs. The **name** identifies the caller; the token is the secret. Generate with `openssl rand -hex 32`. |
-| `ASK_RATE_LIMIT_CLIENT` | `30/hour` | Spend ceiling, keyed by the token's name. |
-| `ASK_RATE_LIMIT_IP` | `10/minute` | Burst protection, keyed by IP — still applies if a token leaks. |
+| `ASK_RATE_LIMIT_CLIENT` | `30/hour` | Spend quota, keyed by the token's name. Per-route (`/ask`). |
+| `ASK_RATE_LIMIT_IP` | `10/minute` | Burst ceiling, keyed by IP. Applies to every non-exempt route, and counts rejected requests too. |
 
 Tokens carry an **identity** rather than being one shared secret, which is what makes per-client limits (and revoking one caller without touching the others) possible. Comparison uses `secrets.compare_digest` over *all* tokens with no early exit, so neither the token prefix nor its position in the list leaks by timing. An unset or empty `API_TOKENS` returns **500**, not 401 — a broken deploy should not look like a bad client credential.
 
-Both limits are applied on every request, each with its own key. Exceeding either returns **429**. A limit string that doesn't parse falls back to the default with a logged warning — slowapi's own behaviour is to swallow the parse error and apply *no* limit, so a typo in the env would silently remove the spend ceiling.
+**The two limits are applied at different layers, and that split is the point.**
+
+The **per-IP ceiling** is a `default_limits` enforced by `SlowAPIMiddleware`, which runs before routing and before dependencies. It therefore counts requests that never reach the endpoint — including the **401s**. As a route decorator it would never be reached at all: `require_client` is a dependency, FastAPI resolves dependencies before invoking the endpoint, so an invalid token raised 401 and the limiter was never consulted. Anyone could hammer `/ask` with wrong tokens for free.
+
+It applies to every route that isn't exempt, but it is *counted per route path*: slowapi's default `key_style` is `"url"`, so the bucket key is `(IP, path)`. `10/minute` means ten requests per minute **per path**, not ten across the whole API — worth knowing before adding a second paid route.
+
+The **per-client quota** stays a route decorator on `/ask`, because it keys on `request.state.client_name`, which only exists after authentication has run.
+
+Each request is counted **once per limit**, never twice: slowapi only folds the global default into the route check when every route limit has `override_defaults=False`, and `.limit()` sets it to `True`. So the middleware pass evaluates only the IP ceiling and the decorator pass only the client quota. Exceeding either returns **429**.
+
+`/health` and `/health/db` are `@limiter.exempt`, so they are outside the global ceiling too. Railway's healthcheck polls them in a loop; if that consumed quota, the platform would start receiving 429s and tear down a perfectly healthy service.
+
+A limit string that doesn't parse falls back to the default with a logged warning — slowapi's own behaviour is to swallow the parse error and apply *no* limit, so a typo in the env would silently remove the spend ceiling.
 
 **Deploying behind a proxy** (Railway, and any other edge that terminates TLS): run uvicorn with
 
