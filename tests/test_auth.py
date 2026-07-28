@@ -109,10 +109,79 @@ async def test_estourar_o_limite_429(monkeypatch, protected_client):
 
 
 async def test_limite_por_ip_429(monkeypatch, protected_client):
-    """O limite por IP vale em cima do de cliente: nem token válido escapa do burst."""
+    """O teto por IP vale em cima da cota por cliente: nem token válido escapa do burst.
+
+    Também é o teste que fixa o NÃO-contar-em-dobro: o teto por IP é avaliado pelo
+    middleware e a cota por cliente pelo decorator. Com 1/minute, o 1º request tem
+    que passar — se as duas passagens somassem no mesmo balde, ele já sairia 429.
+    """
     monkeypatch.setenv("ASK_RATE_LIMIT_IP", "1/minute")
 
     async with await protected_client() as c:
+        assert (await c.post("/ask", json=QUESTION, headers=AUTH)).status_code == 200
+
+        r = await c.post("/ask", json=QUESTION, headers=AUTH)
+
+    assert r.status_code == 429
+
+
+async def test_teto_por_ip_cobre_request_sem_auth(monkeypatch, protected_client):
+    """Sem Authorization, o excedente é 429 — não 401 para sempre.
+
+    Este é o bug que a fatia fecha: como decorator, o limite nunca era alcançado
+    (require_client levanta 401 na fase de dependency, antes do endpoint), então dava
+    pra martelar /ask de graça. No middleware, o request é contado antes de rotear.
+    """
+    monkeypatch.setenv("ASK_RATE_LIMIT_IP", "2/minute")
+
+    async with await protected_client() as c:
+        assert (await c.post("/ask", json=QUESTION)).status_code == 401
+        assert (await c.post("/ask", json=QUESTION)).status_code == 401
+
+        r = await c.post("/ask", json=QUESTION)
+
+    assert r.status_code == 429
+
+
+async def test_teto_por_ip_cobre_token_invalido(monkeypatch, protected_client):
+    """Mesma coisa com token errado: brute-force passa a ter cota."""
+    monkeypatch.setenv("ASK_RATE_LIMIT_IP", "2/minute")
+    bad = {"Authorization": "Bearer nao-e-esse"}
+
+    async with await protected_client() as c:
+        assert (await c.post("/ask", json=QUESTION, headers=bad)).status_code == 401
+        assert (await c.post("/ask", json=QUESTION, headers=bad)).status_code == 401
+
+        r = await c.post("/ask", json=QUESTION, headers=bad)
+
+    assert r.status_code == 429
+
+
+async def test_health_isento_do_teto_por_ip(monkeypatch, protected_client):
+    """O healthcheck do Railway bate em loop; cota consumida ali viraria 429 e a
+    plataforma derrubaria um serviço saudável.
+
+    Martelamos o PRÓPRIO /health muito acima do teto. Estourar o /ask e depois olhar
+    o /health não provaria nada: o key_style do slowapi é "url" por padrão, então cada
+    rota tem seu balde e o /health passaria mesmo sem o exempt.
+    """
+    monkeypatch.setenv("ASK_RATE_LIMIT_IP", "1/minute")
+
+    async with await protected_client() as c:
+        for _ in range(5):
+            assert (await c.get("/health")).status_code == 200
+
+
+async def test_cota_por_cliente_vale_dentro_do_teto_de_ip(monkeypatch, protected_client):
+    """Com folga de sobra no teto por IP, quem barra é a cota do cliente.
+
+    Garante que mover o limite por IP pro middleware não engoliu o decorator.
+    """
+    monkeypatch.setenv("ASK_RATE_LIMIT_IP", "100/minute")
+    monkeypatch.setenv("ASK_RATE_LIMIT_CLIENT", "2/minute")
+
+    async with await protected_client() as c:
+        assert (await c.post("/ask", json=QUESTION, headers=AUTH)).status_code == 200
         assert (await c.post("/ask", json=QUESTION, headers=AUTH)).status_code == 200
 
         r = await c.post("/ask", json=QUESTION, headers=AUTH)
