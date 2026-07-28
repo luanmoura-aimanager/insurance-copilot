@@ -4,11 +4,17 @@ Testes do POST /ask — ZERO chamada real à API Anthropic.
 Todo o grafo é exercitado de verdade (supervisor -> route -> sql_worker -> supervisor),
 só que com o client Anthropic e o acesso ao Postgres trocados por fakes: o que importa
 aqui é o roteamento e o circuit breaker, não o modelo nem o banco.
+
+/ask é autenticado (ver tests/test_auth.py); aqui a auth é só um pré-requisito, então
+a fixture cadastra um token e todas as requisições mandam o header.
 """
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.agents import graph as graph_mod
+
+TOKEN = "token-de-teste"
+AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
 
 # --- Fakes do client Anthropic (mesma superfície: .messages.create -> .content[]) ---
@@ -67,8 +73,9 @@ def fake_graph(monkeypatch):
 
 
 @pytest.fixture
-async def ask_client():
+async def ask_client(monkeypatch):
     """Client HTTP puro: /ask não toca no Postgres, então não usa a fixture de DB."""
+    monkeypatch.setenv("API_TOKENS", f"teste:{TOKEN}")
     from app.main import app
 
     transport = ASGITransport(app=app)
@@ -80,7 +87,9 @@ async def test_ask_happy_path(ask_client, fake_graph):
     """supervisor -> sql_worker -> supervisor -> END: a resposta vem do worker."""
     fake_graph(["sql_worker", "END"])
 
-    r = await ask_client.post("/ask", json={"question": "Quantos perigos existem?"})
+    r = await ask_client.post(
+        "/ask", json={"question": "Quantos perigos existem?"}, headers=AUTH
+    )
 
     assert r.status_code == 200
     body = r.json()
@@ -92,7 +101,9 @@ async def test_ask_end_immediately_returns_fallback(ask_client, fake_graph):
     """Supervisor encerra de cara: nenhum worker rodou, então não inventamos resposta."""
     fake_graph(["END"])
 
-    r = await ask_client.post("/ask", json={"question": "Qual a capital da França?"})
+    r = await ask_client.post(
+        "/ask", json={"question": "Qual a capital da França?"}, headers=AUTH
+    )
 
     assert r.status_code == 200
     body = r.json()
@@ -108,7 +119,9 @@ async def test_ask_circuit_breaker_stops_the_loop(ask_client, fake_graph):
     """
     client = fake_graph(["sql_worker"])  # nunca escolhe END
 
-    r = await ask_client.post("/ask", json={"question": "Pergunta que gera loop"})
+    r = await ask_client.post(
+        "/ask", json={"question": "Pergunta que gera loop"}, headers=AUTH
+    )
 
     assert r.status_code == 200
     assert r.json()["iterations"] == graph_mod.MAX_ITERATIONS
@@ -117,5 +130,5 @@ async def test_ask_circuit_breaker_stops_the_loop(ask_client, fake_graph):
 
 async def test_ask_rejects_empty_question(ask_client):
     """Validação do Pydantic barra antes de qualquer chamada de LLM."""
-    r = await ask_client.post("/ask", json={"question": ""})
+    r = await ask_client.post("/ask", json={"question": ""}, headers=AUTH)
     assert r.status_code == 422

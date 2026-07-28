@@ -34,6 +34,20 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from testcontainers.postgres import PostgresContainer
 
 
+@pytest.fixture(autouse=True)
+def reset_limiter():
+    """O limiter do slowapi é global (storage in-memory no processo do teste).
+
+    Sem isso, o consumo de um teste vazaria pro próximo e a ordem de execução da
+    suíte viraria parte do resultado.
+    """
+    from app.limits import limiter
+
+    limiter.reset()
+    yield
+    limiter.reset()
+
+
 @pytest.fixture(scope="session")
 def db_url():
     """Boot one throwaway Postgres for the whole suite and apply migrations to it."""
