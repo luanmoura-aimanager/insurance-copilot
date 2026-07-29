@@ -197,7 +197,8 @@ PDF footer).
 - [x] Postgres MCP SQL server + read-only `insurance_ro` role
 - [~] Agent layer — async LLM supervisor (structured output) + single-pass SQL worker, served at `POST /ask`; RAG/extraction workers + a ReAct refinement loop pending
 - [x] `POST /ask` hardening — Bearer auth with identity + per-client and per-IP rate limits
-- [ ] WhatsApp surface + cost attribution
+- [x] Cost attribution in the agent graph — one `cost_event` per LLM call, tagged with a per-request id and the calling client
+- [ ] WhatsApp surface
 - [ ] Deploy to Railway
 
 ## License
