@@ -110,6 +110,15 @@ async def cost_rows(engine, monkeypatch):
 
 @pytest_asyncio.fixture
 async def ask_client(monkeypatch):
+    """Importa app.main DEPOIS do container subir — por isso `cost_rows` vem antes
+    de `ask_client` na assinatura dos testes.
+
+    `app.db` lê DATABASE_URL no nível do módulo, então importar app.main sem o
+    container de pé só funciona se houver um .env por perto. Pedindo `cost_rows`
+    primeiro, a fixture de banco já rodou e apontou DATABASE_URL pro container —
+    e rodar SÓ este arquivo (`pytest tests/test_cost_graph.py`) funciona num
+    checkout limpo, sem .env.
+    """
     monkeypatch.setenv("API_TOKENS", f"{CLIENTE}:{TOKEN}")
     from app.main import app
 
@@ -133,7 +142,7 @@ def test_modelo_cobrado_tem_preco_cadastrado():
     assert MODEL_COBRADO in load_pricing()
 
 
-async def test_ask_grava_uma_linha_de_custo_por_chamada(ask_client, fake_graph, cost_rows):
+async def test_ask_grava_uma_linha_de_custo_por_chamada(cost_rows, ask_client, fake_graph):
     """supervisor -> sql_worker -> supervisor -> END = 3 chamadas pagas = 3 linhas.
 
     São 3, não 2: o supervisor roda de novo DEPOIS do worker (é ele quem decide o END),
@@ -159,7 +168,7 @@ async def test_ask_grava_uma_linha_de_custo_por_chamada(ask_client, fake_graph, 
     assert all(e.batch is False for e in eventos)           # /ask é online, preço cheio
 
 
-async def test_cada_ask_tem_seu_proprio_request_id(ask_client, fake_graph, cost_rows):
+async def test_cada_ask_tem_seu_proprio_request_id(cost_rows, ask_client, fake_graph):
     """O ContextVar é resetado no fim do request: dois /ask não compartilham id.
 
     Se o reset falhasse (ou o var fosse global), o segundo request herdaria o id do
@@ -177,7 +186,7 @@ async def test_cada_ask_tem_seu_proprio_request_id(ask_client, fake_graph, cost_
 
 
 async def test_falha_ao_gravar_custo_nao_derruba_o_ask(
-    ask_client, fake_graph, cost_rows, monkeypatch
+    cost_rows, ask_client, fake_graph, monkeypatch
 ):
     """Best effort: a chamada ao LLM JÁ FOI PAGA e já tem resposta.
 
