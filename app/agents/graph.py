@@ -1,14 +1,18 @@
 import asyncio
+import logging
 from typing import TypedDict, Annotated, Literal
 from langchain_core.messages import HumanMessage, AIMessage
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel
 
+from app.cost import record_call_cost
 from app.llm import get_async_client
 # Import direto das funções core do MCP server (mesmo processo, sem protocolo MCP).
 # run_query já carrega o guard SELECT-only + LIMIT e conecta pela role read-only.
 from mcp_servers.postgres_mcp_server import get_schema, run_query
+
+logger = logging.getLogger(__name__)
 
 MAX_ITERATIONS = 5
 SUPERVISOR_MODEL = "claude-haiku-4-5"  # routing é tarefa leve: modelo barato basta
@@ -57,6 +61,35 @@ class SqlQuery(BaseModel):
     sql: str  # structured output = só o SQL, sem cercas de markdown pra limpar
 
 
+# --- 2.5 Custo por chamada: BEST EFFORT, nunca derruba a resposta ---
+async def _record_cost(agent_name: str, resp) -> None:
+    """Grava 1 linha de cost_event pra chamada que acabou de voltar.
+
+    Duas decisões:
+
+    - **`resp.model`, não o alias que mandamos.** Enviamos "claude-haiku-4-5"; a API
+      cobra e devolve o id versionado ("claude-haiku-4-5-20251001"), que é a chave do
+      pricing.json. Gravar o alias faria o custo cair no fail-loud do cost_usd — ou,
+      pior, num preço de outra versão do modelo.
+    - **Best effort.** Quando chegamos aqui a chamada já foi paga e a resposta já está
+      na mão. Falha ao gravar custo (banco fora, modelo sem preço) vira log e segue:
+      perder a observabilidade de uma chamada é MUITO mais barato do que devolver 500
+      num /ask que já custou dinheiro e já tem resposta.
+
+    É chamado ANTES do parse do tool_use, e não depois: um payload malformado também
+    foi cobrado, e o custo dele não pode sumir junto com a exceção do parse.
+    """
+    try:
+        await record_call_cost(
+            agent_name=agent_name,
+            model=resp.model,
+            input_tokens=resp.usage.input_tokens,
+            output_tokens=resp.usage.output_tokens,
+        )
+    except Exception as exc:  # noqa: BLE001 — best effort é o ponto: nada aqui pode subir
+        logger.warning("falha ao gravar custo de %s: %s", agent_name, exc)
+
+
 # --- 3. Supervisor node: decide de verdade, via LLM com structured output ---
 async def supervisor(state: State) -> dict:
     i = state["iterations"] + 1
@@ -79,6 +112,8 @@ async def supervisor(state: State) -> dict:
             for m in state["messages"]
         ],
     )
+    await _record_cost("supervisor", resp)
+
     tool_use = next(b for b in resp.content if b.type == "tool_use")
     decision = SupervisorDecision.model_validate(tool_use.input)
 
@@ -132,6 +167,8 @@ async def sql_worker(state: State) -> dict:
             }
         ],
     )
+    await _record_cost("sql_worker", resp)
+
     tool_use = next(b for b in resp.content if b.type == "tool_use")
     sql = SqlQuery.model_validate(tool_use.input).sql
 

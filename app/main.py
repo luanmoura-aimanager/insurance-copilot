@@ -1,3 +1,5 @@
+from uuid import uuid4
+
 from fastapi import Depends, FastAPI, Request
 from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import BaseModel, Field
@@ -6,6 +8,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy import text
 
+from app.agents.context import reset_request_context, set_request_context
 from app.agents.graph import graph
 from app.auth import require_client
 from app.db import get_session
@@ -91,9 +94,18 @@ async def ask(
     # require_client já gravou isso em request.state (antes do wrapper do slowapi);
     # repetimos aqui só pra deixar o vínculo explícito na leitura da rota.
     request.state.client_name = client
-    state = await graph.ainvoke({
-        "iterations": 0,
-        "next": "",
-        "messages": [HumanMessage(content=req.question)],
-    })
+
+    # Contexto que os nós do grafo leem pra atribuir o custo: um id novo por request
+    # (correlaciona as N chamadas de LLM de um mesmo /ask) e QUEM pediu. O reset no
+    # finally é obrigatório — sem ele o valor sobreviveria ao request nesta task e
+    # vazaria pro próximo que a reaproveitasse.
+    ctx = set_request_context(str(uuid4()), client)
+    try:
+        state = await graph.ainvoke({
+            "iterations": 0,
+            "next": "",
+            "messages": [HumanMessage(content=req.question)],
+        })
+    finally:
+        reset_request_context(ctx)
     return AskResponse(answer=_final_answer(state), iterations=state["iterations"])

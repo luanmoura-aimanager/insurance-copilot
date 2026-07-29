@@ -85,6 +85,45 @@ async def record_cost_event(
     return event
 
 
+async def record_call_cost(
+    *,
+    agent_name: str,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+) -> None:
+    """Grava o custo de UMA chamada de LLM feita dentro do grafo, em transação PRÓPRIA.
+
+    Abre a própria session e COMMITA na hora, em vez de pegar carona na transação do
+    request: quando chegamos aqui a chamada JÁ FOI PAGA. Se o request estourar depois,
+    o dinheiro continua gasto — a linha de custo tem que existir mesmo assim.
+
+    `request_id`/`client` vêm dos ContextVars (`app/agents/context.py`), não de
+    parâmetro: o nó do grafo não conhece a borda HTTP. Fora de um request, são None.
+
+    O import de `app.db` fica AQUI DENTRO de propósito: importar `app.db` exige
+    DATABASE_URL, e a extração offline importa `app.cost` só pra calcular preço, sem
+    banco nenhum.
+    """
+    from app.agents.context import get_client_name, get_request_id
+    from app.db import SessionLocal
+
+    async with SessionLocal() as session:
+        event = await record_cost_event(
+            session,
+            agent_name=agent_name,
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+        # As duas colunas de correlação são atribuídas no objeto que record_cost_event
+        # devolve — ele é o único ponto que calcula preço e não vale forkar a assinatura
+        # dele por causa disso. Ainda é a MESMA transação (INSERT + UPDATE, um commit).
+        event.request_id = get_request_id()
+        event.client = get_client_name()
+        await session.commit()
+
+
 async def cost_event_exists_by_label(
     session: AsyncSession, label: str, *, batch: bool | None = None
 ) -> bool:
