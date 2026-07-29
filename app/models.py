@@ -87,6 +87,10 @@ class CostEvent(Base):
     # instead of looking like a pricing bug during an audit.
     batch: Mapped[bool] = mapped_column(default=False)
     label: Mapped[str | None]                   # what this call was about (e.g. susep_<id>)
+    # Preenchidas só pelas chamadas feitas dentro de um request (o grafo do /ask); as
+    # linhas da extração offline ficam NULL — lá não existe request nem cliente.
+    request_id: Mapped[str | None]              # correlaciona TODAS as chamadas de um /ask
+    client: Mapped[str | None]                  # identidade do token (app/auth.py) — custo por cliente
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 

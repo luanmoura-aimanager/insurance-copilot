@@ -67,6 +67,16 @@ def fake_graph(monkeypatch):
         monkeypatch.setattr(graph_mod, "get_async_client", lambda: client)
         monkeypatch.setattr(graph_mod, "get_schema", lambda: "TABLE peril(id int, nome text)")
         monkeypatch.setattr(graph_mod, "run_query", lambda sql: "[(7,)]")
+
+        # Gravação de custo vira no-op: quem testa isso é tests/test_cost_graph.py.
+        # Explícito de propósito — sem isto, o custo só não é gravado por ACIDENTE
+        # (os fakes não têm .model/.usage, e o AttributeError cai no best-effort do
+        # grafo). Completar os fakes um dia faria estes testes, que não têm fixture
+        # de banco, tentarem escrever no Postgres de verdade.
+        async def _sem_custo(**kwargs):
+            return None
+
+        monkeypatch.setattr(graph_mod, "record_call_cost", _sem_custo)
         return client
 
     return _install
