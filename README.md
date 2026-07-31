@@ -2,7 +2,7 @@
 
 A multi-agent system that turns Brazilian home-insurance policy documents into a queryable knowledge base. It harvests *condições gerais* (general terms) registered with SUSEP, extracts their structure into Postgres, and answers coverage-comparison questions in natural language.
 
-> **Status: work in progress.** The data pipeline (SUSEP harvester + extraction schema) and the service skeleton (FastAPI + Postgres) are in place. The agent layer has its first real slice — an LLM supervisor routing to a single-pass SQL worker over the Postgres MCP server, exposed at `POST /ask`. See [Roadmap](#roadmap).
+> **Status: work in progress.** The data pipeline (SUSEP harvester + extraction schema) and the service skeleton (FastAPI + Postgres) are in place. The agent layer has its first real slice — an LLM supervisor routing to a single-pass SQL worker over the Postgres MCP server, with a synthesizer node turning the query result into a natural-language answer, exposed at `POST /ask`. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -17,6 +17,8 @@ A supervisor agent routes each question to specialized workers (canonical hub-an
 - **extraction** — turns a policy PDF into structured rows (insurer, product, coverages, perils, exclusions).
 - **SQL** — aggregates over the structured tables (coverage comparison, deductible structure, exclusion patterns).
 - **RAG** — retrieves and explains raw clause text (pgvector).
+
+A **synthesizer** node closes every path: it turns the worker's raw output into a single natural-language sentence, so the API answers in prose rather than in tuples. When no worker ran (the question is out of scope), it returns a fixed sentence *without* calling the model — there is nothing to synthesize, and paying for a call to say "I don't know" is wasted money.
 
 Each LLM call is cost-attributed per agent (one row per call: request id, agent, model, tokens, cost). Surface: WhatsApp (Meta Cloud API), with HMAC-verified webhooks.
 
@@ -89,14 +91,14 @@ curl localhost:8000/health      # {"status":"ok"}
 curl localhost:8000/health/db   # {"db":"ok"}  — API ↔ Postgres OK
 ```
 
-Ask the agent graph a question (needs `ANTHROPIC_API_KEY`, a populated database, and a token from `API_TOKENS` — this spends money, one LLM call per supervisor hop):
+Ask the agent graph a question (needs `ANTHROPIC_API_KEY`, a populated database, and a token from `API_TOKENS` — this spends money: one LLM call per supervisor hop, per worker, and one for the synthesizer):
 
 ```bash
 curl -X POST localhost:8000/ask \
   -H 'Content-Type: application/json' \
   -H "Authorization: Bearer $YOUR_TOKEN" \
   -d '{"question":"Quantos perigos existem na base?"}'
-# {"answer":"SQL: SELECT count(*) FROM peril\nResult: [(7,)]","iterations":2}
+# {"answer":"Existem 7 perigos cadastrados na base.","iterations":2}
 ```
 
 ### Auth and rate limiting on `/ask`
@@ -195,7 +197,7 @@ PDF footer).
 - [x] Test suite (testcontainers)
 - [ ] Production extraction (LLM → tables)
 - [x] Postgres MCP SQL server + read-only `insurance_ro` role
-- [~] Agent layer — async LLM supervisor (structured output) + single-pass SQL worker, served at `POST /ask`; RAG/extraction workers + a ReAct refinement loop pending
+- [~] Agent layer — async LLM supervisor (structured output) + single-pass SQL worker + synthesizer (natural-language answer), served at `POST /ask`; RAG/extraction workers + a ReAct refinement loop pending
 - [x] `POST /ask` hardening — Bearer auth with identity + per-client and per-IP rate limits
 - [x] Cost attribution in the agent graph — one `cost_event` per LLM call, tagged with a per-request id and the calling client
 - [ ] WhatsApp surface

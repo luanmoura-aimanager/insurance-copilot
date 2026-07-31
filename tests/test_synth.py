@@ -129,7 +129,14 @@ async def cost_rows(engine, monkeypatch):
 
 
 @pytest_asyncio.fixture
-async def ask_client(monkeypatch):
+async def ask_client(db_url, monkeypatch):
+    """`db_url` vem primeiro DE PROPÓSITO, mesmo nos testes que não tocam no banco.
+
+    `app.db` lê DATABASE_URL no nível do módulo, então importar `app.main` antes do
+    container subir só funciona se houver um .env por perto. Com a fixture de banco
+    na frente, rodar só este arquivo (`pytest tests/test_synth.py`) funciona num
+    checkout limpo — e o container é session-scoped, então não custa nada a mais.
+    """
     monkeypatch.setenv("API_TOKENS", f"{CLIENTE}:{TOKEN}")
     from app.main import app
 

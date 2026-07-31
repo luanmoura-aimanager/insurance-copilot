@@ -245,7 +245,7 @@ async def synthesizer(state: State) -> dict:
 
     # `or resultado` cobre os dois modos de falha (exceção e resposta vazia): o texto
     # cru é feio, mas é uma resposta REAL e já paga — melhor que estourar o grafo.
-    print("[synthesizer] frase final gerada")
+    print(f"[synthesizer] resposta final {'sintetizada' if frase else 'CRUA (degradou)'}")
     return {"messages": [AIMessage(content=frase or resultado, name="final")]}
 
 
