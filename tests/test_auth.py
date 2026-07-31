@@ -13,13 +13,20 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 QUESTION = {"question": "Quantos perigos existem?"}
 
 
+RESPOSTA = "Existem 7 perigos cadastrados na base."
+
+
 class _FakeGraph:
-    """Mesma superfície usada pelo /ask: ainvoke -> state com messages/iterations."""
+    """Mesma superfície usada pelo /ask: ainvoke -> state com messages/iterations.
+
+    A última mensagem vem com name="final" porque é assim que o grafo real termina:
+    quem escreve a resposta é o synthesizer, e o /ask só lê messages[-1].
+    """
 
     async def ainvoke(self, state):
         return {
             "iterations": 1,
-            "messages": [AIMessage(content="Result: [(7,)]", name="sql_worker")],
+            "messages": [AIMessage(content=RESPOSTA, name="final")],
         }
 
 
@@ -87,7 +94,7 @@ async def test_token_valido_200(client):
     r = await client.post("/ask", json=QUESTION, headers=AUTH)
 
     assert r.status_code == 200
-    assert r.json() == {"answer": "Result: [(7,)]", "iterations": 1}
+    assert r.json() == {"answer": RESPOSTA, "iterations": 1}
 
 
 async def test_health_continua_aberto(client):

@@ -17,6 +17,12 @@ logger = logging.getLogger(__name__)
 MAX_ITERATIONS = 5
 SUPERVISOR_MODEL = "claude-haiku-4-5"  # routing é tarefa leve: modelo barato basta
 SQL_MODEL = "claude-haiku-4-5"          # SQL simples: Haiku dá conta
+SYNTHESIZER_MODEL = "claude-haiku-4-5"  # transformar linha de resultado em frase: idem
+
+# Frase de quando nenhum worker rodou (pergunta fora de escopo, ou o circuit breaker
+# cortou antes de qualquer resultado). Mora aqui, e não na API, porque quem escreve a
+# resposta final agora é o synthesizer — o /ask só lê a última mensagem.
+NO_ANSWER = "Não consegui responder essa pergunta com os dados disponíveis."
 
 # Structured output canônico (mesmo padrão da extração de seguros): expõe UM tool
 # cujo input_schema é o JSON Schema do Pydantic e força tool_choice pra ele. O modelo
@@ -41,6 +47,13 @@ SQL_SYSTEM = (
     "Gere apenas UM SELECT que responda a pergunta — sem comentários, sem cercas de "
     "markdown, sem ponto e vírgula. Use exatamente os nomes de tabela/coluna do schema. "
     "Responda SEMPRE chamando a tool emit_sql."
+)
+
+SYNTHESIZER_SYSTEM = (
+    "Você recebe a pergunta de um usuário e o resultado cru de uma query SQL. Devolva "
+    "UMA frase em pt-BR que responda a pergunta usando esse resultado. Não invente "
+    "nenhum dado além do que está no resultado — se ele não responder a pergunta, diga "
+    "isso em uma frase. Responda só com a frase, sem preâmbulo e sem repetir o SQL."
 )
 
 
@@ -181,6 +194,61 @@ async def sql_worker(state: State) -> dict:
     return {"messages": [AIMessage(content=f"SQL: {sql}\nResult: {rows}", name="sql_worker")]}
 
 
+# --- 4.5 Synthesizer: último nó SEMPRE. Vira o resultado cru em frase. ---
+async def synthesizer(state: State) -> dict:
+    """Escreve a resposta final em linguagem natural.
+
+    Roda em todo caminho que termina o grafo, inclusive quando nenhum worker rodou —
+    por isso é ele, e não o supervisor, quem produz a última mensagem. A API só precisa
+    ler `messages[-1]`.
+
+    Sem chamada de LLM quando não há resultado de worker: não há o que sintetizar, e
+    pagar uma chamada só pra escrever "não sei" seria queimar dinheiro à toa.
+    """
+    question = next(
+        (m.content for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
+        "",
+    )
+    resultado = next(
+        (
+            m.content
+            for m in reversed(state["messages"])
+            if isinstance(m, AIMessage) and m.name == "sql_worker"
+        ),
+        None,
+    )
+
+    if resultado is None:
+        print("[synthesizer] sem resultado de worker -> fallback estático")
+        return {"messages": [AIMessage(content=NO_ANSWER, name="final")]}
+
+    # Texto livre, não structured output: a saída é UMA frase em prosa, e forçar uma
+    # tool aqui só embrulharia uma string em JSON sem ganhar nada.
+    frase = None
+    try:
+        client = get_async_client()
+        resp = await client.messages.create(
+            model=SYNTHESIZER_MODEL,
+            max_tokens=512,
+            system=SYNTHESIZER_SYSTEM,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Pergunta: {question}\n\nResultado da query:\n{resultado}",
+                }
+            ],
+        )
+        await _record_cost("synthesizer", resp)
+        frase = "".join(b.text for b in resp.content if b.type == "text").strip()
+    except Exception as exc:  # noqa: BLE001 — o dado já está na mão; não morrer no último nó
+        logger.warning("synthesizer falhou (%s); caindo no texto cru do worker", exc)
+
+    # `or resultado` cobre os dois modos de falha (exceção e resposta vazia): o texto
+    # cru é feio, mas é uma resposta REAL e já paga — melhor que estourar o grafo.
+    print("[synthesizer] frase final gerada")
+    return {"messages": [AIMessage(content=frase or resultado, name="final")]}
+
+
 # --- 5. Conditional edge: routes by reading State (with fail-closed fallback) ---
 def route(state: State) -> str:
     if state["iterations"] >= MAX_ITERATIONS:  # mechanical guard: does not ask the LLM
@@ -199,13 +267,18 @@ def route(state: State) -> str:
 builder = StateGraph(State)
 builder.add_node("supervisor", supervisor)
 builder.add_node("sql_worker", sql_worker)
+builder.add_node("synthesizer", synthesizer)
 
 builder.set_entry_point("supervisor")
+# Onde antes o route() ia direto pro END, agora passa pelo synthesizer — o mapa traduz
+# o valor devolvido pelo route (que continua sendo END) no nó de saída. É por isso que
+# route() não precisou mudar: a decisão dele é a mesma, só o destino é outro.
 builder.add_conditional_edges("supervisor", route, {
     "sql_worker": "sql_worker",
-    END: END,
+    END: "synthesizer",
 })
-builder.add_edge("sql_worker", "supervisor")  # worker returns to the supervisor
+builder.add_edge("sql_worker", "supervisor")   # worker returns to the supervisor
+builder.add_edge("synthesizer", END)           # synthesizer é sempre o último nó
 
 graph = builder.compile()
 

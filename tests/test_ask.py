@@ -16,6 +16,9 @@ from app.agents import graph as graph_mod
 TOKEN = "token-de-teste"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
+# Frase que o synthesizer (mockado) devolve — a resposta do /ask passa por ele agora.
+FRASE_FINAL = "Existem 7 perigos cadastrados na base."
+
 
 # --- Fakes do client Anthropic (mesma superfície: .messages.create -> .content[]) ---
 class _FakeToolUse:
@@ -27,9 +30,18 @@ class _FakeToolUse:
         self.input = payload
 
 
+class _FakeText:
+    """Bloco de texto: é o que o synthesizer lê (ele não força tool)."""
+
+    type = "text"
+
+    def __init__(self, text: str):
+        self.text = text
+
+
 class _FakeResponse:
-    def __init__(self, payload: dict):
-        self.content = [_FakeToolUse(payload)]
+    def __init__(self, blocks: list):
+        self.content = blocks
 
 
 class _FakeMessages:
@@ -39,6 +51,10 @@ class _FakeMessages:
         self.supervisor_calls = 0
 
     async def create(self, **kwargs):
+        # Sem tools = synthesizer, o único nó que pede texto livre.
+        if not kwargs.get("tools"):
+            return _FakeResponse([_FakeText(FRASE_FINAL)])
+
         # Despacha pelo nome da tool forçada: o mesmo client atende supervisor e worker.
         tool_name = kwargs["tools"][0]["name"]
         if tool_name == graph_mod._DECISION_TOOL:
@@ -47,8 +63,8 @@ class _FakeMessages:
             # Esgotou o roteiro? repete a última decisão (é o que segura o teste do
             # circuit breaker: supervisor que NUNCA escolhe END).
             nxt = self._decisions[min(i, len(self._decisions) - 1)]
-            return _FakeResponse({"next": nxt, "reasoning": f"fake decision #{i}"})
-        return _FakeResponse({"sql": self._sql})
+            return _FakeResponse([_FakeToolUse({"next": nxt, "reasoning": f"fake decision #{i}"})])
+        return _FakeResponse([_FakeToolUse({"sql": self._sql})])
 
 
 class _FakeClient:
@@ -94,7 +110,7 @@ async def ask_client(monkeypatch):
 
 
 async def test_ask_happy_path(ask_client, fake_graph):
-    """supervisor -> sql_worker -> supervisor -> END: a resposta vem do worker."""
+    """supervisor -> sql_worker -> supervisor -> synthesizer: a resposta vem em prosa."""
     fake_graph(["sql_worker", "END"])
 
     r = await ask_client.post(
@@ -103,7 +119,7 @@ async def test_ask_happy_path(ask_client, fake_graph):
 
     assert r.status_code == 200
     body = r.json()
-    assert "Result:" in body["answer"]      # veio do sql_worker, não do reasoning do supervisor
+    assert body["answer"] == FRASE_FINAL    # frase do synthesizer, não o resultado cru
     assert body["iterations"] == 2          # duas passadas pelo supervisor
 
 
