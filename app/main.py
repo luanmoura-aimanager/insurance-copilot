@@ -9,7 +9,7 @@ from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy import text
 
 from app.agents.context import reset_request_context, set_request_context
-from app.agents.graph import graph
+from app.agents.graph import NO_ANSWER, graph
 from app.auth import require_client
 from app.db import get_session
 from app.limits import ask_client_limit, client_key, limiter
@@ -27,10 +27,6 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # require_client levanta antes — e dava pra martelar /ask com token inválido de graça.
 app.add_middleware(SlowAPIMiddleware)
 
-# Resposta quando nenhum worker rodou (supervisor foi direto pro END, ou o circuit
-# breaker cortou antes de qualquer resultado): não inventamos resposta.
-NO_ANSWER = "Não consegui responder essa pergunta com os dados disponíveis."
-
 
 class AskRequest(BaseModel):
     question: str = Field(min_length=3, max_length=500)
@@ -42,14 +38,16 @@ class AskResponse(BaseModel):
 
 
 def _final_answer(state: dict) -> str:
-    """Última mensagem do sql_worker no histórico.
+    """A frase do synthesizer, que é sempre o último nó do grafo.
 
-    Varre DE TRÁS PRA FRENTE procurando o worker: messages[-1] seria o reasoning do
-    supervisor (ele sempre roda por último, pra decidir o END), não a resposta.
+    Não há mais o que varrer: todo caminho de saída passa pelo synthesizer (inclusive
+    o que não roda worker nenhum), então a resposta é literalmente a última mensagem.
+    O NO_ANSWER aqui é só cinto: se o histórico vier com outra coisa no fim, não
+    devolvemos o raciocínio interno de um agente como se fosse resposta.
     """
-    for m in reversed(state["messages"]):
-        if isinstance(m, AIMessage) and m.name == "sql_worker":
-            return m.content
+    last = state["messages"][-1]
+    if isinstance(last, AIMessage) and last.name == "final":
+        return last.content
     return NO_ANSWER
 
 

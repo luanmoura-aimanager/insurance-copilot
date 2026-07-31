@@ -1,7 +1,7 @@
 """
 Custo por chamada DENTRO do grafo — ZERO chamada real à API Anthropic.
 
-O grafo roda inteiro (supervisor -> sql_worker -> supervisor -> END), com o client
+O grafo roda inteiro (supervisor -> sql_worker -> supervisor -> synthesizer), com o client
 Anthropic e o acesso ao Postgres trocados por fakes; o que se verifica aqui é a
 CONTABILIDADE: uma linha de cost_event por chamada de LLM, cada uma carimbada com o
 request_id do /ask e com o cliente autenticado.
@@ -31,6 +31,9 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 # quem é cobrado, e quem tem preço no pricing.json, é a versão resolvida.
 MODEL_COBRADO = "claude-haiku-4-5-20251001"
 
+# Frase que o synthesizer (mockado) devolve — ele fecha todo caminho do grafo.
+FRASE_FINAL = "Existem 7 perigos cadastrados na base."
+
 
 # --- Fakes do client Anthropic: além do tool_use, agora .model e .usage ---
 class _FakeToolUse:
@@ -46,9 +49,16 @@ class _FakeUsage:
         self.output_tokens = output_tokens
 
 
+class _FakeText:
+    type = "text"
+
+    def __init__(self, text: str):
+        self.text = text
+
+
 class _FakeResponse:
-    def __init__(self, payload: dict):
-        self.content = [_FakeToolUse(payload)]
+    def __init__(self, blocks: list):
+        self.content = blocks
         self.model = MODEL_COBRADO      # id versionado, como vem da API
         self.usage = _FakeUsage(1_000, 200)
 
@@ -60,13 +70,15 @@ class _FakeMessages:
         self.supervisor_calls = 0
 
     async def create(self, **kwargs):
+        if not kwargs.get("tools"):     # sem tool forçada = synthesizer (texto livre)
+            return _FakeResponse([_FakeText(FRASE_FINAL)])
         tool_name = kwargs["tools"][0]["name"]
         if tool_name == graph_mod._DECISION_TOOL:
             i = self.supervisor_calls
             self.supervisor_calls += 1
             nxt = self._decisions[min(i, len(self._decisions) - 1)]
-            return _FakeResponse({"next": nxt, "reasoning": f"fake decision #{i}"})
-        return _FakeResponse({"sql": self._sql})
+            return _FakeResponse([_FakeToolUse({"next": nxt, "reasoning": f"fake decision #{i}"})])
+        return _FakeResponse([_FakeToolUse({"sql": self._sql})])
 
 
 class _FakeClient:
@@ -143,11 +155,12 @@ def test_modelo_cobrado_tem_preco_cadastrado():
 
 
 async def test_ask_grava_uma_linha_de_custo_por_chamada(cost_rows, ask_client, fake_graph):
-    """supervisor -> sql_worker -> supervisor -> END = 3 chamadas pagas = 3 linhas.
+    """supervisor -> sql_worker -> supervisor -> synthesizer = 4 chamadas pagas = 4 linhas.
 
-    São 3, não 2: o supervisor roda de novo DEPOIS do worker (é ele quem decide o END),
-    e o grão do cost_event é a CHAMADA, não o agente. Cada linha sai carimbada com o
-    mesmo request_id — é o que permite somar "quanto custou este /ask".
+    São 4, não 2: o supervisor roda de novo DEPOIS do worker (é ele quem decide o END),
+    o synthesizer fecha escrevendo a frase, e o grão do cost_event é a CHAMADA, não o
+    agente. Cada linha sai carimbada com o mesmo request_id — é o que permite somar
+    "quanto custou este /ask".
     """
     fake_graph(["sql_worker", "END"])
 
@@ -157,7 +170,9 @@ async def test_ask_grava_uma_linha_de_custo_por_chamada(cost_rows, ask_client, f
     assert r.status_code == 200
 
     eventos = await _eventos(cost_rows)
-    assert [e.agent_name for e in eventos] == ["supervisor", "sql_worker", "supervisor"]
+    assert [e.agent_name for e in eventos] == [
+        "supervisor", "sql_worker", "supervisor", "synthesizer",
+    ]
 
     request_ids = {e.request_id for e in eventos}
     assert len(request_ids) == 1              # um id por /ask, compartilhado pelas chamadas
@@ -205,5 +220,5 @@ async def test_falha_ao_gravar_custo_nao_derruba_o_ask(
     )
 
     assert r.status_code == 200
-    assert "Result:" in r.json()["answer"]     # a resposta do worker chegou inteira
+    assert r.json()["answer"] == FRASE_FINAL   # a resposta chegou inteira mesmo assim
     assert await _eventos(cost_rows) == []     # e nenhuma linha foi gravada
