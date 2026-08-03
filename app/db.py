@@ -36,6 +36,10 @@ def SessionLocal(**kwargs) -> AsyncSession:
     Continua sendo um atributo chamável do módulo de propósito: 6 scripts fazem
     `from app.db import SessionLocal` e dois testes trocam o atributo via
     `monkeypatch.setattr("app.db.SessionLocal", ...)`.
+
+    Só a CHAMADA é a API pública: como isto virou função, os métodos do
+    `async_sessionmaker` (`.begin()`, `.configure()`) não existem mais aqui. Ninguém
+    os usa hoje; se precisar, pegue a fábrica com `_sessionmaker()`.
     """
     return _sessionmaker()(**kwargs)
 

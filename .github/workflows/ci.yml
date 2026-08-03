@@ -6,6 +6,13 @@ on:
   push:
     branches: [main]
 
+# Um push novo no mesmo PR cancela o run anterior — não adianta segurar runner por
+# um commit que já foi substituído. Em `main` NÃO cancela: lá cada commit é um estado
+# publicado e engolir o resultado dele esconderia uma quebra.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest

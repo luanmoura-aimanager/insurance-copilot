@@ -36,7 +36,15 @@ assert "DATABASE_URL" not in os.environ, "vazou DATABASE_URL pro subprocesso"
 
 def _run_child(code: str, tmp_path) -> subprocess.CompletedProcess:
     """Roda `code` num Python com env limpo (sem DATABASE_URL) e fora do repo."""
-    env = {"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(REPO_ROOT)}
+    # Só o mínimo pro Python achar o interpretador e o pacote. HOME entra porque
+    # algumas libs expandem `~` no import e um env sem HOME é um jeito bobo de a
+    # suíte ficar vermelha por um motivo que não é o do teste — ele não tem nada a
+    # ver com a configuração do banco, que é o que precisa estar ausente aqui.
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", ""),
+        "PYTHONPATH": str(REPO_ROOT),
+    }
     return subprocess.run(
         [sys.executable, "-c", code],
         env=env,
@@ -61,23 +69,34 @@ def test_import_app_main_sem_database_url(tmp_path):
     )
 
 
-def test_sessionmaker_e_cacheado(db_url):
-    """Uma engine por processo: o `lru_cache` é o que impede um pool novo por chamada.
+async def test_sessionlocal_abre_session_de_verdade_e_reusa_a_engine(db_url):
+    """Chama `SessionLocal()` PRA VALER e roda uma query com o que ela devolve.
 
-    Pede `db_url` porque aqui a leitura do env acontece de verdade (é o ponto: ela
-    acontece em RUNTIME, na primeira chamada, não no import).
+    Não é firula: nenhum outro teste chama essa função. Os dois testes de custo
+    substituem o atributo (`monkeypatch.setattr("app.db.SessionLocal", ...)`) e a
+    fixture `client` sobrescreve a dependência `get_session` — então um bug DENTRO
+    de `SessionLocal` (devolver a fábrica em vez da session, p.ex.) passaria pela
+    suíte inteira verde e só apareceria no /health/db ou num script.
+
+    Pede `db_url` porque aqui a leitura do env acontece de verdade — que é o ponto
+    da fatia: ela acontece em RUNTIME, na primeira chamada, não no import.
     """
+    from sqlalchemy import text
+
     from app.db import SessionLocal, _sessionmaker
 
+    sm = _sessionmaker()
+    engine = sm.kw["bind"]
     try:
-        assert _sessionmaker() is _sessionmaker()
-        # O nome público continua sendo um atributo CHAMÁVEL do módulo: 6 scripts
-        # fazem `from app.db import SessionLocal` e dois testes trocam esse atributo
-        # via monkeypatch.setattr("app.db.SessionLocal", ...).
-        assert callable(SessionLocal)
+        # Uma engine por processo: o lru_cache é o que impede um pool novo por chamada.
+        assert sm is _sessionmaker()
+
+        async with SessionLocal() as session:
+            assert (await session.execute(text("SELECT 1"))).scalar_one() == 1
     finally:
         # Não deixa uma engine ligada ao container pendurada no cache do módulo.
         _sessionmaker.cache_clear()
+        await engine.dispose()
 
 
 @pytest.mark.parametrize("modulo", ["app.db", "app.cost", "app.agents.graph"])
