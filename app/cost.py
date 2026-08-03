@@ -101,9 +101,11 @@ async def record_call_cost(
     `request_id`/`client` vêm dos ContextVars (`app/agents/context.py`), não de
     parâmetro: o nó do grafo não conhece a borda HTTP. Fora de um request, são None.
 
-    O import de `app.db` fica AQUI DENTRO de propósito: importar `app.db` exige
-    DATABASE_URL, e a extração offline importa `app.cost` só pra calcular preço, sem
-    banco nenhum.
+    O import de `app.db` fica AQUI DENTRO de propósito. O motivo original (importar
+    `app.db` exigia DATABASE_URL, e a extração offline importa `app.cost` só pra
+    calcular preço) caiu com a engine preguiçosa, mas o import tardio continua sendo
+    load-bearing: ele resolve `SessionLocal` no momento da CHAMADA, que é o que faz
+    `monkeypatch.setattr("app.db.SessionLocal", ...)` dos testes de custo pegar.
     """
     from app.agents.context import get_client_name, get_request_id
     from app.db import SessionLocal

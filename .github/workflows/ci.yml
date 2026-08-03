@@ -1,0 +1,36 @@
+name: CI
+
+# PR e push na main: o mesmo comando que roda na máquina do dev.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Um push novo no mesmo PR cancela o run anterior — não adianta segurar runner por
+# um commit que já foi substituído. Em `main` NÃO cancela: lá cada commit é um estado
+# publicado e engolir o resultado dele esconderia uma quebra.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Sem DATABASE_URL e sem .env DE PROPÓSITO: quem sobe o Postgres é o
+      # testcontainers, dentro da suíte (o runner ubuntu-latest já tem Docker, e o
+      # conftest seta TESTCONTAINERS_RYUK_DISABLED). É a engine preguiçosa do
+      # app/db.py que faz isso funcionar — o env só é lido em runtime, então
+      # importar a app antes do container existir não quebra mais.
+      - name: Run tests
+        run: pytest -q

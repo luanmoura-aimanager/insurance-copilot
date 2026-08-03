@@ -56,7 +56,7 @@ Categorical columns feed the SQL worker; raw-text columns feed the RAG worker.
 
 ## Tech stack
 
-FastAPI · Postgres (+ pgvector) · SQLAlchemy 2.0 (async) · Alembic · Docker Compose · pytest + testcontainers · deployed on Railway.
+FastAPI · Postgres (+ pgvector) · SQLAlchemy 2.0 (async) · Alembic · Docker Compose · pytest + testcontainers · GitHub Actions · deployed on Railway.
 
 ## Getting started
 
@@ -101,6 +101,29 @@ curl -X POST localhost:8000/ask \
 # {"answer":"Existem 7 perigos cadastrados na base.","iterations":2}
 ```
 
+### Tests and CI
+
+```bash
+pytest -q       # needs Docker running (Colima on macOS); no environment variables
+```
+
+The suite boots its own throwaway Postgres with testcontainers and applies the real
+migrations to it, so **no environment variable is required to run it** — not even
+`DATABASE_URL`. That works because the database engine is **lazy**: `app/db.py` reads
+`DATABASE_URL` on the first `SessionLocal()` call (behind an `lru_cache`, so there is
+exactly one engine per process), not at import time. Importing the app used to blow up
+with `KeyError: 'DATABASE_URL'` in any environment without a database configured —
+including pytest's own collection phase, before the container existed.
+`tests/test_lazy_db.py` pins that: it imports `app.main` in a subprocess with a
+scrubbed environment and asserts it exits 0.
+
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on every pull request
+and on pushes to `main`: Python 3.11, `pip install -r requirements.txt`, `pytest -q`.
+It deliberately sets no `DATABASE_URL` and writes no `.env` — the lazy engine is what
+makes a database-less checkout able to import the app and let testcontainers do the
+rest. No secrets are needed either: every test uses fakes, so nothing calls the
+Anthropic API.
+
 ### Auth and rate limiting on `/ask`
 
 `POST /ask` is the only paid endpoint (each supervisor hop is an Anthropic call), so it is closed by default. `/health` and `/health/db` stay open — they are the Railway healthcheck, which sends no `Authorization` header.
@@ -139,11 +162,13 @@ Without it every request arrives with the proxy's IP as `request.client.host`, s
 
 ```
 insurance-copilot/
+├── .github/
+│   └── workflows/ci.yml    # CI: pytest on every PR and push to main
 ├── app/
 │   ├── main.py             # FastAPI app + health endpoints + POST /ask
 │   ├── auth.py             # Bearer auth with identity (API_TOKENS: name -> token)
 │   ├── limits.py           # slowapi limiter: per-client + per-IP keys
-│   ├── db.py               # async engine + session (SQLAlchemy 2.0)
+│   ├── db.py               # lazy async engine + session factory (SQLAlchemy 2.0)
 │   └── models.py           # ORM models: PolicyDocument, Coverage, Peril, CoveragePeril, Exclusion
 ├── alembic/
 │   └── versions/           # migrations (alembic upgrade head)
@@ -195,6 +220,7 @@ PDF footer).
 - [x] ORM models — all 5 tables: `policy_document`, `coverage`, `peril`, `coverage_peril`, `exclusion`
 - [x] Alembic migrations
 - [x] Test suite (testcontainers)
+- [x] CI on GitHub Actions — `pytest -q` on every PR and push to `main`, with no database configured (lazy engine)
 - [ ] Production extraction (LLM → tables)
 - [x] Postgres MCP SQL server + read-only `insurance_ro` role
 - [~] Agent layer — async LLM supervisor (structured output) + single-pass SQL worker + synthesizer (natural-language answer), served at `POST /ask`; RAG/extraction workers + a ReAct refinement loop pending
