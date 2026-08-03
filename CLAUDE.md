@@ -33,7 +33,8 @@ curl -X POST localhost:8000/ask -H 'Content-Type: application/json' \
 alembic upgrade head
 alembic revision --autogenerate -m "message"
 
-# Tests (boots a throwaway Postgres via testcontainers — Docker must be running)
+# Tests (boots a throwaway Postgres via testcontainers — Docker must be running).
+# Nenhum env é necessário: a engine é preguiçosa, então é o mesmo comando do CI.
 pytest -q
 
 # Postgres MCP SQL server (stdio; sync psycopg3, not asyncpg). PYTHONPATH=. is
@@ -49,6 +50,12 @@ RO_ROLE_PASSWORD=... PYTHONPATH=. python mcp_servers/test_readonly_role.py # pro
 ## Architecture & key decisions
 
 **Async-only data layer.** `app/db.py` uses SQLAlchemy 2.0 async (`asyncpg` driver). The `DATABASE_URL` **must** use the `postgresql+asyncpg://` scheme, not plain `postgresql://`. The async route (`/health/db`) injects a session via FastAPI `Depends(get_session)`.
+
+**A engine é preguiçosa: `DATABASE_URL` é lida em runtime, não no import.** `app/db.py` não constrói mais nada no nível do módulo. `_sessionmaker()`, cacheado com `@lru_cache(maxsize=1)`, lê o env, normaliza a URL e cria a engine + o `async_sessionmaker` **na primeira chamada**; `SessionLocal()` é uma função que delega pra ele. O motivo: com `os.environ["DATABASE_URL"]` no topo do módulo, qualquer `import app.main` num ambiente sem banco configurado morria com `KeyError` **no import** — inclusive durante a *coleta* do pytest, antes do testcontainers ter subido o Postgres. Esse bug voltou 4×, sempre disfarçado de "ordem de fixture", e é o que impedia um CI sem `.env`. Três detalhes carregam peso. (1) O `lru_cache` **é** a engine única do processo: sem ele, cada `SessionLocal()` criaria uma engine (e um pool) nova e vazaria conexões — não construa engine por chamada, só via o cache. (2) `SessionLocal` continua sendo um **atributo chamável do módulo** de propósito: 6 scripts fazem `from app.db import SessionLocal` e `tests/test_cost_graph.py`/`tests/test_synth.py` trocam esse atributo com `monkeypatch.setattr("app.db.SessionLocal", ...)` — renomear quebra os dois lados. É também por isso que o import de `app.db` dentro de `record_call_cost` continua sendo local: o motivo original (importar `app.db` exigia env) caiu, mas o import tardio é o que resolve `SessionLocal` no momento da chamada e faz o monkeypatch pegar. (3) `load_dotenv()` fica **no topo**: em dev local o `.env` continua sendo a fonte da URL, e em CI, sem arquivo, é no-op — ele não exige nem lê a variável. `tests/test_lazy_db.py` é a trava: roda `import app.main` (e cada degrau da cadeia: `app.db`, `app.cost`, `app.agents.graph`) num **subprocesso** com env limpo, cwd fora do repo e `load_dotenv` neutralizado, porque dentro do processo do pytest o env já está populado pela fixture do container e não se prova nada.
+
+**As gambiarras de ordem de fixture da F3/F4 agora são redundantes.** `ask_client` em `tests/test_cost_graph.py` e `tests/test_synth.py` pede `db_url`/`cost_rows` antes só pra garantir que o container (e portanto `DATABASE_URL`) existisse antes de `import app.main` — com a engine preguiçosa isso não é mais necessário, e os docstrings dessas fixtures descrevem um problema que não existe mais. **Foram mantidas de propósito** na fatia da correção (remover é ruído separado, e `cost_rows` continua obrigatória nos testes que de fato contam linhas em `cost_event`); quem mexer nesses arquivos depois pode simplificar a assinatura sem medo.
+
+**CI (`.github/workflows/ci.yml`).** `pull_request` + push na `main`; ubuntu-latest, Python 3.11, `pip install -r requirements.txt`, `pytest -q`. O job **não** seta `DATABASE_URL` nem cria `.env`, e isso é o ponto: quem sobe o Postgres é o testcontainers dentro da própria suíte (o runner já traz Docker; `TESTCONTAINERS_RYUK_DISABLED` vem do `conftest.py`). Ou seja, o CI só é verde por causa da engine preguiçosa — ele é a prova viva da correção, não só um gate. Também não precisa de secrets: nenhum teste gasta dinheiro (todos usam fakes), então `ANTHROPIC_API_KEY` não entra.
 
 **Port 5433.** docker-compose maps Postgres to host `5433` (not the default 5432) to avoid colliding with a local Postgres; `.env.example` reflects this.
 
