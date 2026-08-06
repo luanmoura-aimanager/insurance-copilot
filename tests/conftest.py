@@ -51,7 +51,9 @@ def reset_limiter():
 @pytest.fixture(scope="session")
 def db_url():
     """Boot one throwaway Postgres for the whole suite and apply migrations to it."""
-    with PostgresContainer("postgres:16") as pg:
+    # Mesma imagem do docker-compose: a migration do clause_chunk faz
+    # CREATE EXTENSION vector, que o postgres:16 puro não tem.
+    with PostgresContainer("pgvector/pgvector:pg16") as pg:
         # testcontainers gives a sync (psycopg2) URL; the app engine wants asyncpg.
         async_url = pg.get_connection_url().replace("+psycopg2", "+asyncpg")
         os.environ["DATABASE_URL"] = async_url  # env.py reads this (and swaps to sync for Alembic)
