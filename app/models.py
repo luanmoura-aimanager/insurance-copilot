@@ -2,7 +2,16 @@ from datetime import datetime
 from decimal import Decimal
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import CheckConstraint, ForeignKey, Index, Numeric, UniqueConstraint, func
+from sqlalchemy import (
+    CheckConstraint,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
+    Numeric,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 # Dimensão do vetor de embedding. Fixa na coluna (`vector(1024)`), porque o
@@ -45,6 +54,10 @@ class Coverage(Base):
             "deductible_type IN ('none', 'percentage', 'fixed_amount', 'defined_in_policy')",
             name="ck_coverage_deductible_type",
         ),
+        # Redundante como unicidade (`id` já é PK), mas é o alvo exigido pela FK
+        # composta de `clause_chunk`: o Postgres só aceita referenciar um conjunto de
+        # colunas que tenha unique/PK. Ver o comentário do arco em ClauseChunk.
+        UniqueConstraint("document_id", "id", name="uq_coverage_document_id_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -129,6 +142,12 @@ class ClauseChunk(Base):
     ponteiro órfão, e os uniques por (origem, chunk_index) valem porque as colunas
     participantes são NOT NULL sempre que a linha usa aquele braço do arco.
 
+    As FKs do arco são **compostas com `document_id`**, o que impede o terceiro caso
+    ruim: um chunk cujo `document_id` aponta pra um documento e cuja origem pertence a
+    outro. Sem isso o `delete_document_by_hash` (que apaga chunks por `document_id`)
+    não enxergaria esse chunk e estouraria na FK ao apagar a exclusão — o mesmo
+    documento pela metade de sempre. Detalhe em `__table_args__`.
+
     `coverage_id` mudou de significado: era cópia denormalizada da cobertura dona da
     exclusão (podia divergir de `exclusion.coverage_id`), agora é um dos dois braços
     do arco — preenchido *só* quando o chunk é a regra de franquia daquela cobertura.
@@ -147,15 +166,54 @@ class ClauseChunk(Base):
             "(exclusion_id IS NOT NULL) <> (coverage_id IS NOT NULL)",
             name="ck_clause_chunk_exactly_one_source",
         ),
+        # As FKs do arco são COMPOSTAS com `document_id` de propósito. Com FKs
+        # simples (`exclusion_id -> exclusion.id`) nada obrigava `document_id` a ser
+        # o documento da origem: um chunk com document_id=B e exclusion_id de uma
+        # exclusão do documento A entrava sem reclamar, e aí
+        # `delete_document_by_hash(A)` — que apaga os chunks por document_id — não
+        # via esse chunk e estourava ForeignKeyViolation em `exclusion`, deixando o
+        # documento pela metade. Exatamente o bug que esta fatia existe pra matar.
+        # MATCH SIMPLE (o padrão) é o que faz isto compor com o arco: quando o braço
+        # está NULL a FK inteira não é checada, então só o braço em uso é validado.
+        ForeignKeyConstraint(
+            ["document_id", "exclusion_id"],
+            ["exclusion.document_id", "exclusion.id"],
+            name="fk_clause_chunk_exclusion",
+        ),
+        ForeignKeyConstraint(
+            ["document_id", "coverage_id"],
+            ["coverage.document_id", "coverage.id"],
+            name="fk_clause_chunk_coverage",
+        ),
         # Idempotência da re-indexação, agora de verdade: nas linhas em que a coluna
         # de origem está preenchida ela é NOT NULL, então o unique morde (o problema
         # do NULL-distinto do desenho antigo não existe mais).
-        UniqueConstraint("exclusion_id", "chunk_index", name="uq_clause_chunk_exclusion_chunk"),
-        UniqueConstraint("coverage_id", "chunk_index", name="uq_clause_chunk_coverage_chunk"),
+        #
+        # São índices únicos PARCIAIS, não UNIQUE constraints: por desenho metade das
+        # linhas tem `exclusion_id` NULL e a outra metade `coverage_id` NULL, então um
+        # índice total carregaria uma entrada morta por linha do outro braço — o dobro
+        # do tamanho, na tabela que também carrega o índice HNSW. O predicado não
+        # enfraquece a garantia (as linhas excluídas são justamente as que o NULL já
+        # tornava não-conflitantes) e continua servindo a validação da FK, porque
+        # `exclusion_id = $1` implica `exclusion_id IS NOT NULL`.
+        Index(
+            "uq_clause_chunk_exclusion_chunk",
+            "exclusion_id",
+            "chunk_index",
+            unique=True,
+            postgresql_where=text("exclusion_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_clause_chunk_coverage_chunk",
+            "coverage_id",
+            "chunk_index",
+            unique=True,
+            postgresql_where=text("coverage_id IS NOT NULL"),
+        ),
         # O Postgres não indexa coluna filha de FK sozinho, e esta é, por desenho, a
         # maior tabela do schema: sem isto todo DELETE em policy_document (o fluxo do
         # --force) vira seq scan pra validar a FK. `exclusion_id` e `coverage_id` já
-        # saem indexadas pelos dois UNIQUE acima — só `document_id` precisa.
+        # saem indexadas pelos dois índices parciais acima — só `document_id` precisa.
         Index("ix_clause_chunk_document_id", "document_id"),
         # O índice HNSW é criado na migration com SQL cru (o Alembic não emite
         # operator class), mas precisa estar declarado aqui: sem isso o próximo
@@ -172,9 +230,11 @@ class ClauseChunk(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     document_id: Mapped[int] = mapped_column(ForeignKey("policy_document.id"))
-    # Arco exclusivo — exatamente um destes dois é NOT NULL (ver o check acima).
-    exclusion_id: Mapped[int | None] = mapped_column(ForeignKey("exclusion.id"))
-    coverage_id: Mapped[int | None] = mapped_column(ForeignKey("coverage.id"))
+    # Arco exclusivo — exatamente um destes dois é NOT NULL (ver o check acima). As
+    # FKs não ficam aqui na coluna: são compostas com document_id, declaradas em
+    # __table_args__.
+    exclusion_id: Mapped[int | None]
+    coverage_id: Mapped[int | None]
     chunk_index: Mapped[int] = mapped_column(default=0)   # posição dentro do texto de origem
     text: Mapped[str]
     # Nullable porque o chunking e o embedding são passos separados: a linha nasce
@@ -194,6 +254,9 @@ class Exclusion(Base):
             "(scope = 'general' AND coverage_id IS NULL) OR (scope = 'coverage' AND coverage_id IS NOT NULL)",
             name="ck_exclusion_scope_coverage_id",
         ),
+        # Idem `coverage`: alvo da FK composta de `clause_chunk`, não uma regra de
+        # unicidade nova.
+        UniqueConstraint("document_id", "id", name="uq_exclusion_document_id_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

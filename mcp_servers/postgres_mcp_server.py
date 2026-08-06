@@ -23,12 +23,29 @@ mcp = FastMCP("postgres-mcp-server")
 # As 5 tabelas do domínio — a fronteira do que o worker SQL pode enxergar.
 TABLES = ("policy_document", "coverage", "peril", "coverage_peril", "exclusion")
 
+# Alvo de FROM/JOIN. Não é um parser de SQL, e não precisa ser: subquery e CTE também
+# usam FROM, então toda leitura de tabela passa por aqui. `FROM (SELECT ...)` não casa
+# (o próximo char é `(`, não identificador), que é o certo — o que importa está dentro.
+_FROM_JOIN_RE = re.compile(
+    r"\b(?:from|join)\s+(?:only\s+)?([a-zA-Z_][\w$]*(?:\.[a-zA-Z_][\w$]*)?)",
+    re.IGNORECASE,
+)
+# Nomes de CTE (`WITH x AS (`), que são referenciáveis mas não são tabelas.
+_CTE_RE = re.compile(
+    r"\b([a-zA-Z_][\w$]*)\s+as\s*(?:not\s+materialized\s+|materialized\s+)?\(",
+    re.IGNORECASE,
+)
+
 
 def _conninfo() -> str:
     """String de conexão libpq. Prefere a role read-only (`DATABASE_URL_RO`) quando
     presente — é a garantia real de segurança: mesmo se o filtro de texto do run_query
     for burlado, a role não tem permissão de escrever. Cai pro DATABASE_URL admin só se
-    a RO não estiver configurada."""
+    a RO não estiver configurada.
+
+    Esse fallback é silencioso, e é por isso que a allowlist de tabela do run_query não
+    é redundante com o `REVOKE SELECT ON clause_chunk`: num deploy sem DATABASE_URL_RO
+    o worker conecta como admin e o REVOKE simplesmente não participa."""
     raw = os.environ.get("DATABASE_URL_RO") or os.environ["DATABASE_URL"]
     # normalize_url devolve `postgresql+psycopg://...`; o libpq (psycopg.connect)
     # só entende o scheme puro `postgresql://`, então tiramos o `+psycopg`.
@@ -81,10 +98,37 @@ def get_schema() -> str:
     return schema_str
 
 
+def _tabelas_fora_da_allowlist(body: str) -> set[str]:
+    """Nomes referenciados em FROM/JOIN que não são tabela de domínio nem CTE local.
+
+    A allowlist é o par da omissão no `get_schema()`: sem ela, "o worker SQL não
+    enxerga `clause_chunk`" era só uma tabela não *anunciada* — um
+    `SELECT * FROM clause_chunk` escrito pelo LLM passava pelo filtro textual (que só
+    olha o primeiro token) e o LIMIT 100 automático despejava 100 vetores de 1024
+    floats no contexto da chamada seguinte, num projeto que cobra por chamada.
+
+    O `REVOKE SELECT` da migration a4c91e5d7f28 cobre o mesmo buraco pelo lado do
+    banco, mas só morde quando `DATABASE_URL_RO` está configurada — sem ela o
+    `_conninfo()` cai pro DATABASE_URL admin e a role read-only não entra na história.
+    Esta checagem vale nos dois casos, e é por isso que ela existe além do REVOKE.
+    """
+    ctes = {nome.lower() for nome in _CTE_RE.findall(body)}
+    referenciadas = set()
+    for nome in _FROM_JOIN_RE.findall(body):
+        nome = nome.lower()
+        # `public.coverage` é a mesma coverage; qualquer outro schema é suspeito e
+        # cai na rejeição junto com os nomes desconhecidos.
+        if nome.startswith("public."):
+            nome = nome.split(".", 1)[1]
+        referenciadas.add(nome)
+    return referenciadas - set(TABLES) - ctes
+
+
 def run_query(sql: str) -> str:
     """
     Executa uma query read-only (SELECT) e retorna até 100 linhas.
-    Rejeita statements empilhados e qualquer coisa que não comece com SELECT.
+    Rejeita statements empilhados, qualquer coisa que não comece com SELECT, e
+    qualquer leitura de tabela fora das 5 do domínio.
     """
     stripped = sql.strip()
 
@@ -102,7 +146,16 @@ def run_query(sql: str) -> str:
     if not body.lower().startswith("select"):
         return "Error: only SELECT queries are allowed."
 
-    # 3. Anexa LIMIT 100 se a query ainda não tiver um LIMIT.
+    # 3. Só as 5 tabelas do domínio. Sem isto o filtro acima aprova qualquer SELECT,
+    #    inclusive em clause_chunk (vetores) e cost_event.
+    fora = _tabelas_fora_da_allowlist(body)
+    if fora:
+        return (
+            f"Error: table(s) not allowed: {', '.join(sorted(fora))}. "
+            f"Only these tables can be queried: {', '.join(TABLES)}."
+        )
+
+    # 4. Anexa LIMIT 100 se a query ainda não tiver um LIMIT.
     if not re.search(r"\blimit\b", body, re.IGNORECASE):
         body = f"{body} LIMIT 100"
 

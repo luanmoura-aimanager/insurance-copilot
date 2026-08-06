@@ -312,7 +312,7 @@ diagrama à parte porque ligam ao schema de domínio de fora — ou por FK que a
 </details>
 
 <div class="why">
-  <h2>Duas decisões que explicam o desenho</h2>
+  <h2>Três decisões que explicam o desenho</h2>
   <p><strong>Canonizar por perigo.</strong> A Porto vende "Vendaval + Granizo"; a Allianz vende "Vendaval + Granizo + Fumaça + Impacto de veículos". Comparar por nome de cobertura não funciona. Por isso <code>peril</code> virou tabela própria e <code>coverage ↔ peril</code> é muitos-para-muitos — daí a junção <code>coverage_peril</code>.</p>
   <p><strong>Categórica alimenta SQL, texto alimenta RAG.</strong> <code>deductible_type</code> permite <code>GROUP BY</code> e agregação; <code>deductible_rule_text</code> permite explicar a regra em linguagem natural. Guardar os dois é o que justifica ter os dois workers.</p>
   <p><strong>Arco exclusivo em vez de ponteiro polimórfico.</strong> Um chunk vem de uma exclusão <em>ou</em> de uma regra de franquia. A primeira versão modelou isso como <code>source</code> (texto) + <code>source_id</code> (id sem FK) — e não funcionava: apagar a linha de origem deixava o chunk apontando pro vazio, e como a re-extração reusa ids, o chunk passava a citar uma cláusula <em>diferente</em>. Duas FKs de verdade com um check XOR dão a mesma flexibilidade com integridade referencial. De brinde, o unique de idempotência passou a morder: com <code>source_id</code> nullable ele não impedia duplicata nenhuma, porque o Postgres trata <code>NULL</code>s como distintos num índice único.</p>

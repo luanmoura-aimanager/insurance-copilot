@@ -82,8 +82,11 @@ async def delete_document_by_hash(session: AsyncSession, pdf_hash: str) -> int |
     if doc_id is None:
         return None
 
-    # document_id cobre os dois braços do arco: todo chunk de uma exclusão ou de uma
-    # cobertura deste documento carrega o mesmo document_id, então um DELETE resolve.
+    # Um DELETE por document_id cobre os dois braços do arco — e isso é garantido, não
+    # presumido: as FKs do arco são compostas com document_id (ver ClauseChunk.
+    # __table_args__), então um chunk não *consegue* apontar pra uma origem de outro
+    # documento. Sem essa FK composta, um chunk incoerente escaparia deste DELETE e
+    # estouraria na remoção da `exclusion` logo abaixo.
     await session.execute(delete(ClauseChunk).where(ClauseChunk.document_id == doc_id))
 
     coverage_ids = (

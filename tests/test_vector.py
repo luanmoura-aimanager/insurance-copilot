@@ -14,12 +14,18 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from app.models import EMBEDDING_DIM, ClauseChunk, Coverage, Exclusion, PolicyDocument
 
 
-async def _documento(db_session) -> PolicyDocument:
-    """clause_chunk.document_id é NOT NULL — todo chunk precisa de um documento."""
+async def _documento(
+    db_session, susep_process: str = "15414.900001/2024-00"
+) -> PolicyDocument:
+    """clause_chunk.document_id é NOT NULL — todo chunk precisa de um documento.
+
+    O processo é parametrizável porque (susep_process, version) é unique e o teste da
+    FK composta precisa de dois documentos distintos.
+    """
     doc = PolicyDocument(
         insurer="Porto Seguro",
         product="Residência Habitual",
-        susep_process="15414.900001/2024-00",
+        susep_process=susep_process,
         pdf_url="https://example.com/doc.pdf",
         pdf_hash="deadbeef",
     )
@@ -141,14 +147,43 @@ async def test_indice_hnsw_existe_com_a_operator_class_certa(db_session):
 
 async def test_indice_de_fk_em_document_id_existe(db_session):
     """O Postgres não indexa coluna filha de FK sozinho, e sem este índice todo
-    DELETE em policy_document varre a maior tabela do schema."""
+    DELETE em policy_document varre a maior tabela do schema.
+
+    Checa a *definição*, não só a existência da linha: com `assert indexdef is not
+    None` bastava criar o índice na coluna errada (`['coverage_id']`) pro teste passar
+    verde com o seq scan intacto — o nome do índice não prova o conteúdo dele.
+    """
     indexdef = await db_session.scalar(
         text(
             "SELECT indexdef FROM pg_indexes "
             "WHERE tablename = 'clause_chunk' AND indexname = 'ix_clause_chunk_document_id'"
         )
     )
-    assert indexdef is not None
+    assert indexdef is not None, "o índice de FK não existe"
+    assert "(document_id)" in indexdef
+
+
+async def test_indices_de_idempotencia_sao_parciais(db_session):
+    """Metade das linhas tem NULL no braço que não usa, por desenho.
+
+    Um índice único total gastaria uma entrada por linha do outro braço — o dobro do
+    tamanho, na tabela que também carrega o HNSW. O predicado não afrouxa a garantia
+    (as linhas que ele exclui são as que o NULL já tornava não-conflitantes), e é o
+    `WHERE` na definição que prova que ele foi aplicado.
+    """
+    for indexname, coluna in (
+        ("uq_clause_chunk_exclusion_chunk", "exclusion_id"),
+        ("uq_clause_chunk_coverage_chunk", "coverage_id"),
+    ):
+        indexdef = await db_session.scalar(
+            text(
+                "SELECT indexdef FROM pg_indexes "
+                "WHERE tablename = 'clause_chunk' AND indexname = :nome"
+            ).bindparams(nome=indexname)
+        )
+        assert indexdef is not None, f"{indexname} não existe"
+        assert "UNIQUE" in indexdef
+        assert f"WHERE ({coluna} IS NOT NULL)" in indexdef
 
 
 async def test_arco_exclusivo_rejeita_nenhuma_origem(db_session):
@@ -179,6 +214,66 @@ async def test_arco_exclusivo_rejeita_as_duas_origens(db_session):
             await db_session.flush()
 
 
+async def test_fk_rejeita_origem_inexistente(db_session):
+    """O ponteiro órfão — o furo nº 1 do desenho antigo — agora é impossível.
+
+    Sem este teste a FK inteira podia sumir da migration e a suíte ficava verde: o
+    check XOR continua disparando, os uniques continuam disparando, e o teste de
+    delete passa porque apaga os chunks primeiro de qualquer jeito. Nada exercitava a
+    integridade referencial em si.
+    """
+    doc = await _documento(db_session)
+    with pytest.raises(IntegrityError, match="fk_clause_chunk_exclusion"):
+        async with db_session.begin_nested():
+            db_session.add(
+                ClauseChunk(document_id=doc.id, exclusion_id=999_999, text="origem fantasma")
+            )
+            await db_session.flush()
+
+
+async def test_fk_impede_apagar_a_exclusao_citada(db_session):
+    """A outra metade da garantia: enquanto um chunk cita a cláusula, ela não some.
+
+    É o que impede a re-extração de reciclar um id e fazer o chunk passar a citar uma
+    cláusula *diferente* — o dano real do ponteiro sem FK, que não é o NULL e sim a
+    citação silenciosamente errada.
+    """
+    doc = await _documento(db_session)
+    exc = await _exclusao(db_session, doc)
+    db_session.add(ClauseChunk(document_id=doc.id, exclusion_id=exc.id, text="pedaço"))
+    await db_session.flush()
+
+    with pytest.raises(IntegrityError, match="fk_clause_chunk_exclusion"):
+        async with db_session.begin_nested():
+            await db_session.execute(
+                text("DELETE FROM exclusion WHERE id = :id").bindparams(id=exc.id)
+            )
+
+
+async def test_fk_composta_rejeita_chunk_de_outro_documento(db_session):
+    """`document_id` e a origem do arco têm que concordar.
+
+    Com FKs simples este INSERT passava (verificado), e aí o buraco reabria pelo lado:
+    `delete_document_by_hash` apaga chunks por `document_id`, não veria este chunk, e
+    estouraria ForeignKeyViolation ao apagar a `exclusion` — o documento pela metade
+    que a fatia inteira existe pra impedir. Quem barra é a FK composta
+    (document_id, exclusion_id) -> exclusion(document_id, id).
+    """
+    doc_a = await _documento(db_session)
+    doc_b = await _documento(db_session, susep_process="15414.900002/2024-11")
+    exc_de_a = await _exclusao(db_session, doc_a)
+
+    with pytest.raises(IntegrityError, match="fk_clause_chunk_exclusion"):
+        async with db_session.begin_nested():
+            db_session.add(
+                ClauseChunk(
+                    document_id=doc_b.id, exclusion_id=exc_de_a.id,
+                    text="origem no documento errado",
+                )
+            )
+            await db_session.flush()
+
+
 async def test_reindexacao_e_idempotente_por_origem(db_session):
     """O unique (exclusion_id, chunk_index) morde de verdade.
 
@@ -200,12 +295,19 @@ async def test_reindexacao_e_idempotente_por_origem(db_session):
 
 
 async def test_worker_sql_nao_enxerga_clause_chunk(db_session):
-    """O REVOKE é o que torna verdadeira a frase "não é exposta ao worker SQL".
+    """Uma das duas camadas que tornam verdadeira a frase "não é exposta ao worker SQL".
 
-    Antes disso a tabela só estava *omitida* do get_schema() do MCP server, e
-    `run_query` não tem allowlist de tabela — um `SELECT * FROM clause_chunk` escrito
-    pelo LLM passaria, e o LIMIT 100 automático despejaria 100 vetores de 1024 floats
-    no contexto da próxima chamada, num projeto que mede custo por chamada.
+    Antes, a tabela só estava *omitida* do get_schema() do MCP server — um
+    `SELECT * FROM clause_chunk` escrito pelo LLM passaria pelo filtro textual, e o
+    LIMIT 100 automático despejaria 100 vetores de 1024 floats no contexto da próxima
+    chamada, num projeto que mede custo por chamada.
+
+    O que este teste NÃO prova: que o worker conecta *como* insurance_ro. Ele afirma o
+    privilégio da role, e `_conninfo()` cai silenciosamente pro DATABASE_URL admin
+    quando DATABASE_URL_RO não está setada — cenário em que este assert continua verde
+    e o REVOKE não participa de nada. Quem cobre esse caso é a allowlist de tabela do
+    run_query (`tests/test_sql_allowlist.py`); as duas camadas são independentes de
+    propósito.
     """
     pode_ler_chunk = await db_session.scalar(
         text("SELECT has_table_privilege('insurance_ro', 'clause_chunk', 'SELECT')")
