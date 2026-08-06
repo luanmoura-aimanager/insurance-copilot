@@ -1,10 +1,16 @@
 """Prova que a role `insurance_ro` é fisicamente read-only.
 
 Conecta COMO insurance_ro (mesmo host/porta/banco do DATABASE_URL, mas
-user=insurance_ro e password=$RO_ROLE_PASSWORD) e checa três coisas:
-  - SELECT em `peril` devolve linhas          → leitura funciona
+user=insurance_ro e password=$RO_ROLE_PASSWORD) e checa quatro coisas:
+  - SELECT em `peril` devolve linhas            → leitura funciona
   - INSERT em `peril` levanta permission denied → escrita barrada
   - CREATE TABLE levanta permission denied      → DDL barrado
+  - SELECT em `clause_chunk` levanta permission denied → o REVOKE da a4c91e5d7f28
+
+O último é o único lugar que prova o REVOKE pelo mesmo caminho que o worker SQL usa:
+uma conexão libpq real autenticada como a role. O `has_table_privilege()` de
+tests/test_vector.py consulta o catálogo de dentro da sessão admin do pytest — ele
+afirma o privilégio da role, não que alguém conecte com ela.
 
 Uso:
     export RO_ROLE_PASSWORD="dev_ro_pw_local"
@@ -94,6 +100,25 @@ def main() -> int:
     except psycopg.Error as exc:
         results.append(
             _report("CREATE TABLE blocked", False, f"unexpected: {exc}".strip())
+        )
+
+    # 4. SELECT em clause_chunk barrado (REVOKE da migration a4c91e5d7f28).
+    #    A tabela guarda vetores de 1024 floats: 100 linhas são ~1 MB de texto caindo
+    #    no contexto da chamada seguinte do worker SQL.
+    try:
+        conn.cursor().execute("SELECT id FROM clause_chunk LIMIT 1")
+        results.append(
+            _report("SELECT clause_chunk blocked", False, "SELECT succeeded!")
+        )
+    except psycopg.errors.InsufficientPrivilege as exc:
+        results.append(
+            _report(
+                "SELECT clause_chunk blocked", True, str(exc).strip().splitlines()[0]
+            )
+        )
+    except psycopg.Error as exc:
+        results.append(
+            _report("SELECT clause_chunk blocked", False, f"unexpected: {exc}".strip())
         )
 
     conn.close()

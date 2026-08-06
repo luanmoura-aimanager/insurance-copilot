@@ -12,7 +12,9 @@
   body{margin:0;padding:32px;background:var(--bg);color:var(--ink);
        font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}
   h1{font-size:22px;margin:0 0 4px}
+  h2.section{font-size:16px;margin:36px 0 4px}
   .sub{color:var(--muted);margin:0 0 28px;max-width:70ch}
+  .sub.tight{margin-bottom:16px}
   .legend{display:flex;gap:18px;flex-wrap:wrap;margin-bottom:24px;font-size:13px;color:var(--muted)}
   .chip{display:inline-flex;align-items:center;gap:6px}
   .dot{width:10px;height:10px;border-radius:2px;display:inline-block}
@@ -45,9 +47,11 @@
 <body>
 
 <h1>insurance-copilot — schema v1</h1>
-<p class="sub">Cinco tabelas que estruturam as condições gerais de seguro residencial (SUSEP).
-O grão da extração é <strong>(seguradora × cobertura)</strong>, e as coberturas são canonizadas
-<strong>por perigo</strong>, não por nome comercial.</p>
+<p class="sub">Cinco tabelas de <strong>domínio</strong> estruturam as condições gerais de seguro
+residencial (SUSEP). O grão da extração é <strong>(seguradora × cobertura)</strong>, e as coberturas
+são canonizadas <strong>por perigo</strong>, não por nome comercial. Duas outras tabelas ficam
+<strong>fora do domínio</strong> — <code>clause_chunk</code> (recuperação) e <code>cost_event</code>
+(governança); estão no segundo diagrama.</p>
 
 <div class="legend">
   <span class="chip"><span class="dot" style="background:var(--pk)"></span> PK — chave primária</span>
@@ -171,6 +175,66 @@ O grão da extração é <strong>(seguradora × cobertura)</strong>, e as cobert
 </svg>
 </div>
 
+<h2 class="section">Fora do domínio: recuperação e governança</h2>
+<p class="sub tight">Estas duas não descrevem o produto de seguro. <code>clause_chunk</code> é a
+camada de recuperação do worker RAG; <code>cost_event</code> é observabilidade de custo. Ficam num
+diagrama à parte porque ligam ao schema de domínio de fora — ou por FK que aponta pra dentro
+(<code>clause_chunk</code>), ou por nada (<code>cost_event</code>).</p>
+
+<div class="wrap">
+<svg viewBox="0 0 980 300" xmlns="http://www.w3.org/2000/svg">
+
+  <!-- ============ clause_chunk (recuperação) ============ -->
+  <g transform="translate(30,20)">
+    <rect class="box" x="0" y="0" width="420" height="250" rx="8"/>
+    <rect class="hdr" x="0" y="0" width="420" height="34" rx="8"/>
+    <rect class="hdr" x="0" y="24" width="420" height="10"/>
+    <text class="tbl-title" x="14" y="22">clause_chunk</text>
+    <text class="tbl-note" x="280" y="22">1 pedaço de cláusula</text>
+
+    <text class="col" x="14" y="56">id</text><text class="badge" x="46" y="56" fill="#7a5af5">PK</text>
+
+    <text class="col" x="14" y="78">document_id</text><text class="badge" x="112" y="78" fill="#c2410c">FK</text>
+    <text class="col-type" x="150" y="78">→ policy_document</text>
+
+    <!-- o arco exclusivo: exatamente um dos dois -->
+    <text class="col" x="14" y="100">exclusion_id</text><text class="badge" x="112" y="100" fill="#c2410c">FK</text>
+    <text class="col-type" x="150" y="100">→ exclusion</text>
+    <text class="col" x="14" y="120">coverage_id</text><text class="badge" x="112" y="120" fill="#c2410c">FK</text>
+    <text class="col-type" x="150" y="120">→ coverage</text>
+    <path class="edge" d="M 280 88 L 290 88 L 290 126 L 280 126" stroke="#0f766e"/>
+    <text class="edge-label" x="298" y="111" fill="#0f766e">exatamente 1</text>
+
+    <text class="col" x="14" y="146">chunk_index</text><text class="col-type" x="330" y="146">int</text>
+    <text class="col" x="14" y="164">text</text><text class="col-type" x="330" y="164">text</text>
+    <text class="col" x="14" y="182">embedding</text><text class="col-type" x="270" y="182">vector(1024)?</text>
+    <text class="col" x="14" y="200">embedding_model</text><text class="col-type" x="300" y="200">text?</text>
+    <text class="col" x="14" y="218">created_at</text><text class="col-type" x="312" y="218">timestamp</text>
+    <text class="tbl-note" x="14" y="240">índice HNSW / vector_cosine_ops · sem SELECT pra insurance_ro</text>
+  </g>
+
+  <!-- ============ cost_event (governança) ============ -->
+  <g transform="translate(530,20)">
+    <rect class="box" x="0" y="0" width="420" height="250" rx="8"/>
+    <rect class="hdr" x="0" y="0" width="420" height="34" rx="8"/>
+    <rect class="hdr" x="0" y="24" width="420" height="10"/>
+    <text class="tbl-title" x="14" y="22">cost_event</text>
+    <text class="tbl-note" x="290" y="22">1 chamada de LLM</text>
+
+    <text class="col" x="14" y="56">id</text><text class="badge" x="46" y="56" fill="#7a5af5">PK</text>
+    <text class="col" x="14" y="78">agent_name</text><text class="col-type" x="270" y="78">extraction, sql…</text>
+    <text class="col" x="14" y="96">model</text><text class="col-type" x="250" y="96">id versionado do modelo</text>
+    <text class="col" x="14" y="114">input_tokens · output_tokens</text><text class="col-type" x="380" y="114">int</text>
+    <text class="col" x="14" y="132">cost_usd</text><text class="col-type" x="292" y="132">numeric(12,6)</text>
+    <text class="col" x="14" y="150">batch</text><text class="col-type" x="290" y="150">bool (50% off)</text>
+    <text class="col" x="14" y="168">label</text><text class="col-type" x="340" y="168">text?</text>
+    <text class="col" x="14" y="186">request_id · client</text><text class="col-type" x="340" y="186">text?</text>
+    <text class="col" x="14" y="204">created_at</text><text class="col-type" x="312" y="204">timestamp</text>
+    <text class="tbl-note" x="14" y="240">sem FK nenhuma — não é schema de domínio</text>
+  </g>
+</svg>
+</div>
+
 <details open>
   <summary>O que cada tabela guarda</summary>
   <table>
@@ -200,6 +264,16 @@ O grão da extração é <strong>(seguradora × cobertura)</strong>, e as cobert
       <td>Uma exclusão</td>
       <td>Exclusões gerais (do documento) e específicas (de uma cobertura) convivem — por isso <code>coverage_id</code> é nullable.</td>
     </tr>
+    <tr>
+      <td><code>clause_chunk</code></td>
+      <td>Um <em>pedaço</em> de texto de cláusula, com o seu vetor</td>
+      <td>O grão é o chunk, não a linha extraída: uma cláusula longa vira vários pedaços, cada um com o seu embedding. Pôr o vetor em <code>exclusion</code>/<code>coverage</code> forçaria um chunk por linha e amarraria o domínio ao modelo de embedding da vez.</td>
+    </tr>
+    <tr>
+      <td><code>cost_event</code></td>
+      <td>Uma chamada de LLM</td>
+      <td>Governança, não domínio. O grão é a <em>chamada</em> (não o documento, não o request) — é o que permite responder "quanto custou este <code>/ask</code>?" e "qual agente queima o orçamento?".</td>
+    </tr>
   </table>
 </details>
 
@@ -225,13 +299,23 @@ O grão da extração é <strong>(seguradora × cobertura)</strong>, e as cobert
     <tr><td><code>coverage_id</code> <span class="k-fk">FK</span></td><td>exclusion</td><td>Nullable: exclusão geral não pertence a cobertura nenhuma.</td></tr>
     <tr><td><code>scope</code></td><td>exclusion</td><td><code>general</code> ou <code>coverage</code>.</td></tr>
     <tr><td><code>clause_text</code></td><td>exclusion</td><td>Texto literal da cláusula. Alimenta RAG.</td></tr>
+    <tr><td><code>exclusion_id</code> · <code>coverage_id</code> <span class="k-fk">FK</span></td><td>clause_chunk</td><td><strong>Arco exclusivo</strong>: exatamente um dos dois é preenchido — ou o chunk é pedaço de uma exclusão, ou é pedaço da regra de franquia de uma cobertura. Imposto pelo check <code>ck_clause_chunk_exactly_one_source</code>.</td></tr>
+    <tr><td><code>chunk_index</code></td><td>clause_chunk</td><td>Posição do pedaço dentro do texto de origem. Com a FK forma o unique que torna a re-indexação idempotente.</td></tr>
+    <tr><td><code>text</code></td><td>clause_chunk</td><td>O pedaço em si — o que vai ser embeddado e devolvido como citação.</td></tr>
+    <tr><td><code>embedding</code></td><td>clause_chunk</td><td><code>vector(1024)</code> (voyage-4-lite). Nullable: chunking e embedding são passos separados, então <code>NULL</code> = "ainda não indexado". A dimensão está no tipo porque o Postgres precisa dela pra indexar.</td></tr>
+    <tr><td><code>embedding_model</code></td><td>clause_chunk</td><td>Qual modelo gerou o vetor — sem isso, re-embeddar não sabe o que já está atualizado.</td></tr>
+    <tr><td><code>agent_name</code> · <code>model</code></td><td>cost_event</td><td>Quem chamou e qual modelo foi cobrado (id versionado, que é a chave do <code>pricing.json</code>).</td></tr>
+    <tr><td><code>cost_usd</code></td><td>cost_event</td><td><code>numeric(12,6)</code>, nunca float — cobrança tem que ser exata.</td></tr>
+    <tr><td><code>batch</code></td><td>cost_event</td><td>A Batch API cobra 50%. O flag faz uma linha pela metade do preço se explicar sozinha numa auditoria.</td></tr>
+    <tr><td><code>request_id</code> · <code>client</code></td><td>cost_event</td><td>Correlaciona todas as chamadas de um <code>/ask</code> e a identidade do token. Nullable: a extração offline não tem request nem cliente.</td></tr>
   </table>
 </details>
 
 <div class="why">
-  <h2>Duas decisões que explicam o desenho</h2>
+  <h2>Três decisões que explicam o desenho</h2>
   <p><strong>Canonizar por perigo.</strong> A Porto vende "Vendaval + Granizo"; a Allianz vende "Vendaval + Granizo + Fumaça + Impacto de veículos". Comparar por nome de cobertura não funciona. Por isso <code>peril</code> virou tabela própria e <code>coverage ↔ peril</code> é muitos-para-muitos — daí a junção <code>coverage_peril</code>.</p>
   <p><strong>Categórica alimenta SQL, texto alimenta RAG.</strong> <code>deductible_type</code> permite <code>GROUP BY</code> e agregação; <code>deductible_rule_text</code> permite explicar a regra em linguagem natural. Guardar os dois é o que justifica ter os dois workers.</p>
+  <p><strong>Arco exclusivo em vez de ponteiro polimórfico.</strong> Um chunk vem de uma exclusão <em>ou</em> de uma regra de franquia. A primeira versão modelou isso como <code>source</code> (texto) + <code>source_id</code> (id sem FK) — e não funcionava: apagar a linha de origem deixava o chunk apontando pro vazio, e como a re-extração reusa ids, o chunk passava a citar uma cláusula <em>diferente</em>. Duas FKs de verdade com um check XOR dão a mesma flexibilidade com integridade referencial. De brinde, o unique de idempotência passou a morder: com <code>source_id</code> nullable ele não impedia duplicata nenhuma, porque o Postgres trata <code>NULL</code>s como distintos num índice único.</p>
   <p><strong>Nota de escopo:</strong> o corpus são condições gerais — descrevem o produto. O <em>valor</em> da franquia vive na apólice individual do cliente, fora deste schema. Por isso <code>deductible_type</code> tem a categoria <code>defined_in_policy</code>.</p>
 </div>
 

@@ -59,12 +59,14 @@ Categorical columns feed the SQL worker; raw-text columns feed the RAG worker.
 Postgres runs the `pgvector/pgvector:pg16` image (the official `postgres:16` plus the `vector` extension compiled in), and `clause_chunk` stores one **chunk** of clause text per row, with its embedding.
 
 - **The grain is the chunk, not the extracted row.** A long clause becomes several pieces, each with its own vector. Putting the embedding on `exclusion` / `coverage` would force one chunk per row — bad retrieval — and tie the domain schema to whichever embedding model is current.
-- `source` (`exclusion` | `deductible_rule`) + `source_id` point back at the original row, which is what lets an answer cite where a clause came from. `unique (source, source_id, chunk_index)` makes re-indexing idempotent.
+- **The origin is an exclusive arc**: `exclusion_id` **or** `coverage_id` — exactly one, enforced by a check constraint. Real foreign keys, so the "cite where this came from" guarantee has referential integrity behind it. The FKs are **composite with `document_id`** (`(document_id, exclusion_id) → exclusion(document_id, id)`), which is what forbids a chunk whose `document_id` and whose origin belong to different documents — such a row would slip past the by-`document_id` delete and then break the FK on the way out, leaving a half-deleted document. `MATCH SIMPLE` is why this composes with the arc: a FK with any `NULL` column isn't checked, so only the arm in use is validated. Partial unique indexes on `(exclusion_id, chunk_index)` and `(coverage_id, chunk_index)` make re-indexing idempotent at half the index size (by design, half the rows are `NULL` in each arm).
 - Embeddings are **voyage-4-lite, 1024 dimensions** — multilingual (the corpus is pt-BR), cheap, and the smaller dimension keeps the index light. The dimension lives in the column type (`vector(1024)`) because Postgres needs it to index, so changing models is a migration, not configuration.
 - `embedding` / `embedding_model` are nullable: chunking and embedding are separate steps, so `NULL` means "not indexed yet".
-- The index is `USING hnsw (embedding vector_cosine_ops)`, matching the cosine distance the search will use. It is written as raw SQL in the migration (Alembic emits neither `CREATE EXTENSION` nor an operator class) *and* declared on the model, so a later `--autogenerate` doesn't propose dropping it.
+- The index is `USING hnsw (embedding vector_cosine_ops)`, matching the cosine distance the search will use. It is written as raw SQL in the migration (Alembic emits neither `CREATE EXTENSION` nor an operator class) *and* declared on the model, so a later `--autogenerate` doesn't propose dropping it. `document_id` gets a plain btree index too — Postgres does not index FK child columns on its own, and this is by design the largest table in the schema.
 
-**`clause_chunk` is deliberately not exposed to the SQL worker** — it is absent from `TABLES` in `mcp_servers/postgres_mcp_server.py`. That worker answers by aggregating categorical columns; a vector column in its `get_schema()` would only burn context and invite `SELECT`s over embeddings. Similarity search belongs to the RAG worker.
+The first version modelled the origin as a polymorphic pointer (`source` text + `source_id` with no FK). It was replaced because neither promise held: a `source_id` with no foreign key goes dangling when its origin row is deleted (and re-extraction reuses ids, so the chunk starts citing a *different* clause), and the unique constraint enforced nothing at all, since `source_id` was nullable and Postgres treats `NULL`s as distinct in a unique index.
+
+**`clause_chunk` is not reachable by the SQL worker**, enforced in two independent layers: a **table allowlist in `run_query`** (every `FROM`/`JOIN` target must be one of the 5 domain tables or a local CTE), *and* a `REVOKE SELECT` on the table for `insurance_ro`. Being absent from `TABLES` was never protection on its own — the text filter only inspects the first token, so a `SELECT * FROM clause_chunk` written by the model would pass and the automatic `LIMIT 100` would dump 100 vectors of 1024 floats into the next call's context. Neither layer subsumes the other: the revoke does nothing when `DATABASE_URL_RO` is unset and connections fall back to the admin URL, and the allowlist would not stop a writable role if the `SELECT` filter were bypassed. The revoke is surgical — the default privileges for future tables stay in place, and the domain tables stay readable. Similarity search belongs to the RAG worker.
 
 **This is storage only.** Nothing chunks, embeds or retrieves yet, and the agent graph is unchanged — see [Roadmap](#roadmap).
 
@@ -183,7 +185,7 @@ insurance-copilot/
 │   ├── auth.py             # Bearer auth with identity (API_TOKENS: name -> token)
 │   ├── limits.py           # slowapi limiter: per-client + per-IP keys
 │   ├── db.py               # lazy async engine + session factory (SQLAlchemy 2.0)
-│   └── models.py           # ORM models: PolicyDocument, Coverage, Peril, CoveragePeril, Exclusion, ClauseChunk
+│   └── models.py           # ORM models: PolicyDocument, Coverage, Peril, CoveragePeril, Exclusion, ClauseChunk, CostEvent
 ├── alembic/
 │   └── versions/           # migrations (alembic upgrade head)
 ├── docs/
@@ -240,7 +242,7 @@ PDF footer).
 - [~] Agent layer — async LLM supervisor (structured output) + single-pass SQL worker + synthesizer (natural-language answer), served at `POST /ask`; RAG/extraction workers + a ReAct refinement loop pending
 - [x] `POST /ask` hardening — Bearer auth with identity + per-client and per-IP rate limits
 - [x] Cost attribution in the agent graph — one `cost_event` per LLM call, tagged with a per-request id and the calling client
-- [~] RAG worker — vector storage ready (pgvector extension, `clause_chunk`, HNSW/cosine index); chunking, embedding and retrieval pending
+- [~] RAG worker — vector storage ready (pgvector extension, `clause_chunk` with an exclusive-arc origin, HNSW/cosine index, revoked from the SQL worker's role); chunking, embedding and retrieval pending
 - [ ] WhatsApp surface
 - [ ] Deploy to Railway
 
