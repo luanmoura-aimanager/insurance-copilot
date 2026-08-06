@@ -1,6 +1,8 @@
 services:
   postgres:
-    image: postgres:16
+    # pgvector/pgvector:pg16 = o postgres:16 oficial + a extensão `vector` já compilada.
+    # Trocar a imagem é o que permite `CREATE EXTENSION vector` na migration.
+    image: pgvector/pgvector:pg16
     container_name: insurance-copilot-db
     restart: unless-stopped
     environment:

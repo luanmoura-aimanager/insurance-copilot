@@ -2,7 +2,7 @@
 
 A multi-agent system that turns Brazilian home-insurance policy documents into a queryable knowledge base. It harvests *condições gerais* (general terms) registered with SUSEP, extracts their structure into Postgres, and answers coverage-comparison questions in natural language.
 
-> **Status: work in progress.** The data pipeline (SUSEP harvester + extraction schema) and the service skeleton (FastAPI + Postgres) are in place. The agent layer has its first real slice — an LLM supervisor routing to a single-pass SQL worker over the Postgres MCP server, with a synthesizer node turning the query result into a natural-language answer, exposed at `POST /ask`. See [Roadmap](#roadmap).
+> **Status: work in progress.** The data pipeline (SUSEP harvester + extraction schema) and the service skeleton (FastAPI + Postgres) are in place. The agent layer has its first real slice — an LLM supervisor routing to a single-pass SQL worker over the Postgres MCP server, with a synthesizer node turning the query result into a natural-language answer, exposed at `POST /ask`. The RAG worker has its vector storage (pgvector + `clause_chunk`) but no retrieval yet. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -16,7 +16,7 @@ A supervisor agent routes each question to specialized workers (canonical hub-an
 
 - **extraction** — turns a policy PDF into structured rows (insurer, product, coverages, perils, exclusions).
 - **SQL** — aggregates over the structured tables (coverage comparison, deductible structure, exclusion patterns).
-- **RAG** — retrieves and explains raw clause text (pgvector).
+- **RAG** — retrieves and explains raw clause text (pgvector). *Storage is in place (`clause_chunk`); chunking, embedding and retrieval are not.*
 
 A **synthesizer** node closes every path: it turns the worker's raw output into a single natural-language sentence, so the API answers in prose rather than in tuples. When no worker ran (the question is out of scope), it returns a fixed sentence *without* calling the model — there is nothing to synthesize, and paying for a call to say "I don't know" is wasted money.
 
@@ -54,6 +54,20 @@ The extraction grain is **(insurer × coverage)**, not the insurer — a policy 
 
 Categorical columns feed the SQL worker; raw-text columns feed the RAG worker.
 
+### Retrieval storage — `clause_chunk` (pgvector)
+
+Postgres runs the `pgvector/pgvector:pg16` image (the official `postgres:16` plus the `vector` extension compiled in), and `clause_chunk` stores one **chunk** of clause text per row, with its embedding.
+
+- **The grain is the chunk, not the extracted row.** A long clause becomes several pieces, each with its own vector. Putting the embedding on `exclusion` / `coverage` would force one chunk per row — bad retrieval — and tie the domain schema to whichever embedding model is current.
+- `source` (`exclusion` | `deductible_rule`) + `source_id` point back at the original row, which is what lets an answer cite where a clause came from. `unique (source, source_id, chunk_index)` makes re-indexing idempotent.
+- Embeddings are **voyage-4-lite, 1024 dimensions** — multilingual (the corpus is pt-BR), cheap, and the smaller dimension keeps the index light. The dimension lives in the column type (`vector(1024)`) because Postgres needs it to index, so changing models is a migration, not configuration.
+- `embedding` / `embedding_model` are nullable: chunking and embedding are separate steps, so `NULL` means "not indexed yet".
+- The index is `USING hnsw (embedding vector_cosine_ops)`, matching the cosine distance the search will use. It is written as raw SQL in the migration (Alembic emits neither `CREATE EXTENSION` nor an operator class) *and* declared on the model, so a later `--autogenerate` doesn't propose dropping it.
+
+**`clause_chunk` is deliberately not exposed to the SQL worker** — it is absent from `TABLES` in `mcp_servers/postgres_mcp_server.py`. That worker answers by aggregating categorical columns; a vector column in its `get_schema()` would only burn context and invite `SELECT`s over embeddings. Similarity search belongs to the RAG worker.
+
+**This is storage only.** Nothing chunks, embeds or retrieves yet, and the agent graph is unchanged — see [Roadmap](#roadmap).
+
 ## Tech stack
 
 FastAPI · Postgres (+ pgvector) · SQLAlchemy 2.0 (async) · Alembic · Docker Compose · pytest + testcontainers · GitHub Actions · deployed on Railway.
@@ -75,7 +89,7 @@ pip install -r requirements.txt
 cp .env.example .env        # then edit if needed
 
 # 4. start Postgres
-docker compose up -d        # serves Postgres on localhost:5433
+docker compose up -d        # serves Postgres (pgvector/pgvector:pg16) on localhost:5433
 
 # 5. create the tables
 alembic upgrade head
@@ -169,7 +183,7 @@ insurance-copilot/
 │   ├── auth.py             # Bearer auth with identity (API_TOKENS: name -> token)
 │   ├── limits.py           # slowapi limiter: per-client + per-IP keys
 │   ├── db.py               # lazy async engine + session factory (SQLAlchemy 2.0)
-│   └── models.py           # ORM models: PolicyDocument, Coverage, Peril, CoveragePeril, Exclusion
+│   └── models.py           # ORM models: PolicyDocument, Coverage, Peril, CoveragePeril, Exclusion, ClauseChunk
 ├── alembic/
 │   └── versions/           # migrations (alembic upgrade head)
 ├── docs/
@@ -226,6 +240,7 @@ PDF footer).
 - [~] Agent layer — async LLM supervisor (structured output) + single-pass SQL worker + synthesizer (natural-language answer), served at `POST /ask`; RAG/extraction workers + a ReAct refinement loop pending
 - [x] `POST /ask` hardening — Bearer auth with identity + per-client and per-IP rate limits
 - [x] Cost attribution in the agent graph — one `cost_event` per LLM call, tagged with a per-request id and the calling client
+- [~] RAG worker — vector storage ready (pgvector extension, `clause_chunk`, HNSW/cosine index); chunking, embedding and retrieval pending
 - [ ] WhatsApp surface
 - [ ] Deploy to Railway
 
