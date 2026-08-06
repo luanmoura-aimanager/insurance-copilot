@@ -113,23 +113,50 @@ class ClauseChunk(Base):
     embedding da vez — re-embeddar com outro modelo viraria migration em vez de
     reprocessamento.
 
-    `source` + `source_id` são o vínculo de volta com a linha original, que é o que
-    permite citar a origem ("essa exclusão está no documento X"); o unique
-    (source, source_id, chunk_index) torna a re-indexação idempotente.
+    A origem do chunk é um **arco exclusivo**: ou `exclusion_id` (o chunk é um pedaço
+    de `exclusion.clause_text`) ou `coverage_id` (é um pedaço da regra de franquia,
+    `coverage.deductible_rule_text`) — exatamente um dos dois, nunca os dois, nunca
+    nenhum. O check `ck_clause_chunk_exactly_one_source` é quem impõe isso.
 
-    Fica **fora** do TABLES do MCP server de propósito: o worker SQL responde por
+    Substituiu o ponteiro polimórfico (`source` + `source_id`) da R1, que tinha dois
+    furos. (1) `source_id` era um id sem FK: apagar a exclusão de origem deixava o
+    chunk apontando pro vazio, e como a re-extração reusa ids, o chunk podia passar a
+    citar uma cláusula *diferente* — justamente a garantia de "citar a origem" que a
+    coluna existia pra dar. (2) `UniqueConstraint(source, source_id, chunk_index)` não
+    tornava a re-indexação idempotente coisa nenhuma: `source_id` era nullable e o
+    Postgres trata NULLs como distintos num índice único, então dois chunks idênticos
+    com `source_id IS NULL` entravam os dois. Com FKs de verdade o banco impede o
+    ponteiro órfão, e os uniques por (origem, chunk_index) valem porque as colunas
+    participantes são NOT NULL sempre que a linha usa aquele braço do arco.
+
+    `coverage_id` mudou de significado: era cópia denormalizada da cobertura dona da
+    exclusão (podia divergir de `exclusion.coverage_id`), agora é um dos dois braços
+    do arco — preenchido *só* quando o chunk é a regra de franquia daquela cobertura.
+
+    Fica **fora** do alcance do worker SQL de propósito: o worker responde por
     agregação sobre colunas categóricas, e um vetor não é coisa que se responda com
-    SELECT — o acesso a esta tabela é do worker RAG, por similaridade.
+    SELECT. Isso é imposto por privilégio (`REVOKE SELECT ... FROM insurance_ro`, na
+    migration a4c91e5d7f28), não só pela omissão no `get_schema()` do MCP server — o
+    acesso a esta tabela é do worker RAG, por similaridade.
     """
 
     __tablename__ = "clause_chunk"
     __table_args__ = (
+        # Arco exclusivo: `<>` entre dois booleanos é XOR. Exatamente um preenchido.
         CheckConstraint(
-            "source IN ('exclusion', 'deductible_rule')", name="ck_clause_chunk_source"
+            "(exclusion_id IS NOT NULL) <> (coverage_id IS NOT NULL)",
+            name="ck_clause_chunk_exactly_one_source",
         ),
-        UniqueConstraint(
-            "source", "source_id", "chunk_index", name="uq_clause_chunk_source_chunk"
-        ),
+        # Idempotência da re-indexação, agora de verdade: nas linhas em que a coluna
+        # de origem está preenchida ela é NOT NULL, então o unique morde (o problema
+        # do NULL-distinto do desenho antigo não existe mais).
+        UniqueConstraint("exclusion_id", "chunk_index", name="uq_clause_chunk_exclusion_chunk"),
+        UniqueConstraint("coverage_id", "chunk_index", name="uq_clause_chunk_coverage_chunk"),
+        # O Postgres não indexa coluna filha de FK sozinho, e esta é, por desenho, a
+        # maior tabela do schema: sem isto todo DELETE em policy_document (o fluxo do
+        # --force) vira seq scan pra validar a FK. `exclusion_id` e `coverage_id` já
+        # saem indexadas pelos dois UNIQUE acima — só `document_id` precisa.
+        Index("ix_clause_chunk_document_id", "document_id"),
         # O índice HNSW é criado na migration com SQL cru (o Alembic não emite
         # operator class), mas precisa estar declarado aqui: sem isso o próximo
         # `alembic revision --autogenerate` enxerga um índice que o modelo não
@@ -145,9 +172,9 @@ class ClauseChunk(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     document_id: Mapped[int] = mapped_column(ForeignKey("policy_document.id"))
+    # Arco exclusivo — exatamente um destes dois é NOT NULL (ver o check acima).
+    exclusion_id: Mapped[int | None] = mapped_column(ForeignKey("exclusion.id"))
     coverage_id: Mapped[int | None] = mapped_column(ForeignKey("coverage.id"))
-    source: Mapped[str]                         # exclusion | deductible_rule
-    source_id: Mapped[int | None]               # id da linha de origem
     chunk_index: Mapped[int] = mapped_column(default=0)   # posição dentro do texto de origem
     text: Mapped[str]
     # Nullable porque o chunking e o embedding são passos separados: a linha nasce

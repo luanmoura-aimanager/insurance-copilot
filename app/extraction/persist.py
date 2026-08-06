@@ -14,7 +14,7 @@ do LLM — o manifesto é o ground truth (o LLM encurtou "Porto Seguro", perdeu 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Coverage, CoveragePeril, Exclusion, Peril, PolicyDocument
+from app.models import ClauseChunk, Coverage, CoveragePeril, Exclusion, Peril, PolicyDocument
 
 from .schema import ExtractedDocument
 
@@ -65,7 +65,14 @@ async def delete_document_by_hash(session: AsyncSession, pdf_hash: str) -> int |
 
     Ordem filho→pai obrigatória: as FKs recusam apagar um pai com filhos vivos. É a
     mesma restrição de integridade que protege o banco, agora atrapalhando de propósito
-    — não existe DELETE CASCADE aqui, então a ordem é explícita.
+    — não existe DELETE CASCADE aqui, então a ordem é explícita:
+
+        clause_chunk → coverage_peril → exclusion → coverage → policy_document
+
+    `clause_chunk` vem primeiro porque é o filho mais fundo: cada chunk aponta pro
+    documento E pro seu braço do arco exclusivo (exclusion_id ou coverage_id), então
+    ele referencia as três tabelas acima dele. Deixar pra depois faz o DELETE estourar
+    já em `exclusion`, com o documento pela metade.
 
     Usado só pra re-extrair um doc (ex.: extração que saiu incompleta).
     """
@@ -74,6 +81,10 @@ async def delete_document_by_hash(session: AsyncSession, pdf_hash: str) -> int |
     )
     if doc_id is None:
         return None
+
+    # document_id cobre os dois braços do arco: todo chunk de uma exclusão ou de uma
+    # cobertura deste documento carrega o mesmo document_id, então um DELETE resolve.
+    await session.execute(delete(ClauseChunk).where(ClauseChunk.document_id == doc_id))
 
     coverage_ids = (
         await session.scalars(select(Coverage.id).where(Coverage.document_id == doc_id))
