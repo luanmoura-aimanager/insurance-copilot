@@ -2,7 +2,7 @@
 
 A multi-agent system that turns Brazilian home-insurance policy documents into a queryable knowledge base. It harvests *condições gerais* (general terms) registered with SUSEP, extracts their structure into Postgres, and answers coverage-comparison questions in natural language.
 
-> **Status: work in progress.** The data pipeline (SUSEP harvester + extraction schema) and the service skeleton (FastAPI + Postgres) are in place. The agent layer has its first real slice — an LLM supervisor routing to a single-pass SQL worker over the Postgres MCP server, with a synthesizer node turning the query result into a natural-language answer, exposed at `POST /ask`. The RAG worker has its vector storage (pgvector + `clause_chunk`) but no retrieval yet. See [Roadmap](#roadmap).
+> **Status: work in progress.** The data pipeline (SUSEP harvester + extraction schema) and the service skeleton (FastAPI + Postgres) are in place. The agent layer has its first real slice — an LLM supervisor routing to a single-pass SQL worker over the Postgres MCP server, with a synthesizer node turning the query result into a natural-language answer, exposed at `POST /ask`. The RAG worker has its vector storage (pgvector + `clause_chunk`) and its chunk materialization (`app/rag/`), but no embedding or retrieval yet. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -16,7 +16,7 @@ A supervisor agent routes each question to specialized workers (canonical hub-an
 
 - **extraction** — turns a policy PDF into structured rows (insurer, product, coverages, perils, exclusions).
 - **SQL** — aggregates over the structured tables (coverage comparison, deductible structure, exclusion patterns).
-- **RAG** — retrieves and explains raw clause text (pgvector). *Storage is in place (`clause_chunk`); chunking, embedding and retrieval are not.*
+- **RAG** — retrieves and explains raw clause text (pgvector). *Storage and chunking are in place (`clause_chunk`, `app/rag/`); embedding and retrieval are not.*
 
 A **synthesizer** node closes every path: it turns the worker's raw output into a single natural-language sentence, so the API answers in prose rather than in tuples. When no worker ran (the question is out of scope), it returns a fixed sentence *without* calling the model — there is nothing to synthesize, and paying for a call to say "I don't know" is wasted money.
 
@@ -68,7 +68,24 @@ The first version modelled the origin as a polymorphic pointer (`source` text + 
 
 **`clause_chunk` is not reachable by the SQL worker**, enforced in two independent layers: a **table allowlist in `run_query`** (every `FROM`/`JOIN` target must be one of the 5 domain tables or a local CTE), *and* a `REVOKE SELECT` on the table for `insurance_ro`. Being absent from `TABLES` was never protection on its own — the text filter only inspects the first token, so a `SELECT * FROM clause_chunk` written by the model would pass and the automatic `LIMIT 100` would dump 100 vectors of 1024 floats into the next call's context. Neither layer subsumes the other: the revoke does nothing when `DATABASE_URL_RO` is unset and connections fall back to the admin URL, and the allowlist would not stop a writable role if the `SELECT` filter were bypassed. The revoke is surgical — the default privileges for future tables stay in place, and the domain tables stay readable. Similarity search belongs to the RAG worker.
 
-**This is storage only.** Nothing chunks, embeds or retrieves yet, and the agent graph is unchanged — see [Roadmap](#roadmap).
+### Chunking — one source row, one chunk (`app/rag/`)
+
+`app/rag/` fills `clause_chunk` from the text extraction already persisted: `chunking.py` (pure functions, no database) builds each chunk's text and `index.py::index_document(session, document_id)` writes the rows, leaving `embedding`/`embedding_model` `NULL`. Nothing calls an embedding model yet.
+
+**There is no splitter, and that is a measured decision.** Across the 30 persisted documents, the 4,176 exclusions have a **median length of 101 characters**, a p99 of 456 and a maximum of 907; the 210 deductible rules average 180. Nothing comes near 1,400 characters — far below any embedding model's limit. So **one source row = one chunk**, and `chunk_index` is always `0` (the largest chunk produced over the real corpus is 934 characters: the 907-character clause plus its header). Splitting by size and overlapping pieces would be machinery with no text to exercise it; when the corpus does bring long clauses, `chunk_index` is already in the schema and only the chunking layer changes. Current corpus: 4,176 + 210 = **4,386 chunks**.
+
+**The chunk text carries meaning, not identity.** A header exists because `"Danos causados por ato doloso"` on its own doesn't say what it is an exclusion *of* — an exclusion of the Fire coverage and a policy-wide exclusion are different facts, and the vector has to know which. The three formats are deliberately short (`Exclusão da cobertura {name}: …`, `Exclusão geral da apólice: …`, `Regra de franquia da cobertura {name}: …`): with the median clause at 101 characters, a long prefix would dominate the vector and search would start ranking by header. **Insurer, product and SUSEP process stay out** — that is *identity*: it already lives in `policy_document` and is answered by a SQL filter (`WHERE document_id ...`) at query time, exactly and for free. Inside the text it would only pull every chunk from the same insurer closer together, noise that drags similarity away from what the question actually asks.
+
+**Re-indexing is idempotent, and new text invalidates the vector.** The upsert conflicts on the two partial unique indexes — which is why `index_where` must accompany `index_elements` (without it Postgres cannot infer the arbiter), and why there are two upserts, one per arm of the arc. On conflict the text is always refreshed, while `embedding`/`embedding_model` go through a `CASE`: **preserved when the text is identical, reset to `NULL` when it changed**. An old vector over new text is an index that *lies* — search keeps matching the old wording and confidently cites a clause that no longer exists, and `NULL` simply means "not indexed yet". Both halves matter: always clearing the vector would still pass the invalidation test and force a full re-embed of the corpus on every pass, which is real money.
+
+**The pass is authoritative — it also prunes.** An upsert alone is idempotent only for sources that were *added or changed*, never for sources that were *removed*: clearing `coverage.deductible_rule_text` leaves the old chunk alive with its paid-for vector, and retrieval starts confidently citing a deductible rule the document no longer contains. So `index_document` deletes the document's chunks that this pass did not produce, in the same transaction. Blank source text (`""`, `"   "`) is treated as no text for the same reason — it passes the `IS NOT NULL` filter but yields a chunk that is nothing but its header: zero content, a paid embedding, and one more near-identical noise vector competing inside the HNSW index.
+
+```bash
+python scripts/index_chunks.py                  # every document; costs nothing (no LLM, no embedding API)
+python scripts/index_chunks.py --document-id 7  # just one
+```
+
+**Embedding and retrieval are still pending**, and the agent graph is unchanged — see [Roadmap](#roadmap).
 
 ## Tech stack
 
@@ -242,7 +259,7 @@ PDF footer).
 - [~] Agent layer — async LLM supervisor (structured output) + single-pass SQL worker + synthesizer (natural-language answer), served at `POST /ask`; RAG/extraction workers + a ReAct refinement loop pending
 - [x] `POST /ask` hardening — Bearer auth with identity + per-client and per-IP rate limits
 - [x] Cost attribution in the agent graph — one `cost_event` per LLM call, tagged with a per-request id and the calling client
-- [~] RAG worker — vector storage ready (pgvector extension, `clause_chunk` with an exclusive-arc origin, HNSW/cosine index, revoked from the SQL worker's role); chunking, embedding and retrieval pending
+- [~] RAG worker — vector storage ready (pgvector extension, `clause_chunk` with an exclusive-arc origin, HNSW/cosine index, revoked from the SQL worker's role) and chunks materialized from the extracted text (one source row = one chunk, idempotent re-indexing that invalidates the vector when the text changes); embedding and retrieval pending
 - [ ] WhatsApp surface
 - [ ] Deploy to Railway
 
