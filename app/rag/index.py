@@ -5,11 +5,17 @@ monta o texto do chunk (`app.rag.chunking`) e grava uma linha por origem, com
 `embedding`/`embedding_model` `NULL` — "ainda não indexado". Quem preenche o vetor é a
 R2b.
 
-Contrato de transação igual ao de `persist_document`: **não commita**. Dá flush no que
-precisar e devolve; o chamador (script, teste, batch) é dono da transação.
+A passada é **autoritativa**: o que está em `clause_chunk` depois dela é exatamente o
+que as origens do documento produzem agora — o que sumiu da origem some daqui (ver
+`_podar`).
+
+Contrato de transação igual ao de `persist_document`: **não commita**. Os statements
+são Core (`INSERT ... ON CONFLICT`, `DELETE`), então já estão no banco quando a função
+retorna — não há flush a esperar, mas também não há commit: o chamador (script, teste,
+batch) é dono da transação.
 """
 
-from sqlalchemy import case, select
+from sqlalchemy import and_, case, delete, or_, select, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import InstrumentedAttribute
@@ -61,11 +67,68 @@ async def _upsert(
     return len(rows)
 
 
+def _sobras(arm: InstrumentedAttribute, chaves: list[tuple[int, int]]):
+    """Predicado das linhas DESTE braço que a passada atual não escreveu.
+
+    Sem lista de chaves (a origem não produz mais texto nenhum) o braço inteiro é
+    sobra — `tuple_(...).not_in([])` renderiza um "sempre verdadeiro" no SQLAlchemy,
+    mas escrever o caso explicitamente é mais barato de ler do que confiar nisso.
+    """
+    if not chaves:
+        return arm.is_not(None)
+    return and_(arm.is_not(None), tuple_(arm, ClauseChunk.chunk_index).not_in(chaves))
+
+
+async def _podar(
+    session: AsyncSession,
+    document_id: int,
+    linhas_exclusao: list[dict],
+    linhas_franquia: list[dict],
+) -> None:
+    """Apaga os chunks do documento que esta passada não produziu.
+
+    Sem isto o UPSERT sozinho é idempotente só para origem *adicionada ou alterada*,
+    nunca para origem *removida*: limpar `coverage.deductible_rule_text` (uma
+    re-extração que corrigiu uma leitura errada) deixa o chunk antigo vivo, com o
+    vetor pago intacto, e a busca passa a citar com confiança uma regra de franquia
+    que o documento não tem mais. O braço das exclusões está acidentalmente protegido
+    — a FK composta impede apagar uma `exclusion` citada por um chunk —, mas o das
+    coberturas não, porque zerar uma coluna de texto não toca em FK nenhuma.
+
+    A poda inclui o `chunk_index` na chave, e não só o id da origem: hoje o grão é um
+    chunk por origem, mas no dia em que o chunking cortar por tamanho, uma cláusula
+    que encolhe de 3 pedaços para 2 tem que perder o pedaço nº 2.
+    """
+    await session.execute(
+        delete(ClauseChunk).where(
+            ClauseChunk.document_id == document_id,
+            or_(
+                _sobras(
+                    ClauseChunk.exclusion_id,
+                    [(r["exclusion_id"], r["chunk_index"]) for r in linhas_exclusao],
+                ),
+                _sobras(
+                    ClauseChunk.coverage_id,
+                    [(r["coverage_id"], r["chunk_index"]) for r in linhas_franquia],
+                ),
+            ),
+        )
+    )
+
+
 async def index_document(session: AsyncSession, document_id: int) -> int:
     """Grava (ou atualiza) os chunks de um documento. Devolve quantos.
 
-    Uma linha de origem = um chunk, `chunk_index=0` — ver a justificativa medida em
-    `app.rag.chunking`.
+    A passada é autoritativa: escreve o que as origens produzem agora e **poda** o que
+    elas não produzem mais (`_podar`). Uma linha de origem = um chunk, `chunk_index=0`
+    — ver a justificativa medida em `app.rag.chunking`.
+
+    Origem com texto em branco (`""`, `"   "`) é tratada como origem sem texto e não
+    vira chunk: `ExtractedCoverage.deductible_rule_text` é `str | None` sem
+    `min_length`, então um LLM que devolve `""` em vez de `null` é persistido tal e
+    qual, e o chunk resultante seria só o cabeçalho — conteúdo zero, embedding pago na
+    R2b, e um vetor de ruído quase idêntico a todos os outros disputando espaço no
+    índice HNSW.
     """
     # Outer join: as exclusões de escopo 'general' têm coverage_id NULL, e são
     # justamente as que precisam do cabeçalho "geral da apólice".
@@ -84,7 +147,8 @@ async def index_document(session: AsyncSession, document_id: int) -> int:
     ).all()
 
     # Só as coberturas que têm regra de franquia escrita: sem texto não há o que indexar
-    # (e `deductible_type` sozinho é coluna categórica, assunto do worker SQL).
+    # (e `deductible_type` sozinho é coluna categórica, assunto do worker SQL). O NULL
+    # é barrado aqui; o texto em branco é barrado na montagem das linhas, abaixo.
     franquias = (
         await session.execute(
             select(Coverage.id, Coverage.coverage_name, Coverage.deductible_rule_text)
@@ -105,6 +169,7 @@ async def index_document(session: AsyncSession, document_id: int) -> int:
             "text": build_exclusion_text(clause_text, scope, coverage_name),
         }
         for exc_id, clause_text, scope, coverage_name in exclusoes
+        if clause_text and clause_text.strip()
     ]
     linhas_franquia = [
         {
@@ -115,8 +180,10 @@ async def index_document(session: AsyncSession, document_id: int) -> int:
             "text": build_deductible_text(rule_text, coverage_name),
         }
         for cov_id, coverage_name, rule_text in franquias
+        if rule_text and rule_text.strip()
     ]
 
     gravados = await _upsert(session, linhas_exclusao, ClauseChunk.exclusion_id)
     gravados += await _upsert(session, linhas_franquia, ClauseChunk.coverage_id)
+    await _podar(session, document_id, linhas_exclusao, linhas_franquia)
     return gravados

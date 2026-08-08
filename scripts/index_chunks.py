@@ -49,12 +49,16 @@ async def run(document_id: int | None) -> None:
         for doc_id, insurer, product in docs:
             n = await index_document(session, doc_id)
             total += n
-            print(f"[ok] doc {doc_id:>4}  chunks={n:>5}  {insurer} — {product}")
+            # `[..]` e não `[ok]`: nada está gravado ainda. O commit é único, no fim
+            # (o script é dono da transação — mesmo contrato de persist_document), e
+            # um erro no documento 29 desfaz os 28 anteriores. Tudo ou nada é a escolha
+            # certa aqui (diferente do run_batch, onde cada doc já custou dinheiro):
+            # esta passada não gasta nada, então repetir é de graça e um documento
+            # meio-indexado seria pior. Mas dizer "ok" antes do commit seria mentira.
+            print(f"[..] doc {doc_id:>4}  chunks={n:>5}  {insurer} — {product}")
 
-        # index_document só dá flush; o script é dono da transação (mesmo contrato de
-        # persist_document) — um commit único no fim, tudo ou nada.
         await session.commit()
-        print(f"[total] {len(docs)} documento(s), {total} chunks")
+        print(f"[ok] commit — {len(docs)} documento(s), {total} chunks")
 
 
 def main() -> None:

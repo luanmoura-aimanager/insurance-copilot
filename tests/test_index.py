@@ -7,12 +7,10 @@ com regra de franquia, outra sem), 1 exclusão de cobertura e 2 gerais.
 from sqlalchemy import func, select, update
 
 from app.extraction.persist import persist_document
-from app.models import EMBEDDING_DIM, ClauseChunk, Exclusion
+from app.models import EMBEDDING_DIM, ClauseChunk, Coverage, Exclusion
 from app.rag.index import index_document
 
-# `tests/` não é pacote (não há __init__.py), então o pytest põe o diretório no
-# sys.path e o import é plano — não relativo.
-from test_persist import MANIFEST_ROW, sample_doc
+from tests.test_persist import MANIFEST_ROW, sample_doc
 
 # sample_doc: 3 exclusões (1 de cobertura + 2 gerais) + 1 cobertura com
 # deductible_rule_text ("Incêndio"; "Vendaval" tem None e não vira chunk).
@@ -114,6 +112,49 @@ async def test_texto_novo_invalida_o_embedding(db_session):
     assert "agora corrigida" in depois[alvo.id].text
     assert depois[alvo.id].embedding is None
     assert depois[alvo.id].embedding_model is None
+
+
+async def test_poda_chunk_cuja_origem_perdeu_o_texto(db_session):
+    """O UPSERT sozinho é idempotente só pra origem adicionada ou alterada.
+
+    Zerar `coverage.deductible_rule_text` (re-extração que corrigiu uma leitura errada)
+    não toca em FK nenhuma, então sem a poda o chunk antigo sobrevive com o vetor pago
+    intacto e a busca cita, confiante, uma regra de franquia que o documento não tem
+    mais. O braço das exclusões está acidentalmente protegido pela FK composta; este
+    aqui não estava.
+    """
+    pd_id = await _documento_indexado(db_session)
+    alvo = next(c for c in await _chunks(db_session, pd_id) if c.coverage_id is not None)
+
+    await db_session.execute(
+        update(Coverage)
+        .where(Coverage.id == alvo.coverage_id)
+        .values(deductible_rule_text=None)
+    )
+    await index_document(db_session, pd_id)
+
+    restantes = await _chunks(db_session, pd_id)
+    assert len(restantes) == CHUNKS_ESPERADOS - 1
+    assert all(c.coverage_id is None for c in restantes)   # o braço de franquia esvaziou
+
+
+async def test_texto_em_branco_nao_vira_chunk(db_session):
+    """`deductible_rule_text=""` passa pelo filtro `IS NOT NULL` — e o schema da
+    extração é `str | None` sem `min_length`, então um LLM que devolve `""` em vez de
+    `null` é persistido tal e qual. O chunk resultante seria só o cabeçalho: conteúdo
+    zero, embedding pago na R2b, e um vetor de ruído quase idêntico a todos os outros
+    disputando espaço no índice HNSW.
+    """
+    pd_id = await persist_document(db_session, sample_doc(), MANIFEST_ROW)
+    await db_session.execute(
+        update(Coverage)
+        .where(Coverage.document_id == pd_id, Coverage.deductible_rule_text.is_not(None))
+        .values(deductible_rule_text="   ")
+    )
+
+    gravados = await index_document(db_session, pd_id)
+    assert gravados == CHUNKS_ESPERADOS - 1     # só as 3 exclusões
+    assert all(c.coverage_id is None for c in await _chunks(db_session, pd_id))
 
 
 async def test_texto_igual_preserva_o_embedding(db_session):
