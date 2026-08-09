@@ -17,6 +17,16 @@ sem erro nenhum pra denunciar.
 resolve sozinha esperando, porque é uma janela que reabre. Todo o resto sobe na hora —
 mascarar um erro real atrás de 6 tentativas só faz o backfill levar minutos pra dar a
 mesma mensagem.
+
+**`truncation=False`, contra o padrão do SDK.** Com o padrão (`True`), um texto maior
+que o contexto do modelo é *cortado em silêncio* e embeddado pela metade. A linha
+resultante fica indistinguível de uma correta — `clause_chunk.text` guarda a cláusula
+inteira, o vetor cobre só o começo dela, e `embedding_model` diz `voyage-4-lite` como em
+todas as outras. Aí a busca casa por um prefixo e cita a cláusula toda: exatamente o
+"índice que mente" que a R2a já trata como inaceitável, entrando pela última porta que
+faltava. Hoje isso é inalcançável (o maior chunk do corpus tem 934 caracteres), mas a
+R2a **não tem splitter por decisão medida** — o dia em que o corpus trouxer uma cláusula
+longa é o dia em que este parâmetro decide entre um erro barulhento e um índice podre.
 """
 
 import logging
@@ -55,6 +65,13 @@ RATE_LIMIT_ESPERA_INICIAL = 20.0
 RATE_LIMIT_FATOR = 2.0
 RATE_LIMIT_ESPERA_MAX = 120.0
 
+# Timeout da chamada HTTP. O SDK herda 600s se ninguém escolher, e 10 minutos aqui não é
+# só espera: `_pendentes` segura as linhas do lote com FOR UPDATE durante a chamada, e a
+# transação fica aberta junto. Num Postgres com `idle_in_transaction_session_timeout`
+# ligado, é esse número que decide se a passada morre. 60s é folgado pra um lote de 200
+# textos curtos e mantém a janela de trava em algo defensável.
+EMBED_TIMEOUT = 60.0
+
 
 @lru_cache(maxsize=1)
 def get_client() -> voyageai.Client:
@@ -77,7 +94,10 @@ def get_client() -> voyageai.Client:
             "VOYAGE_API_KEY não está no ambiente — a indexação de vetores precisa da "
             "chave da Voyage. Ponha o valor real no .env (ver .env.example)."
         )
-    return voyageai.Client(api_key=key)
+    # `max_retries=0` (o padrão) é deliberado: quem retenta é `_embed_com_retry`, e só
+    # rate limit. Deixar o SDK retentar por conta dele empilharia uma política invisível
+    # por baixo da nossa — inclusive em erros que não devem ser retentados.
+    return voyageai.Client(api_key=key, timeout=EMBED_TIMEOUT, max_retries=0)
 
 
 def _embed_com_retry(client: voyageai.Client, texts: list[str]):
@@ -85,8 +105,16 @@ def _embed_com_retry(client: voyageai.Client, texts: list[str]):
 
     Rate limit é a única falha que se resolve sozinha esperando — é uma janela que
     reabre. Qualquer outra exceção sobe na hora, sem retry: chave inválida, dimensão
-    negociada errada, texto grande demais ou queda da API não melhoram com espera, e
-    retentar um erro real só faz o backfill demorar 7 minutos pra dar a mesma mensagem.
+    negociada errada ou texto grande demais não melhoram com espera, e retentar um erro
+    real só faz o backfill demorar 7 minutos pra dar a mesma mensagem.
+
+    **`Timeout` fica de fora de propósito, mesmo parecendo transitório.** Um 429 é
+    recusado *antes* de processar, então retentar não paga nada duas vezes. Um timeout,
+    não: a requisição pode ter sido processada e cobrada do outro lado, e nós só não
+    vimos a resposta — reenviar o lote é uma cobrança em dobro que nenhum lado consegue
+    detectar depois, dentro do livro-caixa que este projeto existe pra manter confiável.
+    Melhor a passada morrer e retomar (o commit por lote garante que nada pago se perde)
+    do que gastar duas vezes em silêncio.
 
     O jitter (metade fixa, metade aleatória) desincroniza as tentativas: sem ele, dois
     processos que baterem no limite ao mesmo tempo voltam ao mesmo tempo, batem de novo,
@@ -99,7 +127,12 @@ def _embed_com_retry(client: voyageai.Client, texts: list[str]):
     espera = RATE_LIMIT_ESPERA_INICIAL
     for tentativa in range(1, RATE_LIMIT_TENTATIVAS + 1):
         try:
-            return client.embed(texts, model=EMBED_MODEL, input_type=INPUT_TYPE_DOCUMENT)
+            return client.embed(
+                texts,
+                model=EMBED_MODEL,
+                input_type=INPUT_TYPE_DOCUMENT,
+                truncation=False,   # cortar em silêncio é pior que falhar — ver o módulo
+            )
         except voyageai.error.RateLimitError as exc:
             if tentativa == RATE_LIMIT_TENTATIVAS:
                 logger.warning(

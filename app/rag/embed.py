@@ -14,6 +14,7 @@ from math import ceil
 
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer
 
 from app.cost import cost_usd, record_cost_event
 from app.models import ClauseChunk
@@ -71,6 +72,13 @@ def _pendentes(limit: int | None = None, remodel: bool = False):
     """
     q = (
         select(ClauseChunk)
+        # `embedding` é a única coluna que esta passada nunca LÊ — ela só escreve por
+        # cima. No caminho normal isso não custaria nada (as pendentes têm NULL ali), mas
+        # `--remodel` é justamente o caminho que varre o corpus INTEIRO com vetor
+        # preenchido: seriam 1024 floats por linha vindos do banco só pra serem
+        # descartados (~18 MB no corpus atual). `defer` não impede a escrita — atribuir a
+        # um atributo adiado não dispara carga, só marca a coluna como suja.
+        .options(defer(ClauseChunk.embedding))
         .where(_a_fazer(remodel))
         .order_by(ClauseChunk.id)
         .with_for_update(skip_locked=True)
@@ -142,6 +150,13 @@ async def embed_pending(
     """
     if batch_size < 1:
         raise ValueError(f"batch_size tem que ser >= 1, veio {batch_size}")
+    # O CLI já barra isto, mas o guard tem que morar aqui também: `limit=0` sai pelo
+    # `while` na primeira volta e devolve um relatório de zeros — "0 chunks, US$ 0" é
+    # indistinguível de "já estava tudo indexado", que é a mentira plausível que a
+    # validação do script existe pra evitar. Quem chama de fora do CLI (teste, notebook,
+    # a ferramenta da R3) merece o mesmo erro alto.
+    if limit is not None and limit < 1:
+        raise ValueError(f"limit tem que ser >= 1 quando informado, veio {limit}")
 
     if not remodel:
         desatualizados = await contar_desatualizados(session)
