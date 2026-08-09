@@ -14,6 +14,7 @@ from math import ceil
 
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer
 
 from app.cost import cost_usd, record_cost_event
 from app.models import ClauseChunk
@@ -24,6 +25,20 @@ from .embedding import EMBED_MODEL, MAX_BATCH, embed_documents
 # de texto em português. Serve pra dar ordem de grandeza do custo ANTES de gastar; o
 # número que vai pro `cost_event` é sempre o `total_tokens` que a API cobrou de verdade.
 CHARS_PER_TOKEN = 4
+
+
+def _validar_limit(limit: int | None) -> None:
+    """`limit` menor que 1 é sempre erro, nas duas funções públicas que o aceitam.
+
+    Em `embed_pending`, `limit=0` sai pelo `while` na primeira volta e devolve um
+    relatório de zeros; em `pending_stats`, vira `LIMIT 0` e devolve contagem zero. Os
+    dois resultados são indistinguíveis de "já estava tudo indexado" — a mentira
+    plausível que a validação do CLI existe pra evitar, e a pior saída possível num
+    script que gasta dinheiro. O CLI já barra, mas quem chama de fora dele (teste,
+    notebook, a ferramenta da R3) não passa pelo argparse.
+    """
+    if limit is not None and limit < 1:
+        raise ValueError(f"limit tem que ser >= 1 quando informado, veio {limit}")
 
 
 def _desatualizado():
@@ -71,6 +86,13 @@ def _pendentes(limit: int | None = None, remodel: bool = False):
     """
     q = (
         select(ClauseChunk)
+        # `embedding` é a única coluna que esta passada nunca LÊ — ela só escreve por
+        # cima. No caminho normal isso não custaria nada (as pendentes têm NULL ali), mas
+        # `--remodel` é justamente o caminho que varre o corpus INTEIRO com vetor
+        # preenchido: seriam 1024 floats por linha vindos do banco só pra serem
+        # descartados (~18 MB no corpus atual). `defer` não impede a escrita — atribuir a
+        # um atributo adiado não dispara carga, só marca a coluna como suja.
+        .options(defer(ClauseChunk.embedding))
         .where(_a_fazer(remodel))
         .order_by(ClauseChunk.id)
         .with_for_update(skip_locked=True)
@@ -89,6 +111,7 @@ async def pending_stats(
     session: AsyncSession, limit: int | None = None, remodel: bool = False
 ) -> dict:
     """Quantos chunks faltam e quanto custaria, sem chamar a API. Alimenta o `--dry-run`."""
+    _validar_limit(limit)
     alvo = select(ClauseChunk.text).where(_a_fazer(remodel)).order_by(ClauseChunk.id)
     if limit is not None:
         alvo = alvo.limit(limit)
@@ -142,6 +165,7 @@ async def embed_pending(
     """
     if batch_size < 1:
         raise ValueError(f"batch_size tem que ser >= 1, veio {batch_size}")
+    _validar_limit(limit)   # ver o porquê em _validar_limit
 
     if not remodel:
         desatualizados = await contar_desatualizados(session)

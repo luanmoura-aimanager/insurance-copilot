@@ -45,8 +45,15 @@ class FakeVoyage:
         self.rate_limit_nas_primeiras = rate_limit_nas_primeiras
         self.calls: list[dict] = []
 
-    def embed(self, texts, model=None, input_type=None):
-        self.calls.append({"texts": list(texts), "model": model, "input_type": input_type})
+    def embed(self, texts, model=None, input_type=None, truncation=True):
+        self.calls.append(
+            {
+                "texts": list(texts),
+                "model": model,
+                "input_type": input_type,
+                "truncation": truncation,
+            }
+        )
         if len(self.calls) <= self.rate_limit_nas_primeiras:
             raise voyageai.error.RateLimitError("rate limit (falso)")
         if self.falha_no_lote is not None and len(self.calls) == self.falha_no_lote:
@@ -74,6 +81,32 @@ def test_embed_documents_manda_input_type_document():
     assert tokens > 0
 
 
+def test_embed_documents_desliga_a_truncagem():
+    """`truncation=False` contra o padrão do SDK (`True`).
+
+    Truncando, um texto maior que o contexto do modelo é cortado **em silêncio**: o
+    `clause_chunk.text` guarda a cláusula inteira, o vetor cobre só o começo dela e
+    `embedding_model` diz `voyage-4-lite` como em qualquer linha correta. A busca casa
+    por um prefixo e cita a cláusula toda — o "índice que mente" de novo. Como a R2a não
+    tem splitter por decisão medida, é este parâmetro que decide, no dia da primeira
+    cláusula longa, entre um erro barulhento e um índice podre.
+    """
+    fake = FakeVoyage()
+    embed_documents(["cláusula A"], client=fake)
+    assert fake.calls[0]["truncation"] is False
+
+
+def test_get_client_escolhe_o_timeout(monkeypatch):
+    """O SDK herda 600s se ninguém escolher, e aqui 10 minutos não são só espera: o lote
+    fica travado com FOR UPDATE e a transação aberta durante a chamada inteira."""
+    get_client.cache_clear()
+    monkeypatch.setenv("VOYAGE_API_KEY", "chave-de-teste")
+    client = get_client()
+    assert client._params["request_timeout"] == embedding.EMBED_TIMEOUT
+    assert client.max_retries == 0   # quem retenta é _embed_com_retry, e só rate limit
+    get_client.cache_clear()
+
+
 def test_lista_vazia_nao_chama_a_api():
     """Um lote vazio é uma chamada paga por nada — e a API rejeitaria mesmo."""
     fake = FakeVoyage()
@@ -95,8 +128,10 @@ def test_quantidade_de_vetores_diferente_levanta_erro():
     o chunk receberia, em silêncio, o vetor do vizinho — e nada no banco denunciaria."""
 
     class Curto(FakeVoyage):
-        def embed(self, texts, model=None, input_type=None):
-            resp = super().embed(texts, model=model, input_type=input_type)
+        def embed(self, texts, model=None, input_type=None, truncation=True):
+            resp = super().embed(
+                texts, model=model, input_type=input_type, truncation=truncation
+            )
             resp.embeddings = resp.embeddings[:-1]
             return resp
 
@@ -140,8 +175,10 @@ def test_erro_que_nao_e_rate_limit_nao_e_retentado(esperas):
     retentar um erro real só faz o backfill levar 7 minutos pra dar a mesma mensagem."""
 
     class ChaveInvalida(FakeVoyage):
-        def embed(self, texts, model=None, input_type=None):
-            super().embed(texts, model=model, input_type=input_type)
+        def embed(self, texts, model=None, input_type=None, truncation=True):
+            super().embed(
+                texts, model=model, input_type=input_type, truncation=truncation
+            )
             raise voyageai.error.AuthenticationError("chave inválida (falso)")
 
     fake = ChaveInvalida()

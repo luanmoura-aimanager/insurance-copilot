@@ -5,6 +5,7 @@ já indexado pela R2a) — 4 chunks —, com o cliente falso de `tests/test_embe
 Nenhuma chamada real: nada aqui gasta dinheiro.
 """
 
+import re
 from decimal import Decimal
 
 import pytest
@@ -291,6 +292,50 @@ async def test_lote_e_reivindicado_com_for_update_skip_locked(db_session):
 
     await _documento_com_chunks(db_session)
     assert (await pending_stats(db_session))["chunks"] == CHUNKS   # não trava, só conta
+
+
+async def test_limit_invalido_falha_alto(db_session):
+    """`limit=0` sairia pelo `while` na primeira volta e devolveria um relatório de
+    zeros — indistinguível de "já estava tudo indexado", que é a mentira plausível que a
+    validação do CLI existe pra evitar. O guard mora nas duas camadas porque quem chama
+    de fora do script (teste, notebook, a ferramenta da R3) merece o mesmo erro alto."""
+    await _documento_com_chunks(db_session)
+    fake = FakeVoyage()
+
+    for ruim in (0, -5):
+        with pytest.raises(ValueError, match="limit tem que ser >= 1"):
+            await embed_pending(db_session, limit=ruim, client=fake)
+        # `pending_stats` aceita o mesmo argumento e produziria a mesma mentira por
+        # outro caminho (`LIMIT 0` => contagem zero => "tudo já tem vetor").
+        with pytest.raises(ValueError, match="limit tem que ser >= 1"):
+            await pending_stats(db_session, limit=ruim)
+
+    assert fake.calls == []
+    assert all(c.embedding is None for c in await _chunks(db_session))
+
+
+async def test_lote_nao_carrega_o_vetor_antigo(db_session):
+    """`embedding` é a única coluna que a passada nunca LÊ — só escreve por cima.
+
+    No caminho normal isso não custaria nada (as pendentes têm NULL ali), mas
+    `--remodel` varre o corpus inteiro COM vetor preenchido: sem o `defer`, seriam 1024
+    floats por linha trafegando do banco só pra serem descartados. O teste olha o SQL,
+    porque o desperdício está na query, não no resultado — e olha só a LISTA DE COLUNAS
+    (o trecho antes do `FROM`): o `WHERE embedding IS NULL` cita a mesma coluna, então
+    procurar no SQL inteiro daria falso vermelho. O padrão exclui `embedding_model`, que
+    é outra coluna e é lida de fato.
+    """
+    sql = str(_pendentes(10).compile(db_session.bind))
+    colunas = sql.split("FROM")[0]
+    assert not re.search(r"clause_chunk\.embedding(?!_)", colunas)
+    assert "clause_chunk.text" in colunas       # o que a passada de fato lê continua lá
+    assert "clause_chunk.embedding IS NULL" in sql   # e o filtro continua sendo esse
+
+    # E a escrita continua funcionando: atribuir a um atributo adiado não dispara carga.
+    await _documento_com_chunks(db_session)
+    r = await embed_pending(db_session, client=FakeVoyage())
+    assert r["chunks"] == CHUNKS
+    assert all(c.embedding is not None for c in await _chunks(db_session))
 
 
 async def test_dry_run_nao_chama_a_api(db_session):
