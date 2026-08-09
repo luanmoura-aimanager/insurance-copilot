@@ -305,6 +305,10 @@ async def test_limit_invalido_falha_alto(db_session):
     for ruim in (0, -5):
         with pytest.raises(ValueError, match="limit tem que ser >= 1"):
             await embed_pending(db_session, limit=ruim, client=fake)
+        # `pending_stats` aceita o mesmo argumento e produziria a mesma mentira por
+        # outro caminho (`LIMIT 0` => contagem zero => "tudo já tem vetor").
+        with pytest.raises(ValueError, match="limit tem que ser >= 1"):
+            await pending_stats(db_session, limit=ruim)
 
     assert fake.calls == []
     assert all(c.embedding is None for c in await _chunks(db_session))

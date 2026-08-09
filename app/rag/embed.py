@@ -27,6 +27,20 @@ from .embedding import EMBED_MODEL, MAX_BATCH, embed_documents
 CHARS_PER_TOKEN = 4
 
 
+def _validar_limit(limit: int | None) -> None:
+    """`limit` menor que 1 é sempre erro, nas duas funções públicas que o aceitam.
+
+    Em `embed_pending`, `limit=0` sai pelo `while` na primeira volta e devolve um
+    relatório de zeros; em `pending_stats`, vira `LIMIT 0` e devolve contagem zero. Os
+    dois resultados são indistinguíveis de "já estava tudo indexado" — a mentira
+    plausível que a validação do CLI existe pra evitar, e a pior saída possível num
+    script que gasta dinheiro. O CLI já barra, mas quem chama de fora dele (teste,
+    notebook, a ferramenta da R3) não passa pelo argparse.
+    """
+    if limit is not None and limit < 1:
+        raise ValueError(f"limit tem que ser >= 1 quando informado, veio {limit}")
+
+
 def _desatualizado():
     """Predicado das linhas já embeddadas por um modelo DIFERENTE do configurado.
 
@@ -97,6 +111,7 @@ async def pending_stats(
     session: AsyncSession, limit: int | None = None, remodel: bool = False
 ) -> dict:
     """Quantos chunks faltam e quanto custaria, sem chamar a API. Alimenta o `--dry-run`."""
+    _validar_limit(limit)
     alvo = select(ClauseChunk.text).where(_a_fazer(remodel)).order_by(ClauseChunk.id)
     if limit is not None:
         alvo = alvo.limit(limit)
@@ -150,13 +165,7 @@ async def embed_pending(
     """
     if batch_size < 1:
         raise ValueError(f"batch_size tem que ser >= 1, veio {batch_size}")
-    # O CLI já barra isto, mas o guard tem que morar aqui também: `limit=0` sai pelo
-    # `while` na primeira volta e devolve um relatório de zeros — "0 chunks, US$ 0" é
-    # indistinguível de "já estava tudo indexado", que é a mentira plausível que a
-    # validação do script existe pra evitar. Quem chama de fora do CLI (teste, notebook,
-    # a ferramenta da R3) merece o mesmo erro alto.
-    if limit is not None and limit < 1:
-        raise ValueError(f"limit tem que ser >= 1 quando informado, veio {limit}")
+    _validar_limit(limit)   # ver o porquê em _validar_limit
 
     if not remodel:
         desatualizados = await contar_desatualizados(session)
