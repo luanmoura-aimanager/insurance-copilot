@@ -1,6 +1,8 @@
 {
   "_note": "USD por 1M de tokens. Preço é CONFIG, não código — muda com o tempo. Sonnet 5 está em preço promocional (2/10) até 2026-08-31; depois vira 3/15. Atualizar aqui quando virar.",
+  "_note_embedding": "Modelo de embedding não tem token de saída — output_per_mtok é 0 por natureza, não por falta de preço. O valor de input é o de TABELA: os primeiros 200M de tokens da Voyage são crédito contra a fatura, não tarifa. Gravar zero aqui destruiria a projeção de custo do corpus (a pergunta 'quanto custa re-embeddar tudo?' é sobre a tarifa, e o crédito acaba).",
   "_source": "https://platform.claude.com/docs/en/about-claude/pricing",
+  "_source_voyage": "https://docs.voyageai.com/docs/pricing",
   "claude-sonnet-5": {
     "input_per_mtok": "2",
     "output_per_mtok": "10"
@@ -8,5 +10,9 @@
   "claude-haiku-4-5-20251001": {
     "input_per_mtok": "1",
     "output_per_mtok": "5"
+  },
+  "voyage-4-lite": {
+    "input_per_mtok": "0.02",
+    "output_per_mtok": "0"
   }
 }

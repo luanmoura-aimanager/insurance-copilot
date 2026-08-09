@@ -2,7 +2,7 @@
 
 A multi-agent system that turns Brazilian home-insurance policy documents into a queryable knowledge base. It harvests *condições gerais* (general terms) registered with SUSEP, extracts their structure into Postgres, and answers coverage-comparison questions in natural language.
 
-> **Status: work in progress.** The data pipeline (SUSEP harvester + extraction schema) and the service skeleton (FastAPI + Postgres) are in place. The agent layer has its first real slice — an LLM supervisor routing to a single-pass SQL worker over the Postgres MCP server, with a synthesizer node turning the query result into a natural-language answer, exposed at `POST /ask`. The RAG worker has its vector storage (pgvector + `clause_chunk`) and its chunk materialization (`app/rag/`), but no embedding or retrieval yet. See [Roadmap](#roadmap).
+> **Status: work in progress.** The data pipeline (SUSEP harvester + extraction schema) and the service skeleton (FastAPI + Postgres) are in place. The agent layer has its first real slice — an LLM supervisor routing to a single-pass SQL worker over the Postgres MCP server, with a synthesizer node turning the query result into a natural-language answer, exposed at `POST /ask`. The RAG worker has its vector storage (pgvector + `clause_chunk`), its chunk materialization and its embedding pass (`app/rag/`, Voyage `voyage-4-lite`); retrieval is not wired yet. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -16,7 +16,7 @@ A supervisor agent routes each question to specialized workers (canonical hub-an
 
 - **extraction** — turns a policy PDF into structured rows (insurer, product, coverages, perils, exclusions).
 - **SQL** — aggregates over the structured tables (coverage comparison, deductible structure, exclusion patterns).
-- **RAG** — retrieves and explains raw clause text (pgvector). *Storage and chunking are in place (`clause_chunk`, `app/rag/`); embedding and retrieval are not.*
+- **RAG** — retrieves and explains raw clause text (pgvector). *Storage, chunking and embedding are in place (`clause_chunk`, `app/rag/`); retrieval is not.*
 
 A **synthesizer** node closes every path: it turns the worker's raw output into a single natural-language sentence, so the API answers in prose rather than in tuples. When no worker ran (the question is out of scope), it returns a fixed sentence *without* calling the model — there is nothing to synthesize, and paying for a call to say "I don't know" is wasted money.
 
@@ -70,7 +70,7 @@ The first version modelled the origin as a polymorphic pointer (`source` text + 
 
 ### Chunking — one source row, one chunk (`app/rag/`)
 
-`app/rag/` fills `clause_chunk` from the text extraction already persisted: `chunking.py` (pure functions, no database) builds each chunk's text and `index.py::index_document(session, document_id)` writes the rows, leaving `embedding`/`embedding_model` `NULL`. Nothing calls an embedding model yet.
+`app/rag/` fills `clause_chunk` from the text extraction already persisted: `chunking.py` (pure functions, no database) builds each chunk's text and `index.py::index_document(session, document_id)` writes the rows, leaving `embedding`/`embedding_model` `NULL`. This pass costs nothing; the vectors are filled by a separate pass ([below](#embedding--the-pass-that-costs-money-apprag)).
 
 **There is no splitter, and that is a measured decision.** Across the 30 persisted documents, the 4,176 exclusions have a **median length of 101 characters**, a p99 of 456 and a maximum of 907; the 210 deductible rules average 180. Nothing comes near 1,400 characters — far below any embedding model's limit. So **one source row = one chunk**, and `chunk_index` is always `0` (the largest chunk produced over the real corpus is 934 characters: the 907-character clause plus its header). Splitting by size and overlapping pieces would be machinery with no text to exercise it; when the corpus does bring long clauses, `chunk_index` is already in the schema and only the chunking layer changes. Current corpus: 4,176 + 210 = **4,386 chunks**.
 
@@ -85,11 +85,34 @@ python scripts/index_chunks.py                  # every document; costs nothing 
 python scripts/index_chunks.py --document-id 7  # just one
 ```
 
-**Embedding and retrieval are still pending**, and the agent graph is unchanged — see [Roadmap](#roadmap).
+### Embedding — the pass that costs money (`app/rag/`)
+
+`app/rag/embedding.py` is the only place that talks to Voyage; `app/rag/embed.py::embed_pending` walks the rows where `embedding IS NULL` and fills them in batches. Needs `VOYAGE_API_KEY`.
+
+```bash
+python scripts/embed_chunks.py --dry-run   # how many are pending, and what it would cost
+python scripts/embed_chunks.py             # embed everything pending
+python scripts/embed_chunks.py --limit 50  # a small slice first
+python scripts/embed_chunks.py --remodel   # also re-embed rows carrying another model's vector
+```
+
+**Changing the model is not allowed to be a silent no-op.** Already-embedded rows never return to the `embedding IS NULL` filter, so pointing `EMBED_MODEL` at a same-dimension successor and running would fill only the `NULL`s — leaving the HNSW index holding vectors from **two models**, whose cosine distances are not comparable, and retrieval returning wrong neighbours with no error at all. So the pass refuses to run (before the first paid call) when any row carries another model's vector; `--remodel` includes those rows and restores consistency. It is opt-in because re-embedding the corpus is spending, and spending shouldn't happen as a side effect.
+
+**Each batch is claimed with `FOR UPDATE SKIP LOCKED`.** Two concurrent passes would otherwise read the same ids, both pay for the same text, and both write a `cost_event` — double spend inside the ledger this project exists to keep trustworthy. The lock lasts the *batch*, matching the per-batch commit; the accepted cost is that the transaction stays open across the HTTP call and any backoff, which is where a Postgres with `idle_in_transaction_session_timeout` enabled would bill you (stock Postgres ships it off). The dry-run counts without locking.
+
+**`input_type="document"` is not decoration.** Voyage trains the model *asymmetrically*: documents and queries are embedded with different prefixes, and the space is optimized so a **question** lands near the **documents that answer it** — not near other questions. Indexing always uses `input_type="document"`; retrieval (R3) will query with `input_type="query"`. Getting the pair wrong raises no error at all — it silently degrades recall — so the contract is pinned by a test.
+
+**Only rate limits are retried.** The batch is resent with exponential backoff plus jitter (6 attempts, 20s base, factor 2, 120s ceiling) on `RateLimitError` alone — it is the only failure that fixes itself by waiting, because it is a window that reopens. An invalid key, an oversized text or an API outage propagate immediately: retrying a real error only makes the backfill take minutes to produce the same message. Every wait is logged at **WARNING** with the attempt number and the seconds, because a 20-minute backfill that goes quiet is indistinguishable from a hung one. When the attempts run out the exception propagates — the per-batch commit has already preserved everything paid for, and a re-run resumes on its own.
+
+**The recorded price is the list price, not the effective one.** `voyage-4-lite` sits in `pricing.json` at `$0.02` per 1M input tokens and `0` output (an embedding model has no output tokens by nature). Voyage's first 200M tokens are a **credit against the invoice, not a tariff**: recording zero would destroy the corpus cost projection, because "what does re-embedding everything cost?" is a question about the tariff, and the credit runs out. The current corpus is 4,386 chunks / ~199k estimated tokens ≈ US$ 0.004 at list price.
+
+**`embed_pending` commits per batch — the deliberate exception to the transaction contract.** `persist_document` and `index_document` do *not* commit: there the caller owns the transaction and all-or-nothing is right, because repeating the pass is free. Here each batch is a paid API call, so the transaction boundary follows the **cost of repeating**: a failure on batch 15 must not throw away the 14 batches already paid for. Each batch is committed together with its own `cost_event` row (`agent_name="embedder"`, one row per *call*, `request_id`/`client` `NULL` because the pass is offline), so a re-run resumes exactly where it stopped — committed rows no longer match `embedding IS NULL`. A second pass over a fully indexed corpus makes **zero** API calls, which is what the test asserts (counting calls, not comparing the database: a version that re-embedded everything and rewrote identical vectors would leave the database unchanged and the invoice larger).
+
+Retrieval is still pending, and the agent graph is unchanged — see [Roadmap](#roadmap).
 
 ## Tech stack
 
-FastAPI · Postgres (+ pgvector) · SQLAlchemy 2.0 (async) · Alembic · Docker Compose · pytest + testcontainers · GitHub Actions · deployed on Railway.
+FastAPI · Postgres (+ pgvector) · SQLAlchemy 2.0 (async) · Alembic · LangGraph · Anthropic (agents/extraction) · Voyage (embeddings) · Docker Compose · pytest + testcontainers · GitHub Actions · deployed on Railway.
 
 ## Getting started
 
@@ -259,7 +282,7 @@ PDF footer).
 - [~] Agent layer — async LLM supervisor (structured output) + single-pass SQL worker + synthesizer (natural-language answer), served at `POST /ask`; RAG/extraction workers + a ReAct refinement loop pending
 - [x] `POST /ask` hardening — Bearer auth with identity + per-client and per-IP rate limits
 - [x] Cost attribution in the agent graph — one `cost_event` per LLM call, tagged with a per-request id and the calling client
-- [~] RAG worker — vector storage ready (pgvector extension, `clause_chunk` with an exclusive-arc origin, HNSW/cosine index, revoked from the SQL worker's role) and chunks materialized from the extracted text (one source row = one chunk, idempotent re-indexing that invalidates the vector when the text changes); embedding and retrieval pending
+- [~] RAG worker — vector storage ready (pgvector extension, `clause_chunk` with an exclusive-arc origin, HNSW/cosine index, revoked from the SQL worker's role), chunks materialized from the extracted text (one source row = one chunk, idempotent re-indexing that invalidates the vector when the text changes) and embeddings filled by a resumable, cost-attributed pass (Voyage `voyage-4-lite`, `input_type="document"`, one `cost_event` per batch); retrieval pending
 - [ ] WhatsApp surface
 - [ ] Deploy to Railway
 
