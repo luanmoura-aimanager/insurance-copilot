@@ -8,10 +8,12 @@ indexar —, então trocar de modelo é migration, não config. O critério foi:
 **`input_type` é o detalhe que faz a busca funcionar.** A Voyage treina o modelo de
 forma *assimétrica*: documento e pergunta são embeddados com prefixos diferentes, e o
 espaço é otimizado pra que uma *pergunta* fique perto dos *documentos* que a respondem
-— não perto de outras perguntas. Aqui indexamos cláusulas, então é sempre
-`input_type="document"`. A R3 (retrieval) vai consultar com `input_type="query"`, e é o
-par que precisa bater: usar o mesmo dos dois lados degrada a recuperação em silêncio,
-sem erro nenhum pra denunciar.
+— não perto de outras perguntas. Por isso as duas funções públicas daqui não são
+intercambiáveis: `embed_documents` indexa cláusulas com `input_type="document"` (R2b) e
+`embed_query` embedda a pergunta com `input_type="query"` (R3a). É o par que precisa
+bater: usar o mesmo dos dois lados degrada a recuperação em silêncio, sem erro nenhum
+pra denunciar — nenhuma dimensão muda, nenhuma exceção sobe, só os vizinhos ficam
+piores. Daí os dois lados estarem travados por teste.
 
 **Rate limit é a única falha retentada aqui** (`_embed_com_retry`): é a única que se
 resolve sozinha esperando, porque é uma janela que reabre. Todo o resto sobe na hora —
@@ -53,8 +55,10 @@ MAX_BATCH_API = 1000
 # uma chamada inteira já paga. Com os ~4.4k chunks do corpus atual isso dá 22 chamadas.
 MAX_BATCH = 200
 
-# Prefixo do texto enviado, exigido pelo modelo assimétrico — ver o docstring do módulo.
+# Os dois lados do modelo assimétrico — ver o docstring do módulo. Não são
+# intercambiáveis: cláusula indexada é "document", pergunta de busca é "query".
 INPUT_TYPE_DOCUMENT = "document"
+INPUT_TYPE_QUERY = "query"
 
 # Backoff do rate limit. Os números são grandes de propósito: o limite da Voyage é por
 # minuto, então esperar 1s não resolve nada — só queima tentativa. 6 tentativas com base
@@ -64,6 +68,16 @@ RATE_LIMIT_TENTATIVAS = 6
 RATE_LIMIT_ESPERA_INICIAL = 20.0
 RATE_LIMIT_FATOR = 2.0
 RATE_LIMIT_ESPERA_MAX = 120.0
+
+# Orçamento SEPARADO para a busca, e bem menor. Os números acima são de um backfill
+# offline, onde ninguém espera e sete minutos de paciência são baratos; a busca roda
+# dentro de um request, segurando um worker do `asyncio.to_thread` durante a chamada
+# inteira. Herdar 6 tentativas ali significaria um `/ask` pendurado por minutos e, com
+# algumas buscas simultâneas, o executor padrão esgotado — o que trava também as
+# chamadas síncronas ao Postgres dos outros nós do grafo. Uma retentativa curta cobre o
+# 429 isolado; passou disso, é melhor falhar rápido e devolver o erro.
+RATE_LIMIT_TENTATIVAS_QUERY = 2
+RATE_LIMIT_ESPERA_QUERY = 2.0
 
 # Timeout da chamada HTTP. O SDK herda 600s se ninguém escolher, e 10 minutos aqui não é
 # só espera: `_pendentes` segura as linhas do lote com FOR UPDATE durante a chamada, e a
@@ -100,8 +114,23 @@ def get_client() -> voyageai.Client:
     return voyageai.Client(api_key=key, timeout=EMBED_TIMEOUT, max_retries=0)
 
 
-def _embed_com_retry(client: voyageai.Client, texts: list[str]):
+def _embed_com_retry(
+    client: voyageai.Client,
+    texts: list[str],
+    input_type: str,
+    tentativas: int = RATE_LIMIT_TENTATIVAS,
+    espera_inicial: float = RATE_LIMIT_ESPERA_INICIAL,
+):
     """`client.embed` com backoff exponencial + jitter, **só** para `RateLimitError`.
+
+    `input_type` é parâmetro (e não constante fixa) porque este é o único ponto que
+    chama a API, e os dois lados do par assimétrico passam por aqui: a indexação com
+    `"document"`, a busca com `"query"`. Ver o docstring do módulo.
+
+    `tentativas`/`espera_inicial` também são parâmetros porque **o orçamento de espera
+    depende de quem está esperando**: o backfill é offline e pode aguardar minutos; a
+    busca roda dentro de um request e segura um worker do `to_thread` enquanto dorme.
+    Os defaults são os do backfill; a busca passa os valores curtos.
 
     Rate limit é a única falha que se resolve sozinha esperando — é uma janela que
     reabre. Qualquer outra exceção sobe na hora, sem retry: chave inválida, dimensão
@@ -124,20 +153,20 @@ def _embed_com_retry(client: voyageai.Client, texts: list[str]):
     commit por lote de `embed_pending` já preservou tudo que foi pago até ali, e a
     re-execução retoma sozinha pelas linhas que continuam com `embedding IS NULL`.
     """
-    espera = RATE_LIMIT_ESPERA_INICIAL
-    for tentativa in range(1, RATE_LIMIT_TENTATIVAS + 1):
+    espera = espera_inicial
+    for tentativa in range(1, tentativas + 1):
         try:
             return client.embed(
                 texts,
                 model=EMBED_MODEL,
-                input_type=INPUT_TYPE_DOCUMENT,
+                input_type=input_type,
                 truncation=False,   # cortar em silêncio é pior que falhar — ver o módulo
             )
         except voyageai.error.RateLimitError as exc:
-            if tentativa == RATE_LIMIT_TENTATIVAS:
+            if tentativa == tentativas:
                 logger.warning(
                     "rate limit da Voyage na tentativa %d/%d — desistindo deste lote: %s",
-                    tentativa, RATE_LIMIT_TENTATIVAS, exc,
+                    tentativa, tentativas, exc,
                 )
                 raise
             pausa = espera / 2 + random.uniform(0, espera / 2)
@@ -146,10 +175,30 @@ def _embed_com_retry(client: voyageai.Client, texts: list[str]):
             logger.warning(
                 "rate limit da Voyage (tentativa %d/%d) — esperando %.1fs antes de "
                 "retentar o lote de %d texto(s)",
-                tentativa, RATE_LIMIT_TENTATIVAS, pausa, len(texts),
+                tentativa, tentativas, pausa, len(texts),
             )
             time.sleep(pausa)
             espera = min(espera * RATE_LIMIT_FATOR, RATE_LIMIT_ESPERA_MAX)
+
+
+def _validar(vetores: list[list[float]], texts: list[str]) -> None:
+    """Correspondência 1:1 e dimensão certa — as duas checagens que o banco não faz bem.
+
+    Usada pelos dois lados (indexação e busca) de propósito: a mensagem tem que falar do
+    MODELO, não da coluna. Ver o porquê de cada uma no docstring de `embed_documents`.
+    """
+    if len(vetores) != len(texts):
+        raise ValueError(
+            f"{EMBED_MODEL} devolveu {len(vetores)} vetores para {len(texts)} textos — "
+            "sem correspondência 1:1 os vetores seriam gravados no chunk errado."
+        )
+    for i, v in enumerate(vetores):
+        if len(v) != EMBEDDING_DIM:
+            raise ValueError(
+                f"vetor {i} veio com {len(v)} dimensões, esperado {EMBEDDING_DIM} — "
+                f"o modelo configurado ({EMBED_MODEL}) não bate com a coluna "
+                "`clause_chunk.embedding`, que é vector(1024) e só muda por migration."
+            )
 
 
 def embed_documents(
@@ -173,22 +222,61 @@ def embed_documents(
         return [], 0
 
     client = client or get_client()
-    # A chamada em si (com input_type="document", OBRIGATÓRIO — a R3 consulta com
+    # A chamada em si (com input_type="document", OBRIGATÓRIO — a busca consulta com
     # "query" e é o par assimétrico que a Voyage otimiza) vive em `_embed_com_retry`,
     # que reenvia o lote enquanto o erro for rate limit. Ver o docstring do módulo.
-    resp = _embed_com_retry(client, texts)
+    resp = _embed_com_retry(client, texts, INPUT_TYPE_DOCUMENT)
 
     vetores = list(resp.embeddings)
-    if len(vetores) != len(texts):
-        raise ValueError(
-            f"{EMBED_MODEL} devolveu {len(vetores)} vetores para {len(texts)} textos — "
-            "sem correspondência 1:1 os vetores seriam gravados no chunk errado."
-        )
-    for i, v in enumerate(vetores):
-        if len(v) != EMBEDDING_DIM:
-            raise ValueError(
-                f"vetor {i} veio com {len(v)} dimensões, esperado {EMBEDDING_DIM} — "
-                f"o modelo configurado ({EMBED_MODEL}) não bate com a coluna "
-                "`clause_chunk.embedding`, que é vector(1024) e só muda por migration."
-            )
+    _validar(vetores, texts)
     return vetores, resp.total_tokens
+
+
+def embed_query_with_tokens(
+    text: str, client: voyageai.Client | None = None
+) -> tuple[list[float], int]:
+    """`embed_query` + os tokens cobrados pela chamada. É o que a busca usa.
+
+    Existe separada porque quem embedda uma pergunta dentro de um request precisa gravar
+    o `cost_event` (a chamada é paga como qualquer outra), e o número que vai pro
+    livro-caixa tem que ser o que a API COBROU — estimar tokens por contagem de
+    caracteres gravaria custo errado com cara de certo, exatamente o que o `fail loud` do
+    `app/cost.py` existe pra impedir. `embed_query` fica sendo a assinatura simples pra
+    quem só quer o vetor.
+
+    Mesma validação de `embed_documents` (dimensão e correspondência 1:1) e mesmo retry
+    de rate limit — mas com **orçamento de espera próprio e curto**
+    (`RATE_LIMIT_TENTATIVAS_QUERY`): quem espera aqui é um request, não um backfill. Ver
+    a constante.
+    """
+    if not text or not text.strip():
+        raise ValueError(
+            "pergunta vazia — embeddar espaço em branco custa uma chamada e devolve um "
+            "vetor de ruído que casaria com qualquer cláusula do corpus."
+        )
+
+    client = client or get_client()
+    # `input_type="query"` é o OUTRO lado do par: a cláusula foi indexada como
+    # "document", e é essa assimetria que põe a pergunta perto das cláusulas que a
+    # respondem. Trocar por "document" aqui não levanta erro — só piora os vizinhos.
+    resp = _embed_com_retry(
+        client,
+        [text],
+        INPUT_TYPE_QUERY,
+        tentativas=RATE_LIMIT_TENTATIVAS_QUERY,
+        espera_inicial=RATE_LIMIT_ESPERA_QUERY,
+    )
+
+    vetores = list(resp.embeddings)
+    _validar(vetores, [text])
+    return vetores[0], resp.total_tokens
+
+
+def embed_query(text: str, client: voyageai.Client | None = None) -> list[float]:
+    """Embedda UMA pergunta, com `input_type="query"`. Devolve só o vetor.
+
+    Síncrona pelo mesmo motivo de `embed_documents`: o SDK da Voyage é síncrono, e quem
+    precisa de async chama por `asyncio.to_thread` (ver `app/rag/search.py`).
+    """
+    vetor, _ = embed_query_with_tokens(text, client)
+    return vetor

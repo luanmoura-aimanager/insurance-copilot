@@ -2,7 +2,7 @@
 
 A multi-agent system that turns Brazilian home-insurance policy documents into a queryable knowledge base. It harvests *condições gerais* (general terms) registered with SUSEP, extracts their structure into Postgres, and answers coverage-comparison questions in natural language.
 
-> **Status: work in progress.** The data pipeline (SUSEP harvester + extraction schema) and the service skeleton (FastAPI + Postgres) are in place. The agent layer has its first real slice — an LLM supervisor routing to a single-pass SQL worker over the Postgres MCP server, with a synthesizer node turning the query result into a natural-language answer, exposed at `POST /ask`. The RAG worker has its vector storage (pgvector + `clause_chunk`), its chunk materialization and its embedding pass (`app/rag/`, Voyage `voyage-4-lite`); retrieval is not wired yet. See [Roadmap](#roadmap).
+> **Status: work in progress.** The data pipeline (SUSEP harvester + extraction schema) and the service skeleton (FastAPI + Postgres) are in place. The agent layer has its first real slice — an LLM supervisor routing to a single-pass SQL worker over the Postgres MCP server, with a synthesizer node turning the query result into a natural-language answer, exposed at `POST /ask`. The RAG worker has its vector storage (pgvector + `clause_chunk`), its chunk materialization, its embedding pass (`app/rag/`, Voyage `voyage-4-lite`) and its similarity search as a standalone function; no node in the graph routes to it yet. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -110,7 +110,48 @@ python scripts/embed_chunks.py --remodel   # also re-embed rows carrying another
 
 **`embed_pending` commits per batch — the deliberate exception to the transaction contract.** `persist_document` and `index_document` do *not* commit: there the caller owns the transaction and all-or-nothing is right, because repeating the pass is free. Here each batch is a paid API call, so the transaction boundary follows the **cost of repeating**: a failure on batch 15 must not throw away the 14 batches already paid for. Each batch is committed together with its own `cost_event` row (`agent_name="embedder"`, one row per *call*, `request_id`/`client` `NULL` because the pass is offline), so a re-run resumes exactly where it stopped — committed rows no longer match `embedding IS NULL`. A second pass over a fully indexed corpus makes **zero** API calls, which is what the test asserts (counting calls, not comparing the database: a version that re-embedded everything and rewrote identical vectors would leave the database unchanged and the invoice larger).
 
-Retrieval is still pending, and the agent graph is unchanged — see [Roadmap](#roadmap).
+### Similarity search — `search_clauses` (`app/rag/search.py`)
+
+`search_clauses(session, question, *, k=5, max_distance=None, document_ids=None)` embeds the question with `input_type="query"` and returns the nearest chunks by cosine distance as `Hit(chunk_id, document_id, exclusion_id, coverage_id, text, distance)`. The origin ids travel with the hit because a recovered clause without its provenance is just a sentence.
+
+**This slice is the function and its tests — the agent graph is still untouched.** Nothing routes to retrieval yet; wiring a RAG node into `app/agents/` is the next step.
+
+**The vector search always returns `k` results — there is no "not found".** `ORDER BY embedding <=> :q LIMIT k` hands back the k least distant chunks in the corpus even when the closest one is on the other side of the space: a question about travel-insurance cancellation comes back with the five *least unrelated* home-insurance clauses, and a confident synthesizer turns that into a wrong answer with a citation. So an empty result is produced **by the threshold** (`max_distance`), not by "nothing found" — which is what the test named after it pins. The only other way to get fewer than `k` is the model filter described below, and it is deliberate.
+
+**`hnsw.ef_search` is a silent ceiling, so each search sets it per transaction.** pgvector's default scans 40 candidates: with the index in use, a `LIMIT 100` comes back with **40 rows and no error** — verified on the real 4,386-chunk corpus by forcing `enable_seqscan=off`, where `SET LOCAL hnsw.ef_search = 100` restores all 100. At today's size the planner still prefers a seq scan and results are exact, which is precisely the trap: the "k results" guarantee would be resting on a plan choice that flips on its own as the table grows. It is worse under a filter — `WHERE document_id` is applied *after* the approximate scan, so of ~40 global candidates only the in-scope ones survive (~1, with 29 documents). So `search_clauses` issues `SET LOCAL hnsw.ef_search = min(max(4k, 40), 1000)` before the select: it tracks `k`, with a factor-4 margin for filtering, floored at the default and capped at pgvector's maximum. `SET LOCAL` dies with the transaction, so one search never changes another connection's behaviour.
+
+**Only vectors from the current model are ranked.** `embed_pending` commits per batch by design, so a `--remodel` interrupted halfway leaves the corpus split across two models — and cosine distances from different models are not comparable. Without a filter the search would order both spaces together and return wrong neighbours with no error: the same "index that lies" the write side already refuses to create, entering through the read path. Hence `WHERE embedding_model = EMBED_MODEL`, with a deliberate consequence recorded in the docstring — a half-remodelled corpus returns fewer results, or none, instead of returning wrong ones. Empty is recoverable by finishing the `--remodel`; a confident wrong ranking is not.
+
+**Retrying is on a shorter budget here than in the backfill** (2 attempts starting at 2s, against 6 starting at 20s). The offline pass can afford to sleep for minutes; a search runs inside a request and holds an `asyncio.to_thread` worker while it waits, so inheriting the backfill's budget would hang an `/ask` for minutes and, under a few concurrent searches, exhaust the default executor — which also stalls the graph's synchronous Postgres calls.
+
+**The threshold is cut after the `LIMIT`, not in the `WHERE`.** It is a relevance cut, not pagination: filtering in SQL would make the query dig deeper looking for k rows that qualify — more work for the same answer — and would hide the discarded distances from the tests and from calibration.
+
+**`MAX_DISTANCE_PADRAO` is `0.60` — a decided number, not yet a measured one — and it is not applied by default** (`max_distance=None` means no cut; callers who want one pass it explicitly, because silently dropping results on an unvalidated threshold is worse than returning them). To validate it, `scripts/calibrate_search.py` runs the search *without* a threshold over labelled questions (`data/eval/search_questions.txt`: 10 in-scope, 5 out-of-scope) and prints, per question, the 1st/3rd/5th distances plus the mean first-hit distance per group and — the point of the exercise — the **largest `+` distance against the smallest `-` distance**. If they separate, any value in between is the threshold; if they overlap, no distance cut separates the two groups and that is a result too. Calibrating (and then fixing the constant) is still open.
+
+The out-of-scope half is deliberately two kinds: entirely off-domain (a carrot cake recipe, filing income tax) and **insurance from another line of business** (life, travel, cosmetic surgery). Only the second kind is a real test — a threshold that merely rejects the cake is separating vocabulary, not subject matter, and everyone who writes to this system writes in insurance language. On the other side, a bicycle kept inside the home and a car parked in the house's garage are labelled in-scope on purpose: residential general terms do speak to both, so they are the questions that sound peripheral and are not.
+
+```bash
+python scripts/calibrate_search.py             # 1 embedding call per question (15 by default); needs VOYAGE_API_KEY + an embedded corpus
+python scripts/calibrate_search.py -k 10
+```
+
+`document_ids` filters **before** ranking, in SQL: narrowing to an insurer or product is *identity*, which chunking deliberately kept out of the chunk text precisely because a `WHERE` answers it exactly and for free. An empty list means "no documents" and short-circuits to `[]` without paying for the embedding. Rows with `embedding IS NULL` (chunked by R2a, not yet embedded) never take part — they carry no distance and are not in the HNSW index.
+
+The question's embedding is a paid call like any other, so it writes a `cost_event` with `agent_name="rag_search"` — and since search runs inside a request, `request_id`/`client` come from the ContextVars, unlike the offline `embedder` rows. The write is best effort (a failed ledger row must not 500 a request that already paid). One caveat worth knowing: a single question is ~6 tokens, which at $0.02/1M rounds to `0.000000` in `Numeric(12, 6)` — the truthful, aggregatable number for retrieval is `input_tokens`, not the per-row `cost_usd`.
+
+**Verifying the plan.** Cosine (`<=>`) is not a preference, it is the operator class the index was built with (`USING hnsw (embedding vector_cosine_ops)`); using any other distance still returns *results*, just computed by a full scan. Check it against the real corpus:
+
+```bash
+docker compose exec postgres psql -U insurance -d insurance -c "
+EXPLAIN ANALYZE
+SELECT id, document_id, embedding <=> (SELECT embedding FROM clause_chunk ORDER BY id LIMIT 1) AS distance
+FROM clause_chunk
+WHERE embedding IS NOT NULL
+ORDER BY embedding <=> (SELECT embedding FROM clause_chunk ORDER BY id LIMIT 1)
+LIMIT 5;"
+```
+
+What to look for: `Index Scan using ix_clause_chunk_embedding` with an `Order By: (embedding <=> $0)` line — the index is doing the ordering. What means it is *not*: a `Seq Scan on clause_chunk` followed by `Sort`, which is what the same query produces if you swap `<=>` for `<->` (L2) — verified on the 4,386-chunk corpus, where the cosine version runs the HNSW scan and the L2 version falls back to seq scan + sort. On a small corpus a seq scan is still fast, so the plan — not the wall clock — is the thing to check.
 
 ## Tech stack
 
@@ -227,6 +268,7 @@ insurance-copilot/
 │   ├── auth.py             # Bearer auth with identity (API_TOKENS: name -> token)
 │   ├── limits.py           # slowapi limiter: per-client + per-IP keys
 │   ├── db.py               # lazy async engine + session factory (SQLAlchemy 2.0)
+│   ├── rag/                # chunking + embedding + similarity search over clause_chunk
 │   └── models.py           # ORM models: PolicyDocument, Coverage, Peril, CoveragePeril, Exclusion, ClauseChunk, CostEvent
 ├── alembic/
 │   └── versions/           # migrations (alembic upgrade head)
@@ -234,9 +276,11 @@ insurance-copilot/
 │   └── schema.html         # visual schema diagram (open in browser)
 ├── scripts/
 │   ├── susep_harvest.py    # SUSEP corpus harvester
+│   ├── calibrate_search.py # runs the search unthresholded to find the relevance cut
 │   └── eval/               # F4 extraction eval harness (see "Extraction eval")
 ├── data/
-│   └── corpus/             # downloaded PDFs (gitignored) + corpus_manifest.json
+│   ├── corpus/             # downloaded PDFs (gitignored) + corpus_manifest.json
+│   └── eval/               # labelled questions for the search threshold calibration
 ├── docker-compose.yml      # local Postgres
 ├── requirements.txt
 └── .env.example
@@ -284,7 +328,7 @@ PDF footer).
 - [~] Agent layer — async LLM supervisor (structured output) + single-pass SQL worker + synthesizer (natural-language answer), served at `POST /ask`; RAG/extraction workers + a ReAct refinement loop pending
 - [x] `POST /ask` hardening — Bearer auth with identity + per-client and per-IP rate limits
 - [x] Cost attribution in the agent graph — one `cost_event` per LLM call, tagged with a per-request id and the calling client
-- [~] RAG worker — vector storage ready (pgvector extension, `clause_chunk` with an exclusive-arc origin, HNSW/cosine index, revoked from the SQL worker's role), chunks materialized from the extracted text (one source row = one chunk, idempotent re-indexing that invalidates the vector when the text changes) and embeddings filled by a resumable, cost-attributed pass (Voyage `voyage-4-lite`, `input_type="document"`, one `cost_event` per batch); retrieval pending
+- [~] RAG worker — vector storage ready (pgvector extension, `clause_chunk` with an exclusive-arc origin, HNSW/cosine index, revoked from the SQL worker's role), chunks materialized from the extracted text (one source row = one chunk, idempotent re-indexing that invalidates the vector when the text changes), embeddings filled by a resumable, cost-attributed pass (Voyage `voyage-4-lite`, `input_type="document"`, one `cost_event` per batch), and similarity search as a testable function (`search_clauses`, `input_type="query"`, relevance threshold, per-document filter); **pending:** calibrating the threshold and wiring a RAG node into the graph
 - [ ] WhatsApp surface
 - [ ] Deploy to Railway
 
