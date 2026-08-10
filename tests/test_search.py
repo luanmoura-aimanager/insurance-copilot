@@ -307,6 +307,25 @@ async def test_ef_search_acompanha_o_k(db_session):
     assert int(await db_session.scalar(text("SHOW hnsw.ef_search"))) == 1000
 
 
+async def test_iterative_scan_ligado_para_o_caso_filtrado(db_session):
+    """`ef_search` sozinho NÃO cobre o filtro, e o filtro é o que quebra.
+
+    O `WHERE` (document_id, embedding_model) roda **depois** da varredura aproximada:
+    dos ~40 candidatos globais sobram só os do recorte. Medido no corpus real forçando o
+    plano do HNSW, `k=5` com `document_ids` de um documento devolveu **1 linha**; com
+    `hnsw.iterative_scan` ligado, 5 de 5. Esticar `ef_search` por um fator fixo não
+    resolve — a diluição é a seletividade do filtro, não um múltiplo do `k` (e no `k`
+    padrão o fator 4 dava exatamente o default do pgvector, ou seja, nada).
+
+    `strict_order`, não `relaxed_order`: aqui a ordem por distância É o resultado, e o
+    limiar corta pelas primeiras posições — "quase ordenado" vira hit descartado à toa.
+    """
+    await _com_vetores(db_session, [PERTO, MEIO, LONGE, OPOSTO])
+
+    await search_clauses(db_session, PERGUNTA, client=FakeQueryVoyage())
+    assert await db_session.scalar(text("SHOW hnsw.iterative_scan")) == "strict_order"
+
+
 async def test_vetor_de_outro_modelo_nao_entra_no_ranking(db_session):
     """`embed_pending` commita por lote (de propósito), então um `--remodel` interrompido
     deixa metade do corpus num modelo e metade no outro. Distâncias de cosseno de modelos

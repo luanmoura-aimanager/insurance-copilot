@@ -18,7 +18,7 @@ import logging
 from dataclasses import dataclass
 from typing import Sequence
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cost import record_call_cost
@@ -52,16 +52,29 @@ MAX_DISTANCE_PADRAO = 0.60
 # sai exato, o que quer dizer que a garantia de "`k` resultados" desta função depende de
 # uma escolha de plano que muda sozinha quando a tabela cresce.
 #
-# Pior no caso filtrado: o `WHERE document_id = ...` é aplicado **depois** da varredura
-# aproximada, então dos ~40 candidatos globais sobram só os do recorte — com 29
-# documentos no corpus, sobrariam ~1. Por isso o `SET LOCAL` acompanha o `k` (fator 4,
-# folga para o filtro) em vez de ser um número fixo.
-#
 # O piso é o próprio default (não faz sentido pedir menos) e o teto é 1000, o máximo que
 # o pgvector aceita para o parâmetro.
 EF_SEARCH_FATOR = 4
 EF_SEARCH_MIN = 40
 EF_SEARCH_MAX = 1000
+
+# **`ef_search` sozinho NÃO resolve o caso filtrado, e é o caso filtrado que quebra.**
+# O `WHERE` (document_id, embedding_model, embedding IS NOT NULL) é aplicado **depois**
+# da varredura aproximada, então dos ~40 candidatos globais sobram só os que passam pelo
+# filtro. Medido no corpus real, forçando o plano do HNSW: `k=5` com `document_ids` de um
+# documento devolveu **1 linha** — a função mentindo sobre o próprio contrato. Esticar o
+# `ef_search` por um fator fixo não conserta isso, porque a diluição é a seletividade do
+# filtro (29 documentos ⇒ ~29×) e não um múltiplo do `k`; o fator 4 anterior era, no `k`
+# padrão, literalmente o default do pgvector — ou seja, não fazia nada.
+#
+# `hnsw.iterative_scan` existe pra exatamente isto: o índice devolve mais lotes até
+# juntar `LIMIT` linhas que sobrevivam ao filtro. Mesma medição, com ele ligado: 5 de 5.
+# `strict_order` (e não `relaxed_order`) porque a ordem por distância aqui é o resultado
+# — o limiar corta pelas primeiras posições, e "quase ordenado" viraria hit descartado
+# por engano. Ligado SEMPRE, não só quando há `document_ids`: o filtro por
+# `embedding_model` dilui do mesmo jeito num corpus meio remodelado, e sem filtro
+# nenhum o primeiro lote já satisfaz o `LIMIT` e o parâmetro não custa nada.
+ITERATIVE_SCAN = "strict_order"
 
 
 @dataclass(frozen=True)
@@ -106,8 +119,9 @@ async def search_clauses(
     Essa ressalva é a única outra forma de vir menos que `k`, e é deliberada: um corpus
     meio re-embeddado (`--remodel` interrompido) devolve pouco ou nada em vez de devolver
     uma ordenação que mistura dois modelos. Vazio e honesto é recuperável; ranking errado
-    com cara de certo, não. O outro teto possível — o índice parar em 40 candidatos — é
-    neutralizado pelo `SET LOCAL hnsw.ef_search` abaixo, e é por isso que ele existe.
+    com cara de certo, não. O outro teto possível — o índice parar no primeiro lote de
+    candidatos e devolver menos que `k` depois dos filtros — é neutralizado pelos dois
+    parâmetros de sessão configurados abaixo (`hnsw.ef_search` e `hnsw.iterative_scan`).
 
     O corte acontece **depois** do `LIMIT`, não como `WHERE distance <= :max`: o limiar é
     de relevância, não de paginação. Filtrar no SQL faria a query varrer mais fundo em
@@ -152,13 +166,18 @@ async def search_clauses(
     # `cosine_distance` compila pro operador `<=>`, o mesmo do índice
     # (`USING hnsw (embedding vector_cosine_ops)`). Aparecer nos dois lugares — na
     # projeção e no ORDER BY — é o que deixa o planner usar o índice pra ordenar.
-    # Sem isto o índice pararia em 40 candidatos e devolveria menos que `k` — sem erro.
-    # `SET LOCAL` vale só até o fim da transação da session, então uma busca não altera o
-    # comportamento das outras conexões nem sobrevive ao commit. O valor é interpolado
-    # (não é bind param) porque o Postgres não aceita parâmetro em `SET`; é um `int`
-    # derivado do `k` já validado, então não há texto de fora do processo aqui.
+    # Sem estes dois o índice pararia no primeiro lote de candidatos e devolveria menos
+    # que `k` — sem erro nenhum. Ver as constantes: `ef_search` cobre o `k` grande,
+    # `iterative_scan` cobre o filtro. `set_config(..., is_local => true)` é `SET LOCAL`
+    # como função: vale até o fim da transação da session (não vaza pra outras conexões
+    # nem sobrevive ao commit) e aceita bind param, coisa que a sintaxe `SET` não aceita.
     ef_search = min(max(k * EF_SEARCH_FATOR, EF_SEARCH_MIN), EF_SEARCH_MAX)
-    await session.execute(text(f"SET LOCAL hnsw.ef_search = {int(ef_search)}"))
+    await session.execute(
+        select(
+            func.set_config("hnsw.ef_search", str(ef_search), True),
+            func.set_config("hnsw.iterative_scan", ITERATIVE_SCAN, True),
+        )
+    )
 
     distancia = ClauseChunk.embedding.cosine_distance(vetor).label("distance")
     q = (

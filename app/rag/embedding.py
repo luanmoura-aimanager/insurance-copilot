@@ -86,6 +86,42 @@ RATE_LIMIT_ESPERA_QUERY = 2.0
 # textos curtos e mantém a janela de trava em algo defensável.
 EMBED_TIMEOUT = 60.0
 
+# Timeout da BUSCA, e ele é o número que de fato limita a latência de um `/ask`. Cortar
+# só as tentativas (`RATE_LIMIT_TENTATIVAS_QUERY`) não bastava: com o cliente do backfill,
+# uma Voyage travada segurava um worker do `asyncio.to_thread` por 60s por chamada — e o
+# retry curto ainda podia dobrar isso. Alguns requests simultâneos assim esgotam o
+# executor padrão, que é justamente o que trava também as chamadas síncronas ao Postgres
+# dos outros nós do grafo. 10s é folgado pra UM texto de uma linha; passou disso, a
+# resposta certa pro usuário é o erro, não a espera.
+EMBED_TIMEOUT_QUERY = 10.0
+
+
+def _novo_client(timeout: float) -> voyageai.Client:
+    """Constrói o cliente lendo a chave **na chamada**. Ver `get_client`."""
+    key = os.environ.get("VOYAGE_API_KEY")
+    if not key:
+        raise RuntimeError(
+            "VOYAGE_API_KEY não está no ambiente — a indexação de vetores precisa da "
+            "chave da Voyage. Ponha o valor real no .env (ver .env.example)."
+        )
+    # `max_retries=0` (o padrão) é deliberado: quem retenta é `_embed_com_retry`, e só
+    # rate limit. Deixar o SDK retentar por conta dele empilharia uma política invisível
+    # por baixo da nossa — inclusive em erros que não devem ser retentados.
+    return voyageai.Client(api_key=key, timeout=timeout, max_retries=0)
+
+
+@lru_cache(maxsize=1)
+def get_query_client() -> voyageai.Client:
+    """Cliente da BUSCA — mesmo SDK, timeout curto (`EMBED_TIMEOUT_QUERY`).
+
+    São dois clientes porque o timeout é um parâmetro do cliente, não da chamada, e os
+    dois caminhos têm paciências opostas: o backfill pode esperar 60s por um lote de 200
+    textos sob `FOR UPDATE`, a busca não pode segurar um worker do `to_thread` por tanto
+    tempo dentro de um request. Cortar só o número de tentativas não limitava a latência
+    — o timeout é o termo dominante.
+    """
+    return _novo_client(EMBED_TIMEOUT_QUERY)
+
 
 @lru_cache(maxsize=1)
 def get_client() -> voyageai.Client:
@@ -100,18 +136,10 @@ def get_client() -> voyageai.Client:
     no meio da passada: aí já haveria lotes pagos e a mensagem seria um 401 genérico.
 
     O `lru_cache` é o que garante um cliente (e um pool de conexões HTTP) por processo.
-    Quem troca a env em teste precisa chamar `get_client.cache_clear()`.
+    Quem troca a env em teste precisa chamar `get_client.cache_clear()` (e o mesmo em
+    `get_query_client`, que tem cache próprio).
     """
-    key = os.environ.get("VOYAGE_API_KEY")
-    if not key:
-        raise RuntimeError(
-            "VOYAGE_API_KEY não está no ambiente — a indexação de vetores precisa da "
-            "chave da Voyage. Ponha o valor real no .env (ver .env.example)."
-        )
-    # `max_retries=0` (o padrão) é deliberado: quem retenta é `_embed_com_retry`, e só
-    # rate limit. Deixar o SDK retentar por conta dele empilharia uma política invisível
-    # por baixo da nossa — inclusive em erros que não devem ser retentados.
-    return voyageai.Client(api_key=key, timeout=EMBED_TIMEOUT, max_retries=0)
+    return _novo_client(EMBED_TIMEOUT)
 
 
 def _embed_com_retry(
@@ -153,6 +181,12 @@ def _embed_com_retry(
     commit por lote de `embed_pending` já preservou tudo que foi pago até ali, e a
     re-execução retoma sozinha pelas linhas que continuam com `embedding IS NULL`.
     """
+    # Sem o guard, `tentativas=0` sai do `for` sem executar nada e a função devolve
+    # `None` — o chamador estoura em `resp.embeddings` com um AttributeError que não diz
+    # nada sobre configuração. Mesmo fail-loud do `k` e do `limit`.
+    if tentativas < 1:
+        raise ValueError(f"tentativas tem que ser >= 1, veio {tentativas}")
+
     espera = espera_inicial
     for tentativa in range(1, tentativas + 1):
         try:
@@ -196,8 +230,10 @@ def _validar(vetores: list[list[float]], texts: list[str]) -> None:
         if len(v) != EMBEDDING_DIM:
             raise ValueError(
                 f"vetor {i} veio com {len(v)} dimensões, esperado {EMBEDDING_DIM} — "
-                f"o modelo configurado ({EMBED_MODEL}) não bate com a coluna "
-                "`clause_chunk.embedding`, que é vector(1024) e só muda por migration."
+                f"o modelo configurado ({EMBED_MODEL}) não bate com a dimensão do "
+                "índice (`clause_chunk.embedding` é vector(1024), e isso só muda por "
+                "migration). Indexar gravaria errado; buscar compararia vetores de "
+                "espaços diferentes."
             )
 
 
@@ -255,7 +291,7 @@ def embed_query_with_tokens(
             "vetor de ruído que casaria com qualquer cláusula do corpus."
         )
 
-    client = client or get_client()
+    client = client or get_query_client()   # timeout curto — ver EMBED_TIMEOUT_QUERY
     # `input_type="query"` é o OUTRO lado do par: a cláusula foi indexada como
     # "document", e é essa assimetria que põe a pergunta perto das cláusulas que a
     # respondem. Trocar por "document" aqui não levanta erro — só piora os vizinhos.

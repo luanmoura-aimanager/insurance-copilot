@@ -77,8 +77,18 @@ async def run(caminho: Path, k: int) -> None:
     primeiros: dict[str, list[float]] = {"+": [], "-": []}
 
     async with SessionLocal() as session:
-        for rotulo, pergunta in perguntas:
+        for i, (rotulo, pergunta) in enumerate(perguntas, start=1):
             hits = await search_clauses(session, pergunta, k=k)
+            # `search_clauses` abre transação (o `set_config` local) e não fecha — o dono
+            # da transação é o chamador. Sem este rollback, a conexão ficaria
+            # `idle in transaction` durante TODAS as chamadas HTTP seguintes, que é
+            # exatamente onde um Postgres com `idle_in_transaction_session_timeout`
+            # derruba a sessão no meio da passada, com os embeddings já pagos.
+            await session.rollback()
+            # Progresso linha a linha: a tabela só é impressa no fim (precisa da largura
+            # máxima), e uma passada que morre no meio não pode sair muda depois de ter
+            # gasto — o `\r` some quando a tabela é impressa por cima.
+            print(f"  [{i}/{len(perguntas)}] {pergunta[:50]}", end="\r", flush=True)
             if hits:
                 primeiros[rotulo].append(hits[0].distance)
             melhor = (
@@ -91,6 +101,7 @@ async def run(caminho: Path, k: int) -> None:
             )
 
     largura = max(len(p) for _, p, *_ in linhas)
+    print(" " * 60)   # apaga a última linha de progresso antes da tabela
     cab = f"{'':2} {'pergunta':<{largura}}  {'d1':>6} {'d3':>6} {'d5':>6}  melhor hit"
     print(cab)
     print("-" * len(cab))

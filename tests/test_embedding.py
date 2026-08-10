@@ -21,6 +21,7 @@ from app.rag.embedding import (
     embed_documents,
     embed_query,
     get_client,
+    get_query_client,
 )
 
 
@@ -140,6 +141,62 @@ def test_get_client_escolhe_o_timeout(monkeypatch):
     assert client._params["request_timeout"] == embedding.EMBED_TIMEOUT
     assert client.max_retries == 0   # quem retenta é _embed_com_retry, e só rate limit
     get_client.cache_clear()
+
+
+def test_client_da_busca_tem_timeout_curto(monkeypatch):
+    """O timeout é o termo DOMINANTE da latência, não o número de tentativas.
+
+    Com o cliente do backfill, uma Voyage travada segurava um worker do `to_thread` por
+    60s por chamada (e o retry curto ainda podia dobrar). Alguns requests simultâneos
+    assim esgotam o executor padrão — que é o que trava também as chamadas síncronas ao
+    Postgres dos outros nós do grafo. Cortar só `tentativas` não limitava nada disso.
+    """
+    get_client.cache_clear()
+    get_query_client.cache_clear()
+    monkeypatch.setenv("VOYAGE_API_KEY", "chave-de-teste")
+
+    assert get_query_client()._params["request_timeout"] == embedding.EMBED_TIMEOUT_QUERY
+    assert embedding.EMBED_TIMEOUT_QUERY < embedding.EMBED_TIMEOUT
+    assert get_client()._params["request_timeout"] == embedding.EMBED_TIMEOUT   # o do backfill não muda
+
+    get_client.cache_clear()
+    get_query_client.cache_clear()
+
+
+def test_embed_query_usa_o_client_da_busca(monkeypatch):
+    """A metade que importa do teste acima: ter um cliente de timeout curto não adianta
+    se o caminho da busca continuar pegando o do backfill. Sem este assert, trocar
+    `get_query_client()` por `get_client()` em `embed_query` passa despercebido."""
+    busca, backfill = FakeVoyage(), FakeVoyage()
+    monkeypatch.setattr(embedding, "get_query_client", lambda: busca)
+    monkeypatch.setattr(embedding, "get_client", lambda: backfill)
+
+    embed_query("granizo?")            # sem client explícito: quem resolve é o módulo
+
+    assert len(busca.calls) == 1
+    assert backfill.calls == []
+
+    # E o outro lado continua no cliente do backfill (timeout longo, lote sob FOR UPDATE).
+    embed_documents(["cláusula A"])
+    assert len(backfill.calls) == 1
+    assert len(busca.calls) == 1
+
+
+def test_query_client_sem_chave_falha_alto(monkeypatch):
+    """O fail-closed de configuração vale pros dois clientes — são caches separados."""
+    get_query_client.cache_clear()
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="VOYAGE_API_KEY"):
+        get_query_client()
+    get_query_client.cache_clear()
+
+
+def test_tentativas_invalidas_falham_alto():
+    """`tentativas=0` sairia do `for` sem executar nada e devolveria `None`, e o chamador
+    estouraria em `resp.embeddings` com um AttributeError que não fala de configuração.
+    O parâmetro passou a ser do contrato interno, então ganha o mesmo fail-loud do `k`."""
+    with pytest.raises(ValueError, match="tentativas tem que ser >= 1"):
+        embedding._embed_com_retry(FakeVoyage(), ["a"], "document", tentativas=0)
 
 
 def test_lista_vazia_nao_chama_a_api():

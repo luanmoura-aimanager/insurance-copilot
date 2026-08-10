@@ -9,7 +9,8 @@
 # Se elas se cruzarem, não há corte que separe os dois — ver scripts/calibrate_search.py.
 #
 # Os '-' são de dois tipos de propósito: assunto totalmente fora (bolo, imposto de
-# renda) e SEGURO de outro ramo (vida, viagem, saúde). Os segundos é que valem: um
+# renda) e SEGURO de outro ramo (vida, viagem, cirurgia estética). Os segundos é que
+# valem: um
 # limiar que só barra o bolo está separando vocabulário, não assunto — e quem escreve
 # pro sistema escreve em linguagem de seguro.
 
