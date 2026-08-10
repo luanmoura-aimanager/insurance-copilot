@@ -15,9 +15,13 @@ from app.rag import embedding
 from app.rag.embedding import (
     EMBED_MODEL,
     RATE_LIMIT_ESPERA_INICIAL,
+    RATE_LIMIT_ESPERA_QUERY,
     RATE_LIMIT_TENTATIVAS,
+    RATE_LIMIT_TENTATIVAS_QUERY,
     embed_documents,
+    embed_query,
     get_client,
+    get_query_client,
 )
 
 
@@ -81,6 +85,38 @@ def test_embed_documents_manda_input_type_document():
     assert tokens > 0
 
 
+def test_embed_query_manda_input_type_query():
+    """O OUTRO lado do par assimétrico. A cláusula foi indexada como "document"; a
+    pergunta tem que ir como "query", senão a Voyage a coloca perto de outras perguntas
+    em vez das cláusulas que a respondem — sem erro nenhum, só piores vizinhos."""
+    fake = FakeVoyage()
+    vetor = embed_query("granizo está coberto?", client=fake)
+
+    assert len(fake.calls) == 1
+    assert fake.calls[0]["input_type"] == "query"
+    assert fake.calls[0]["model"] == EMBED_MODEL
+    assert fake.calls[0]["truncation"] is False   # o retry e os parâmetros são os mesmos
+    assert len(vetor) == EMBEDDING_DIM            # o vetor, não uma lista de vetores
+
+
+def test_embed_query_valida_a_dimensao():
+    """Mesma validação de `embed_documents`: a mensagem tem que falar do MODELO. Aqui
+    nem existe coluna pra o Postgres reclamar depois — o vetor errado iria direto pro
+    `<=>` e voltaria com "different vector dimensions" no meio de uma busca."""
+    with pytest.raises(ValueError, match=f"esperado {EMBEDDING_DIM}"):
+        embed_query("granizo?", client=FakeVoyage(dim=512))
+
+
+def test_embed_query_recusa_pergunta_vazia():
+    """Espaço em branco custa uma chamada e devolve um vetor de ruído que casaria com
+    qualquer cláusula do corpus — pior que não buscar."""
+    fake = FakeVoyage()
+    for ruim in ("", "   "):
+        with pytest.raises(ValueError, match="pergunta vazia"):
+            embed_query(ruim, client=fake)
+    assert fake.calls == []
+
+
 def test_embed_documents_desliga_a_truncagem():
     """`truncation=False` contra o padrão do SDK (`True`).
 
@@ -105,6 +141,62 @@ def test_get_client_escolhe_o_timeout(monkeypatch):
     assert client._params["request_timeout"] == embedding.EMBED_TIMEOUT
     assert client.max_retries == 0   # quem retenta é _embed_com_retry, e só rate limit
     get_client.cache_clear()
+
+
+def test_client_da_busca_tem_timeout_curto(monkeypatch):
+    """O timeout é o termo DOMINANTE da latência, não o número de tentativas.
+
+    Com o cliente do backfill, uma Voyage travada segurava um worker do `to_thread` por
+    60s por chamada (e o retry curto ainda podia dobrar). Alguns requests simultâneos
+    assim esgotam o executor padrão — que é o que trava também as chamadas síncronas ao
+    Postgres dos outros nós do grafo. Cortar só `tentativas` não limitava nada disso.
+    """
+    get_client.cache_clear()
+    get_query_client.cache_clear()
+    monkeypatch.setenv("VOYAGE_API_KEY", "chave-de-teste")
+
+    assert get_query_client()._params["request_timeout"] == embedding.EMBED_TIMEOUT_QUERY
+    assert embedding.EMBED_TIMEOUT_QUERY < embedding.EMBED_TIMEOUT
+    assert get_client()._params["request_timeout"] == embedding.EMBED_TIMEOUT   # o do backfill não muda
+
+    get_client.cache_clear()
+    get_query_client.cache_clear()
+
+
+def test_embed_query_usa_o_client_da_busca(monkeypatch):
+    """A metade que importa do teste acima: ter um cliente de timeout curto não adianta
+    se o caminho da busca continuar pegando o do backfill. Sem este assert, trocar
+    `get_query_client()` por `get_client()` em `embed_query` passa despercebido."""
+    busca, backfill = FakeVoyage(), FakeVoyage()
+    monkeypatch.setattr(embedding, "get_query_client", lambda: busca)
+    monkeypatch.setattr(embedding, "get_client", lambda: backfill)
+
+    embed_query("granizo?")            # sem client explícito: quem resolve é o módulo
+
+    assert len(busca.calls) == 1
+    assert backfill.calls == []
+
+    # E o outro lado continua no cliente do backfill (timeout longo, lote sob FOR UPDATE).
+    embed_documents(["cláusula A"])
+    assert len(backfill.calls) == 1
+    assert len(busca.calls) == 1
+
+
+def test_query_client_sem_chave_falha_alto(monkeypatch):
+    """O fail-closed de configuração vale pros dois clientes — são caches separados."""
+    get_query_client.cache_clear()
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="VOYAGE_API_KEY"):
+        get_query_client()
+    get_query_client.cache_clear()
+
+
+def test_tentativas_invalidas_falham_alto():
+    """`tentativas=0` sairia do `for` sem executar nada e devolveria `None`, e o chamador
+    estouraria em `resp.embeddings` com um AttributeError que não fala de configuração.
+    O parâmetro passou a ser do contrato interno, então ganha o mesmo fail-loud do `k`."""
+    with pytest.raises(ValueError, match="tentativas tem que ser >= 1"):
+        embedding._embed_com_retry(FakeVoyage(), ["a"], "document", tentativas=0)
 
 
 def test_lista_vazia_nao_chama_a_api():
@@ -168,6 +260,22 @@ def test_rate_limit_e_retentado_com_backoff(esperas):
     assert len(esperas) == 2
     assert base / 2 <= esperas[0] <= base
     assert base <= esperas[1] <= base * 2
+
+
+def test_query_tem_orcamento_de_espera_proprio_e_curto(esperas):
+    """A busca roda dentro de um request e segura um worker do `to_thread` enquanto
+    dorme. Herdar as 6 tentativas do backfill (~190–380s de espera, mais os timeouts)
+    penduraria o `/ask` por minutos e, com algumas buscas simultâneas, esgotaria o
+    executor — travando também as chamadas síncronas ao Postgres dos outros nós."""
+    fake = FakeVoyage(rate_limit_nas_primeiras=RATE_LIMIT_TENTATIVAS_QUERY + 1)
+
+    with pytest.raises(voyageai.error.RateLimitError):
+        embed_query("granizo?", client=fake)
+
+    assert len(fake.calls) == RATE_LIMIT_TENTATIVAS_QUERY
+    assert len(fake.calls) < RATE_LIMIT_TENTATIVAS        # menos que o do backfill
+    # E a espera é curta: a do backfill começa em 20s, esta em 2s.
+    assert esperas and all(e <= RATE_LIMIT_ESPERA_QUERY for e in esperas)
 
 
 def test_erro_que_nao_e_rate_limit_nao_e_retentado(esperas):

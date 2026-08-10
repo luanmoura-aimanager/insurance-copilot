@@ -1,0 +1,34 @@
+# Perguntas de calibração do limiar da busca semântica (R3a).
+#
+# Formato: um prefixo por linha.
+#   +  a resposta EXISTE no corpus (condições gerais de seguro residencial)
+#   -  a resposta NÃO existe — outro ramo, outro produto, outro assunto
+# Linhas em branco e linhas começando com '#' são ignoradas.
+#
+# O limiar mora entre os dois grupos: a maior distância de um '+' e a menor de um '-'.
+# Se elas se cruzarem, não há corte que separe os dois — ver scripts/calibrate_search.py.
+#
+# Os '-' são de dois tipos de propósito: assunto totalmente fora (bolo, imposto de
+# renda) e SEGURO de outro ramo (vida, viagem, cirurgia estética). Os segundos é que
+# valem: um
+# limiar que só barra o bolo está separando vocabulário, não assunto — e quem escreve
+# pro sistema escreve em linguagem de seguro.
+
+# --- em escopo ---
++ Granizo está coberto?
++ A cobertura de vendaval tem alguma exclusão?
++ Danos elétricos em aparelhos por causa de raio são cobertos?
++ Como funciona a franquia (POS) nessa apólice?
++ Roubo de bens dentro da residência está coberto?
++ O que a cobertura de incêndio exclui?
++ Alagamento por enchente é coberto?
++ Prejuízo causado de propósito pelo segurado é indenizado?
++ Bicicleta guardada dentro da residência está coberta contra roubo?
++ O carro estacionado na garagem de casa tem cobertura por danos?
+
+# --- fora de escopo ---
+- Como funciona o seguro de vida em caso de invalidez?
+- O seguro cobre cancelamento de viagem internacional?
+- O seguro cobre cirurgia plástica estética?
+- Qual a receita de bolo de cenoura?
+- Como declaro imposto de renda?
