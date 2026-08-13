@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from app.cost import record_call_cost
 from app.llm import get_async_client
+from app.rag.search import MAX_DISTANCE_PADRAO, search_clauses
 # Import direto das funções core do MCP server (mesmo processo, sem protocolo MCP).
 # run_query já carrega o guard SELECT-only + LIMIT e conecta pela role read-only.
 from mcp_servers.postgres_mcp_server import get_schema, run_query
@@ -19,10 +20,35 @@ SUPERVISOR_MODEL = "claude-haiku-4-5"  # routing é tarefa leve: modelo barato b
 SQL_MODEL = "claude-haiku-4-5"          # SQL simples: Haiku dá conta
 SYNTHESIZER_MODEL = "claude-haiku-4-5"  # transformar linha de resultado em frase: idem
 
-# Frase de quando nenhum worker rodou (pergunta fora de escopo, ou o circuit breaker
-# cortou antes de qualquer resultado). Mora aqui, e não na API, porque quem escreve a
-# resposta final agora é o synthesizer — o /ask só lê a última mensagem.
+# Quantas cláusulas o rag_worker recupera por pergunta. 5 é o mesmo default de
+# `search_clauses`: o suficiente pra cobrir seguradoras diferentes dizendo a mesma coisa,
+# e pouco o bastante pra caber no contexto do synthesizer sem virar despejo de texto.
+RAG_K = 5
+
+# --- As TRÊS frases finais possíveis, e elas NÃO são intercambiáveis ---
+#
+# Cada uma responde a uma pergunta diferente do usuário sobre o que aconteceu, e trocá-las
+# entre si é mentir de um jeito plausível:
+#
+#   NO_ANSWER      "eu deveria conseguir, mas falhei"  — nenhum worker chegou a produzir
+#                  resultado (o circuit breaker cortou, ou o supervisor encerrou de cara
+#                  sem rotear). É um problema NOSSO, e o usuário pode tentar de novo.
+#   NADA_RELEVANTE "eu procurei e o corpus não tem"    — a busca rodou e todos os vizinhos
+#                  ficaram acima do limiar de relevância. É um fato sobre o CORPUS.
+#   FORA_DE_ESCOPO "eu não trato desse assunto"        — o supervisor classificou a
+#                  pergunta como de outro domínio, antes de gastar qualquer busca. É um
+#                  fato sobre o SISTEMA, e reformular a pergunta não muda nada.
+#
+# As três moram aqui, e não na API, porque quem escreve a resposta final é o synthesizer
+# — o /ask só lê a última mensagem.
 NO_ANSWER = "Não consegui responder essa pergunta com os dados disponíveis."
+NADA_RELEVANTE = (
+    "Não encontrei nenhuma cláusula relevante sobre isso nas condições gerais indexadas."
+)
+FORA_DE_ESCOPO = (
+    "Só respondo perguntas sobre as condições gerais de seguro residencial — coberturas, "
+    "perigos cobertos, exclusões e franquias."
+)
 
 # Structured output canônico (mesmo padrão da extração de seguros): expõe UM tool
 # cujo input_schema é o JSON Schema do Pydantic e força tool_choice pra ele. O modelo
@@ -31,14 +57,30 @@ _DECISION_TOOL = "route_decision"
 _SQL_TOOL = "emit_sql"
 
 SUPERVISOR_SYSTEM = (
-    "Você é o supervisor de um grafo de agentes que responde perguntas sobre seguros "
-    "residenciais. Sua função é rotear: olhe o histórico da conversa e decida o próximo "
-    "passo.\n\n"
-    "Workers disponíveis:\n"
-    "  - sql_worker: responde perguntas sobre o banco de dados de seguros via SQL "
-    "(tabelas de apólices, coberturas, perigos, exclusões).\n"
-    "  - END: encerre quando a pergunta já estiver respondida pelo resultado de um "
-    "worker. Se a última mensagem já traz o dado que responde a pergunta, escolha END.\n\n"
+    "Você é o supervisor de um grafo de agentes que responde perguntas sobre CONDIÇÕES "
+    "GERAIS de seguro residencial registradas na SUSEP. O corpus descreve PRODUTOS "
+    "(o que cada seguradora cobre e exclui), não apólices de clientes — não há preço, "
+    "nem dado de cliente, nem sinistro individual.\n\n"
+    "Sua função é rotear: olhe o histórico e escolha o próximo passo.\n\n"
+    "  - sql_worker: perguntas de ESTRUTURA, que se respondem contando, filtrando ou "
+    "comparando campos categóricos (seguradoras, coberturas, perigos, tipo de franquia). "
+    "Ex.: 'quantas seguradoras cobrem vendaval?', 'quais coberturas não têm franquia?', "
+    "'liste os perigos da cobertura de incêndio'.\n"
+    "  - rag_worker: perguntas de TEOR, que se respondem lendo o texto de uma cláusula. "
+    "Ex.: 'em que situações o roubo não é coberto?', 'o que a apólice diz sobre danos "
+    "elétricos?', 'chuva que entra por janela aberta é coberta?'.\n"
+    "  - unsupported: a pergunta é de OUTRO ASSUNTO — outro ramo de seguro (auto, vida, "
+    "saúde, viagem), preço/cotação, ou nada a ver com seguro. Ex.: 'quanto custa meu "
+    "seguro?', 'seguro de vida cobre suicídio?', 'qual a capital da França?'.\n"
+    "  - END: a pergunta já está respondida pelo resultado de um worker no histórico.\n\n"
+    "ATENÇÃO — o erro mais fácil de cometer aqui: uma pergunta cuja resposta é 'NÃO "
+    "COBRE' continua sendo do escopo. 'Enchente é coberta?' se responde com a cláusula "
+    "de exclusão de enchente, que existe no corpus. 'Não está coberto' é uma RESPOSTA, "
+    "não uma pergunta fora de assunto. Use unsupported só quando o ASSUNTO for outro, "
+    "nunca porque você suspeita que a cobertura não existe.\n\n"
+    "REGRA DE DESEMPATE: na dúvida entre unsupported e um worker, escolha rag_worker. "
+    "Recusar por engano custa a resposta certa a quem tinha uma pergunta legítima; "
+    "buscar à toa custa frações de centavo e devolve 'não encontrei'.\n\n"
     "Responda SEMPRE chamando a tool route_decision."
 )
 
@@ -50,10 +92,12 @@ SQL_SYSTEM = (
 )
 
 SYNTHESIZER_SYSTEM = (
-    "Você recebe a pergunta de um usuário e o resultado cru de uma query SQL. Devolva "
-    "UMA frase em pt-BR que responda a pergunta usando esse resultado. Não invente "
-    "nenhum dado além do que está no resultado — se ele não responder a pergunta, diga "
-    "isso em uma frase. Responda só com a frase, sem preâmbulo e sem repetir o SQL."
+    "Você recebe a pergunta de um usuário e o resultado cru de um worker: linhas de uma "
+    "query SQL, ou trechos de cláusulas recuperados das condições gerais. Devolva UMA "
+    "frase em pt-BR que responda a pergunta usando esse resultado. Não invente nenhum "
+    "dado além do que está no resultado — se ele não responder a pergunta, diga isso em "
+    "uma frase. Responda só com a frase, sem preâmbulo, sem repetir o SQL e sem repetir "
+    "os identificadores técnicos (chunk/doc/dist) que acompanham as cláusulas."
 )
 
 
@@ -64,9 +108,15 @@ class State(TypedDict):
     messages: Annotated[list, add_messages]
 
 
+# Os destinos que são NÓS de verdade. "unsupported" fica de fora de propósito: ele é uma
+# classificação, não um worker — sai pelo synthesizer como qualquer outro fim de grafo.
+WORKERS = frozenset({"sql_worker", "rag_worker"})
+
+
 # --- 2. Supervisor decision: `next` é ENUM = o cinto de segurança ---
 class SupervisorDecision(BaseModel):
-    next: Literal["sql_worker", "END"]  # enum = the belt: no invalid worker can be returned
+    # enum = o cinto: o modelo não consegue rotear pra um worker que não existe.
+    next: Literal["sql_worker", "rag_worker", "unsupported", "END"]
     reasoning: str                       # one line of why, for the message history
 
 
@@ -194,6 +244,98 @@ async def sql_worker(state: State) -> dict:
     return {"messages": [AIMessage(content=f"SQL: {sql}\nResult: {rows}", name="sql_worker")]}
 
 
+# --- 4.2 RAG worker: recupera cláusulas por similaridade. Sem LLM próprio. ---
+def _formatar_hits(hits) -> str:
+    """As cláusulas recuperadas, uma por linha, com a origem colada no texto.
+
+    `chunk_id` e `document_id` viajam junto porque é o que torna a CITAÇÃO possível: são
+    eles que ligam a frase de volta à cláusula e ao documento SUSEP de onde ela saiu — o
+    motivo de as FKs do arco de `clause_chunk` existirem. A distância entra pra que a
+    leitura do log (e do histórico do grafo) mostre *quão* perto o hit estava, que é a
+    diferença entre uma resposta bem apoiada e um vizinho que passou raspando no limiar.
+
+    **O `.strip()` no texto é load-bearing, e o motivo não é estético.** Esta mensagem
+    vira a ÚLTIMA entrada `assistant` da chamada seguinte ao supervisor, e a API recusa
+    (400) um turno assistente final terminando em espaço em branco. `clause_chunk.text`
+    guarda a cláusula como a extração a devolveu — texto de PDF lido por LLM, que termina
+    em `\\n` com facilidade —, e a R2a só rejeita texto EM BRANCO, não normaliza o resto.
+    Sem o strip, uma cláusula com quebra no fim derruba o `/ask` com 500 depois de o
+    embedding já ter sido pago, e só para os documentos que tiverem esse detalhe.
+    """
+    return "\n".join(
+        f"[chunk {h.chunk_id} | doc {h.document_id} | dist {h.distance:.3f}] {h.text.strip()}"
+        for h in hits
+    )
+
+
+async def rag_worker(state: State) -> dict:
+    """Busca semântica sobre `clause_chunk` e devolve as cláusulas como mensagem.
+
+    Ao contrário dos outros nós, este NÃO chama a Anthropic: a única chamada paga é o
+    embedding da pergunta, dentro de `search_clauses` (que também grava o próprio
+    `cost_event` como `rag_search`). O trabalho de virar isso em frase é do synthesizer.
+
+    O limiar é aplicado AQUI, e não é opcional: `search_clauses` sempre devolveria `k`
+    vizinhos — sem corte, uma pergunta de outro assunto que escapou do supervisor volta
+    com 5 cláusulas de seguro residencial e o synthesizer as transforma, confiante, numa
+    resposta errada com citação. Com o corte, "nada relevante" é uma saída possível.
+
+    **O corte é feito no nó, não passado como `max_distance`, pra que o descarte seja
+    VISÍVEL.** É a mesma operação (a R3a já corta depois do `LIMIT`), mas passando o
+    limiar pra dentro da busca as distâncias reprovadas somem, e são exatamente elas que
+    dizem se `MAX_DISTANCE_PADRAO` está no lugar certo — o número segue decidido e não
+    medido, então uma passada que devolve vazio precisa registrar *por quanto*. Sem isso,
+    "não achei" e "achei e cortei a 0,61" ficam indistinguíveis no log.
+    """
+    question = next(
+        (m.content for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
+        "",
+    )
+
+    # Sessão PRÓPRIA, como `record_call_cost`: o nó do grafo não conhece a borda HTTP e
+    # não recebe session por parâmetro. O import é local pelo mesmo motivo do de
+    # `app.cost` — resolve `SessionLocal` no momento da chamada, que é o que faz o
+    # `monkeypatch.setattr("app.db.SessionLocal", ...)` dos testes pegar.
+    from app.db import SessionLocal
+
+    try:
+        async with SessionLocal() as session:
+            hits = await search_clauses(session, question, k=RAG_K)
+    except Exception as exc:  # noqa: BLE001 — mesmo contrato do sql_worker: erro vira mensagem
+        # O supervisor enxerga o texto e encerra; o grafo não estoura no meio de um
+        # request que já pode ter gasto em outros nós.
+        logger.warning("busca RAG falhou: %s", exc)
+        return {"messages": [AIMessage(content=f"RAG error: {exc}", name="rag_worker")]}
+
+    relevantes = [h for h in hits if h.distance <= MAX_DISTANCE_PADRAO]
+    print(
+        f"[rag_worker] {len(relevantes)}/{len(hits)} cláusula(s) dentro do limiar "
+        f"{MAX_DISTANCE_PADRAO}"
+    )
+    if not relevantes:
+        if hits:
+            # O único registro de quanto faltou. Enquanto o limiar não for calibrado,
+            # é este número que diz se ele está apertado demais ou se a pergunta era
+            # mesmo de outro mundo.
+            logger.info(
+                "busca RAG sem hits: melhor distância %.3f > limiar %.2f",
+                hits[0].distance,
+                MAX_DISTANCE_PADRAO,
+            )
+        # Mensagem EXPLÍCITA, nunca string vazia: uma mensagem em branco no histórico é
+        # indistinguível de "o worker não rodou", e o synthesizer cairia no NO_ANSWER
+        # ("falhei") em vez de dizer a verdade ("procurei e não achei").
+        return {"messages": [AIMessage(content=NADA_RELEVANTE, name="rag_worker")]}
+    return {
+        "messages": [
+            AIMessage(
+                content=f"Cláusulas recuperadas:\n{_formatar_hits(relevantes)}",
+                name="rag_worker",
+            )
+        ]
+    }
+
+
 # --- 4.5 Synthesizer: último nó SEMPRE. Vira o resultado cru em frase. ---
 async def synthesizer(state: State) -> dict:
     """Escreve a resposta final em linguagem natural.
@@ -202,25 +344,47 @@ async def synthesizer(state: State) -> dict:
     por isso é ele, e não o supervisor, quem produz a última mensagem. A API só precisa
     ler `messages[-1]`.
 
-    Sem chamada de LLM quando não há resultado de worker: não há o que sintetizar, e
-    pagar uma chamada só pra escrever "não sei" seria queimar dinheiro à toa.
+    Sem chamada de LLM em NENHUM dos três caminhos estáticos (fora de escopo, nada
+    encontrado, nenhum worker): não há o que sintetizar, e pagar uma chamada só pra
+    reescrever uma frase que já está pronta seria queimar dinheiro à toa.
     """
     question = next(
         (m.content for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
         "",
     )
-    resultado = next(
-        (
-            m.content
-            for m in reversed(state["messages"])
-            if isinstance(m, AIMessage) and m.name == "sql_worker"
-        ),
-        None,
-    )
+    # Os resultados de worker, do mais recente pro mais antigo. Fixar `sql_worker` faria
+    # uma resposta de RAG ser sintetizada em cima de um SQL antigo do mesmo histórico —
+    # ou, sem SQL nenhum, cair no NO_ANSWER com as cláusulas certas na mensagem anterior.
+    resultados = [
+        m.content
+        for m in reversed(state["messages"])
+        if isinstance(m, AIMessage) and m.name in WORKERS
+    ]
 
-    if resultado is None:
+    # **As duas saídas estáticas só valem quando NÃO há trabalho a apresentar**, e essa
+    # ordem é a correção de um buraco real: o supervisor roda de novo depois de cada
+    # worker, então nada o impede de classificar como `unsupported` na segunda passada —
+    # e o gatilho mais natural é justamente ler o "não encontrei" do rag_worker e
+    # concluir que o assunto é de outro ramo. Checando `next` antes dos resultados, uma
+    # pergunta legítima recebia "só respondo sobre seguro residencial" DEPOIS de a busca
+    # ter sido paga: a pior das três frases, porque manda o usuário embora.
+    if not resultados:
+        if state.get("next") == "unsupported":
+            print("[synthesizer] fora de escopo -> frase fixa, sem LLM")
+            return {"messages": [AIMessage(content=FORA_DE_ESCOPO, name="final")]}
         print("[synthesizer] sem resultado de worker -> fallback estático")
         return {"messages": [AIMessage(content=NO_ANSWER, name="final")]}
+
+    # A busca rodou e não achou nada dentro do limiar. A frase do worker já É a resposta
+    # final; mandá-la pro LLM só pagaria pra reescrever "não encontrei" com outras
+    # palavras — e arriscaria que ele inventasse um "mas talvez..." em cima do vazio.
+    # Mas ela só vale se for o ÚNICO resultado: se um sql_worker respondeu antes, a
+    # resposta está lá e dizer "não encontrei nada" seria jogar fora o dado certo.
+    substantivos = [r for r in resultados if r != NADA_RELEVANTE]
+    if not substantivos:
+        print("[synthesizer] busca sem hits -> frase do worker, sem LLM")
+        return {"messages": [AIMessage(content=NADA_RELEVANTE, name="final")]}
+    resultado = substantivos[0]
 
     # Texto livre, não structured output: a saída é UMA frase em prosa, e forçar uma
     # tool aqui só embrulharia uma string em JSON sem ganhar nada.
@@ -255,29 +419,34 @@ def route(state: State) -> str:
         print("[route] circuit breaker -> END")
         return END
     nxt = state["next"]
-    if nxt == "END":  # decisão legítima do supervisor de encerrar (o enum devolve a string "END")
-        return END
-    if nxt != "sql_worker":  # suspenders: enum should prevent this, but if it slips → END
+    if nxt in WORKERS:
+        return nxt
+    # "END" (decisão legítima de encerrar) e "unsupported" saem os dois pelo mesmo lugar:
+    # o synthesizer. A diferença entre eles é só a FRASE, e quem a escolhe é o
+    # synthesizer lendo `state["next"]` — route() decide o CAMINHO, não o texto.
+    if nxt not in ("END", "unsupported"):  # suspenders: o enum deveria impedir, mas se escapar → END
         print(f"[route] invalid next '{nxt}' -> END (fail closed)")
-        return END
-    return nxt
+    return END
 
 
 # --- 6. Build the graph ---
 builder = StateGraph(State)
 builder.add_node("supervisor", supervisor)
 builder.add_node("sql_worker", sql_worker)
+builder.add_node("rag_worker", rag_worker)
 builder.add_node("synthesizer", synthesizer)
 
 builder.set_entry_point("supervisor")
 # Onde antes o route() ia direto pro END, agora passa pelo synthesizer — o mapa traduz
-# o valor devolvido pelo route (que continua sendo END) no nó de saída. É por isso que
-# route() não precisou mudar: a decisão dele é a mesma, só o destino é outro.
+# o valor devolvido pelo route (que continua sendo END) no nó de saída. `unsupported`
+# não aparece aqui de propósito: ele já virou END no route().
 builder.add_conditional_edges("supervisor", route, {
     "sql_worker": "sql_worker",
+    "rag_worker": "rag_worker",
     END: "synthesizer",
 })
 builder.add_edge("sql_worker", "supervisor")   # worker returns to the supervisor
+builder.add_edge("rag_worker", "supervisor")   # idem: o supervisor decide se já basta
 builder.add_edge("synthesizer", END)           # synthesizer é sempre o último nó
 
 graph = builder.compile()

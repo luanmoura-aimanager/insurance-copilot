@@ -4,8 +4,9 @@ Embedda a pergunta com `input_type="query"` e devolve os chunks mais próximos p
 distância de cosseno, que é a mesma métrica do índice HNSW (`vector_cosine_ops`) — se as
 duas divergirem o índice deixa de ser usado e o Postgres cai em seq scan em silêncio.
 
-**Ainda NÃO existe nó de RAG no grafo.** Esta fatia entrega a função e os testes; a
-ligação com `app/agents/` (e a decisão de quando o supervisor roteia pra cá) é a R3b.
+Quem chama isto de dentro do grafo é o nó `rag_worker` (`app/agents/graph.py`, R3b), que
+abre a própria session e aplica `MAX_DISTANCE_PADRAO` como limiar. A função em si não
+depende do grafo e continua chamável de script e de teste.
 
 O custo é gravado como qualquer outra chamada paga (`agent_name="rag_search"`), e como
 esta é a primeira coisa da R3 que roda **dentro de um request**, `request_id`/`client`

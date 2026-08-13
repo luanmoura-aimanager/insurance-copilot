@@ -2,7 +2,7 @@
 
 A multi-agent system that turns Brazilian home-insurance policy documents into a queryable knowledge base. It harvests *condições gerais* (general terms) registered with SUSEP, extracts their structure into Postgres, and answers coverage-comparison questions in natural language.
 
-> **Status: work in progress.** The data pipeline (SUSEP harvester + extraction schema) and the service skeleton (FastAPI + Postgres) are in place. The agent layer has its first real slice — an LLM supervisor routing to a single-pass SQL worker over the Postgres MCP server, with a synthesizer node turning the query result into a natural-language answer, exposed at `POST /ask`. The RAG worker has its vector storage (pgvector + `clause_chunk`), its chunk materialization, its embedding pass (`app/rag/`, Voyage `voyage-4-lite`) and its similarity search as a standalone function; no node in the graph routes to it yet. See [Roadmap](#roadmap).
+> **Status: work in progress.** The data pipeline (SUSEP harvester + extraction schema) and the service skeleton (FastAPI + Postgres) are in place. The agent layer routes each question three ways — a single-pass SQL worker over the Postgres MCP server, a RAG worker over the pgvector index, or an out-of-scope refusal — with a synthesizer node turning the worker's output into a natural-language answer, exposed at `POST /ask`. The RAG side is complete end to end (`clause_chunk` storage, chunking, the Voyage embedding pass, and similarity search), except for the relevance threshold, which is decided but not yet measured. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -14,11 +14,23 @@ Comparing home-insurance products in Brazil means reading dozens of 50–90 page
 
 A supervisor agent routes each question to specialized workers (canonical hub-and-spoke):
 
-- **extraction** — turns a policy PDF into structured rows (insurer, product, coverages, perils, exclusions).
+- **extraction** — turns a policy PDF into structured rows (insurer, product, coverages, perils, exclusions). *Offline pipeline only; no node in the graph yet.*
 - **SQL** — aggregates over the structured tables (coverage comparison, deductible structure, exclusion patterns).
-- **RAG** — retrieves and explains raw clause text (pgvector). *Storage, chunking and embedding are in place (`clause_chunk`, `app/rag/`); retrieval is not.*
+- **RAG** — retrieves clause text by similarity over pgvector and hands it to the synthesizer with its origin ids attached.
 
-A **synthesizer** node closes every path: it turns the worker's raw output into a single natural-language sentence, so the API answers in prose rather than in tuples. When no worker ran (the question is out of scope), it returns a fixed sentence *without* calling the model — there is nothing to synthesize, and paying for a call to say "I don't know" is wasted money.
+**The supervisor picks between three destinations**, and the split is *structure vs. wording*: counting, filtering or comparing categorical fields ("how many insurers cover windstorm?") is the SQL worker; anything answered by reading a clause ("in what situations is theft not covered?") is the RAG worker; a question about another line of business, a price, or another subject entirely is `unsupported` and never reaches a worker.
+
+Two rules in the supervisor's prompt exist because both failures are silent and expensive. First, **"not covered" is an answer, not an out-of-scope question**: "is flooding covered?" is answered by the flood *exclusion* clause, which is in the corpus — classifying it as out of scope would refuse a question the system can answer. Second, the **tie-break is `rag_worker`**: refusing by mistake costs a legitimate user the right answer, while searching in vain costs fractions of a cent and comes back with "nothing found".
+
+A **synthesizer** node closes every path and turns the worker's raw output into a single natural-language sentence, so the API answers in prose rather than tuples. It reads the result of the **most recent** worker, whichever one ran. Three of its outcomes are fixed sentences returned *without* calling the model — there is nothing to synthesize, and paying for a call to write a sentence that already exists is wasted money:
+
+| Sentence | Meaning | What happened |
+|---|---|---|
+| `NO_ANSWER` | "I should have been able to, and failed" | No worker produced a result (circuit breaker, or the supervisor ended immediately). Ours to fix; worth retrying. |
+| `NADA_RELEVANTE` | "I searched and the corpus has nothing" | The search ran and every neighbour was past the relevance threshold. A fact about the **corpus**. |
+| `FORA_DE_ESCOPO` | "I don't handle that subject" | The supervisor classified the question as another domain, before spending anything. A fact about the **system**; rewording won't help. |
+
+Swapping any of them for another does not break anything — it just lies plausibly — so each has its own test. The two "nothing to show" sentences are only reachable when **no worker produced a result**: the supervisor runs again after every worker, so it can answer `unsupported` on a later hop — most naturally by reading the RAG worker's own "found nothing" and concluding the subject is out of scope. Checking that classification *before* the results would send a legitimate question away with `FORA_DE_ESCOPO` after the search had already been paid for. Likewise `NADA_RELEVANTE` is final only when it is the sole result — if a SQL worker answered earlier, that answer is the one to synthesize.
 
 Each LLM call is cost-attributed per agent (one row per call: request id, agent, model, tokens, cost). Surface: WhatsApp (Meta Cloud API), with HMAC-verified webhooks.
 
@@ -114,7 +126,7 @@ python scripts/embed_chunks.py --remodel   # also re-embed rows carrying another
 
 `search_clauses(session, question, *, k=5, max_distance=None, document_ids=None)` embeds the question with `input_type="query"` and returns the nearest chunks by cosine distance as `Hit(chunk_id, document_id, exclusion_id, coverage_id, text, distance)`. The origin ids travel with the hit because a recovered clause without its provenance is just a sentence.
 
-**This slice is the function and its tests — the agent graph is still untouched.** Nothing routes to retrieval yet; wiring a RAG node into `app/agents/` is the next step.
+**The graph reaches it through the `rag_worker` node** (`app/agents/graph.py`), which opens its own `SessionLocal`, calls `search_clauses(k=5)` and formats each hit as one line carrying `chunk_id`, `document_id` and the distance — the ids are what make a citation possible downstream. Unlike every other node it makes no Anthropic call: the only paid call is the question's embedding, inside the search. The threshold **is** applied, and is not optional: without it a question that slipped past the supervisor comes back with five residential clauses and the synthesizer turns them into a confident wrong answer. It is applied **in the node rather than as `max_distance`** so the discarded distances stay visible — the same cut either way, but those numbers are what tell you whether `MAX_DISTANCE_PADRAO` sits in the right place, and when the cut empties the list the best distance is logged. An empty result becomes an explicit "nothing relevant found" message, never an empty string — a blank message in the history is indistinguishable from "the worker never ran", and the answer would degrade from "I searched and found nothing" into "I failed". Hit text is `.strip()`ed: the message becomes the final `assistant` turn of the next supervisor call, and the API rejects one ending in whitespace with a 400 — PDF-derived clause text ends in `\n` easily, and the R2a chunker only rejects *blank* text.
 
 **The vector search always returns `k` results — there is no "not found".** `ORDER BY embedding <=> :q LIMIT k` hands back the k least distant chunks in the corpus even when the closest one is on the other side of the space: a question about travel-insurance cancellation comes back with the five *least unrelated* home-insurance clauses, and a confident synthesizer turns that into a wrong answer with a citation. So an empty result is produced **by the threshold** (`max_distance`), not by "nothing found" — which is what the test named after it pins. The only other way to get fewer than `k` is the model filter described below, and it is deliberate.
 
@@ -192,14 +204,28 @@ curl localhost:8000/health      # {"status":"ok"}
 curl localhost:8000/health/db   # {"db":"ok"}  — API ↔ Postgres OK
 ```
 
-Ask the agent graph a question (needs `ANTHROPIC_API_KEY`, a populated database, and a token from `API_TOKENS` — this spends money: one LLM call per supervisor hop, per worker, and one for the synthesizer):
+Ask the agent graph a question (needs `ANTHROPIC_API_KEY`, a populated database, and a token from `API_TOKENS` — this spends money: one LLM call per supervisor hop, per worker, and one for the synthesizer. A question routed to RAG also needs `VOYAGE_API_KEY` and an embedded corpus, and pays one embedding call):
 
 ```bash
+# structure question -> sql_worker
 curl -X POST localhost:8000/ask \
   -H 'Content-Type: application/json' \
   -H "Authorization: Bearer $YOUR_TOKEN" \
   -d '{"question":"Quantos perigos existem na base?"}'
 # {"answer":"Existem 7 perigos cadastrados na base.","iterations":2}
+
+# wording question -> rag_worker
+curl -X POST localhost:8000/ask \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $YOUR_TOKEN" \
+  -d '{"question":"Em que situações o roubo não é coberto?"}'
+
+# another subject -> unsupported (one supervisor call and nothing else)
+curl -X POST localhost:8000/ask \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $YOUR_TOKEN" \
+  -d '{"question":"Seguro de vida cobre suicídio?"}'
+# {"answer":"Só respondo perguntas sobre as condições gerais de seguro residencial...","iterations":1}
 ```
 
 ### Tests and CI
@@ -327,10 +353,10 @@ PDF footer).
 - [x] CI on GitHub Actions — `pytest -q` on every PR and push to `main`, with no database configured (lazy engine)
 - [ ] Production extraction (LLM → tables)
 - [x] Postgres MCP SQL server + read-only `insurance_ro` role
-- [~] Agent layer — async LLM supervisor (structured output) + single-pass SQL worker + synthesizer (natural-language answer), served at `POST /ask`; RAG/extraction workers + a ReAct refinement loop pending
+- [~] Agent layer — async LLM supervisor (structured output) routing to a single-pass SQL worker, a RAG worker or an out-of-scope refusal, closed by a synthesizer (natural-language answer), served at `POST /ask`; extraction worker + a ReAct refinement loop pending
 - [x] `POST /ask` hardening — Bearer auth with identity + per-client and per-IP rate limits
 - [x] Cost attribution in the agent graph — one `cost_event` per LLM call, tagged with a per-request id and the calling client
-- [~] RAG worker — vector storage ready (pgvector extension, `clause_chunk` with an exclusive-arc origin, HNSW/cosine index, revoked from the SQL worker's role), chunks materialized from the extracted text (one source row = one chunk, idempotent re-indexing that invalidates the vector when the text changes), embeddings filled by a resumable, cost-attributed pass (Voyage `voyage-4-lite`, `input_type="document"`, one `cost_event` per batch), and similarity search as a testable function (`search_clauses`, `input_type="query"`, relevance threshold, per-document filter); **pending:** calibrating the threshold and wiring a RAG node into the graph
+- [~] RAG worker — vector storage ready (pgvector extension, `clause_chunk` with an exclusive-arc origin, HNSW/cosine index, revoked from the SQL worker's role), chunks materialized from the extracted text (one source row = one chunk, idempotent re-indexing that invalidates the vector when the text changes), embeddings filled by a resumable, cost-attributed pass (Voyage `voyage-4-lite`, `input_type="document"`, one `cost_event` per batch), similarity search as a testable function (`search_clauses`, `input_type="query"`, relevance threshold, per-document filter), and a `rag_worker` node wired into the graph behind a three-way supervisor; **pending:** calibrating the threshold against the labelled question set
 - [ ] WhatsApp surface
 - [ ] Deploy to Railway
 
