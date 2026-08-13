@@ -73,6 +73,10 @@ SUPERVISOR_SYSTEM = (
     "saúde, viagem), preço/cotação, ou nada a ver com seguro. Ex.: 'quanto custa meu "
     "seguro?', 'seguro de vida cobre suicídio?', 'qual a capital da França?'.\n"
     "  - END: a pergunta já está respondida pelo resultado de um worker no histórico.\n\n"
+    "Se um worker JÁ RODOU e devolveu resultado — inclusive quando esse resultado é "
+    "'não encontrei nenhuma cláusula relevante' —, escolha END. Repetir o mesmo worker "
+    "com a mesma pergunta paga de novo pela mesma resposta; a regra de desempate abaixo "
+    "vale pra PRIMEIRA decisão, não pra insistir depois de já ter procurado.\n\n"
     "ATENÇÃO — o erro mais fácil de cometer aqui: uma pergunta cuja resposta é 'NÃO "
     "COBRE' continua sendo do escopo. 'Enchente é coberta?' se responde com a cláusula "
     "de exclusão de enchente, que existe no corpus. 'Não está coberto' é uma RESPOSTA, "
@@ -305,7 +309,13 @@ async def rag_worker(state: State) -> dict:
         # O supervisor enxerga o texto e encerra; o grafo não estoura no meio de um
         # request que já pode ter gasto em outros nós.
         logger.warning("busca RAG falhou: %s", exc)
-        return {"messages": [AIMessage(content=f"RAG error: {exc}", name="rag_worker")]}
+        # O `.strip()` aqui é o mesmo guard do texto do hit, pela porta de trás: uma
+        # exceção sem mensagem (`raise SomeError()`) faria o conteúdo ser "RAG error: ",
+        # que termina em espaço — e a chamada seguinte ao supervisor morreria com 400
+        # justamente no caminho de erro, trocando uma falha diagnosticável por outra.
+        return {
+            "messages": [AIMessage(content=f"RAG error: {exc}".strip(), name="rag_worker")]
+        }
 
     relevantes = [h for h in hits if h.distance <= MAX_DISTANCE_PADRAO]
     print(
@@ -398,7 +408,11 @@ async def synthesizer(state: State) -> dict:
             messages=[
                 {
                     "role": "user",
-                    "content": f"Pergunta: {question}\n\nResultado da query:\n{resultado}",
+                    # "Resultado do worker", não "da query": com o rag_worker no grafo o
+                    # payload tanto pode ser linha de SELECT quanto cláusula recuperada,
+                    # e rotular cláusula como resultado de query faz o modelo escrever
+                    # "a consulta retornou..." sobre uma consulta que não existiu.
+                    "content": f"Pergunta: {question}\n\nResultado do worker:\n{resultado}",
                 }
             ],
         )

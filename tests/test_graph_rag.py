@@ -304,6 +304,28 @@ async def test_erro_na_busca_vira_mensagem_e_nao_derruba_o_ask(ask_client, fake_
     assert r.json()["answer"] == FRASE   # o synthesizer sintetiza até o erro; ninguém quebra
 
 
+async def test_erro_sem_mensagem_nao_termina_em_espaco(monkeypatch):
+    """`raise SomeError()` produziria "RAG error: " — espaço no fim, 400 na volta.
+
+    É o mesmo guard do texto do hit entrando pela porta de trás: seria uma falha de
+    infra diagnosticável virando um 500 opaco no `/ask`, justamente no caminho de erro.
+    """
+    monkeypatch.setattr("app.db.SessionLocal", lambda **kw: _FakeSession())
+
+    async def _explode(session, question, **kw):
+        raise RuntimeError()   # sem mensagem, de propósito
+
+    monkeypatch.setattr(graph_mod, "search_clauses", _explode)
+
+    out = await graph_mod.rag_worker(
+        {"iterations": 1, "next": "rag_worker", "messages": [HumanMessage(content="oi?")]}
+    )
+
+    conteudo = out["messages"][0].content
+    assert conteudo == conteudo.rstrip()
+    assert conteudo == "RAG error:"
+
+
 def test_route_fail_closed_continua_indo_pro_synthesizer():
     """Valor inválido em `next` → END → synthesizer (nunca um nó inexistente).
 

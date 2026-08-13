@@ -12,6 +12,10 @@ Três fatias prontas:
   par assimétrico) e devolve os chunks mais próximos por distância de cosseno, com a
   origem de cada um. Gasta uma chamada por busca (`cost_event`, `agent_name="rag_search"`).
 
-Falta a **R3b**: o nó de RAG no grafo de agentes — nada em `app/agents/` roteia pra cá
-ainda —, e calibrar o limiar de relevância (`scripts/calibrate_search.py`).
+- **R3b — ligação com o grafo.** Quem chama `search` de dentro de um request é o nó
+  `rag_worker` (`app/agents/graph.py`): ele abre a própria session, busca e aplica o
+  limiar de relevância. Nada aqui depende de `app/agents/` — a direção é só essa.
+
+Falta calibrar o limiar de relevância (`scripts/calibrate_search.py` existe; o número,
+não): `MAX_DISTANCE_PADRAO` segue decidido e não medido.
 """
