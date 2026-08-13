@@ -84,6 +84,10 @@ SUPERVISOR_SYSTEM = (
     "REGRA DE DESEMPATE: na dúvida entre unsupported e um worker, escolha rag_worker. "
     "Recusar por engano custa a resposta certa a quem tinha uma pergunta legítima; "
     "buscar à toa custa frações de centavo e devolve 'não encontrei'.\n\n"
+    "O schema da tool aceita um quarto valor, 'END'. Ele existe só por compatibilidade "
+    "e NUNCA deve ser escolhido: toda pergunta cai em uma das três classificações "
+    "acima, e responder 'END' faz o sistema devolver 'não consegui responder' sem nem "
+    "tentar.\n\n"
     "Responda SEMPRE chamando a tool route_decision."
 )
 
@@ -188,6 +192,19 @@ async def supervisor(state: State) -> dict:
 
     tool_use = next(b for b in resp.content if b.type == "tool_use")
     decision = SupervisorDecision.model_validate(tool_use.input)
+
+    if decision.next == "END":
+        # O prompt manda explicitamente nunca escolher END; chegar aqui é o modelo
+        # ignorando a instrução, e o preço é alto e SILENCIOSO: nenhum worker roda e o
+        # usuário recebe NO_ANSWER ("não consegui responder") pra uma pergunta que o
+        # sistema talvez soubesse responder — indistinguível, de fora, de uma falha de
+        # infra. O fail-safe do enum evita o 500; este WARNING é o que evita que ele
+        # aconteça sem ninguém ficar sabendo.
+        logger.warning(
+            "supervisor devolveu END (proibido pelo prompt) — nenhum worker vai rodar. "
+            "reasoning: %s",
+            decision.reasoning,
+        )
 
     print(f"[supervisor] iteration {i} -> decided: {decision.next} ({decision.reasoning})")
     return {

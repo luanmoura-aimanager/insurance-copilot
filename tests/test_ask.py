@@ -10,6 +10,8 @@ breaker, hoje inalcançável por aqui, tem teste próprio que forja o State.
 /ask é autenticado (ver tests/test_auth.py); aqui a auth é só um pré-requisito, então
 a fixture cadastra um token e todas as requisições mandam o header.
 """
+import logging
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -127,25 +129,30 @@ async def test_ask_happy_path(ask_client, fake_graph):
     assert client.messages.supervisor_calls == 1
 
 
-async def test_ask_end_e_fail_safe_e_nao_inventa_resposta(ask_client, fake_graph):
+async def test_ask_end_e_fail_safe_e_nao_inventa_resposta(ask_client, fake_graph, caplog):
     """`END` saiu do prompt do supervisor, mas continua no enum — e tem que ser inócuo.
 
-    O supervisor não encerra mais nada (os workers vão direto pro synthesizer), então
-    `END` só apareceria por um modelo desalinhado com o prompt. Ele fica no `Literal`
-    justamente pra esse caso: fora do enum a resposta quebraria a validação e derrubaria
-    o request; dentro, cai no mesmo caminho do valor inválido — nenhum worker rodou,
-    então NO_ANSWER, sem inventar resposta.
+    O supervisor não encerra mais nada (os workers vão direto pro synthesizer) e o
+    prompt manda explicitamente NUNCA escolher `END`, então ele só apareceria por um
+    modelo desalinhado. Fica no `Literal` justamente pra esse caso: fora do enum a
+    resposta quebraria a validação e derrubaria o request; dentro, cai no mesmo caminho
+    do valor inválido — nenhum worker rodou, então NO_ANSWER, sem inventar resposta.
+
+    E não pode acontecer em silêncio: de fora, esse NO_ANSWER é indistinguível de uma
+    falha de infra, então o supervisor loga WARNING quando vê `END`.
     """
     fake_graph(["END"])
 
-    r = await ask_client.post(
-        "/ask", json={"question": "Qual a capital da França?"}, headers=AUTH
-    )
+    with caplog.at_level(logging.WARNING, logger="app.agents.graph"):
+        r = await ask_client.post(
+            "/ask", json={"question": "Qual a capital da França?"}, headers=AUTH
+        )
 
     assert r.status_code == 200
     body = r.json()
     assert body["answer"] == "Não consegui responder essa pergunta com os dados disponíveis."
     assert body["iterations"] == 1
+    assert any("END" in rec.message for rec in caplog.records)
 
 
 async def test_ask_nao_reroteia_nem_com_supervisor_teimoso(ask_client, fake_graph):
