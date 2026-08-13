@@ -1,9 +1,11 @@
 """
 Testes do POST /ask — ZERO chamada real à API Anthropic.
 
-Todo o grafo é exercitado de verdade (supervisor -> route -> sql_worker -> supervisor),
+Todo o grafo é exercitado de verdade (supervisor -> route -> sql_worker -> synthesizer),
 só que com o client Anthropic e o acesso ao Postgres trocados por fakes: o que importa
-aqui é o roteamento e o circuit breaker, não o modelo nem o banco.
+aqui é o roteamento e a TERMINAÇÃO, não o modelo nem o banco. O grafo é single-hop — o
+supervisor fala uma vez —, então o caso load-bearing é a contagem de chamadas; o circuit
+breaker, hoje inalcançável por aqui, tem teste próprio que forja o State.
 
 /ask é autenticado (ver tests/test_auth.py); aqui a auth é só um pré-requisito, então
 a fixture cadastra um token e todas as requisições mandam o header.
@@ -60,8 +62,9 @@ class _FakeMessages:
         if tool_name == graph_mod._DECISION_TOOL:
             i = self.supervisor_calls
             self.supervisor_calls += 1
-            # Esgotou o roteiro? repete a última decisão (é o que segura o teste do
-            # circuit breaker: supervisor que NUNCA escolhe END).
+            # Esgotou o roteiro? repete a última decisão. Com o grafo single-hop o
+            # supervisor é chamado uma vez só, então a lista tem UM elemento na prática
+            # — a repetição sobrou como rede pro caso de o ciclo voltar.
             nxt = self._decisions[min(i, len(self._decisions) - 1)]
             return _FakeResponse([_FakeToolUse({"next": nxt, "reasoning": f"fake decision #{i}"})])
         return _FakeResponse([_FakeToolUse({"sql": self._sql})])

@@ -31,8 +31,9 @@ RAG_K = 5
 # entre si é mentir de um jeito plausível:
 #
 #   NO_ANSWER      "eu deveria conseguir, mas falhei"  — nenhum worker chegou a produzir
-#                  resultado (o circuit breaker cortou, ou o supervisor encerrou de cara
-#                  sem rotear). É um problema NOSSO, e o usuário pode tentar de novo.
+#                  resultado. Com o grafo single-hop isso só acontece se o supervisor
+#                  devolver `END` ou um valor inválido, ou se o circuit breaker cortar
+#                  (hoje inalcançável). É um problema NOSSO, e dá pra tentar de novo.
 #   NADA_RELEVANTE "eu procurei e o corpus não tem"    — a busca rodou e todos os vizinhos
 #                  ficaram acima do limiar de relevância. É um fato sobre o CORPUS.
 #   FORA_DE_ESCOPO "eu não trato desse assunto"        — o supervisor classificou a
@@ -74,7 +75,7 @@ SUPERVISOR_SYSTEM = (
     "elétricos?', 'chuva que entra por janela aberta é coberta?'.\n"
     "  - unsupported: a pergunta é de OUTRO ASSUNTO — outro ramo de seguro (auto, vida, "
     "saúde, viagem), preço/cotação, ou nada a ver com seguro. Ex.: 'quanto custa meu "
-    "seguro?', 'seguro de vida cobre suicídio?', 'qual a capital da França?'.\n"
+    "seguro?', 'seguro de vida cobre suicídio?', 'qual a capital da França?'.\n\n"
     "ATENÇÃO — o erro mais fácil de cometer aqui: uma pergunta cuja resposta é 'NÃO "
     "COBRE' continua sendo do escopo. 'Enchente é coberta?' se responde com a cláusula "
     "de exclusão de enchente, que existe no corpus. 'Não está coberto' é uma RESPOSTA, "
@@ -206,7 +207,7 @@ async def sql_worker(state: State) -> dict:
 
     # 2. Schema numa chamada só — dá os nomes de tabela/coluna pro modelo. Se a conexão
     #    falhar aqui, curto-circuita: sem schema não dá pra gerar SQL, então volta o erro
-    #    como mensagem (o supervisor enxerga e encerra) em vez de estourar o grafo.
+    #    como mensagem (que o synthesizer lê) em vez de estourar o grafo.
     #    get_schema é psycopg3 SÍNCRONO: roda numa thread pra não travar o event loop.
     try:
         schema = await asyncio.to_thread(get_schema)
@@ -262,13 +263,16 @@ def _formatar_hits(hits) -> str:
     leitura do log (e do histórico do grafo) mostre *quão* perto o hit estava, que é a
     diferença entre uma resposta bem apoiada e um vizinho que passou raspando no limiar.
 
-    **O `.strip()` no texto é load-bearing, e o motivo não é estético.** Esta mensagem
-    vira a ÚLTIMA entrada `assistant` da chamada seguinte ao supervisor, e a API recusa
-    (400) um turno assistente final terminando em espaço em branco. `clause_chunk.text`
-    guarda a cláusula como a extração a devolveu — texto de PDF lido por LLM, que termina
-    em `\\n` com facilidade —, e a R2a só rejeita texto EM BRANCO, não normaliza o resto.
-    Sem o strip, uma cláusula com quebra no fim derruba o `/ask` com 500 depois de o
-    embedding já ter sido pago, e só para os documentos que tiverem esse detalhe.
+    **O `.strip()` no texto ficou DEFENSIVO, e o histórico importa pra ninguém removê-lo
+    achando que é enfeite.** Ele foi escrito quando o grafo era cíclico: a mensagem do
+    worker voltava pro supervisor como turno `assistant` FINAL, e a API recusa (400) um
+    turno assistente final terminando em espaço em branco — `clause_chunk.text` guarda a
+    cláusula como a extração devolveu (PDF lido por LLM, que termina em `\\n` com
+    facilidade) e a R2a só rejeita texto EM BRANCO, não normaliza o resto. Com o grafo
+    single-hop essa mensagem só é lida pelo synthesizer, dentro de um turno `user`, onde
+    espaço no fim é inofensivo. Fica porque volta a ser load-bearing no dia do multi-hop
+    — que é justamente quando ninguém vai lembrar — e porque texto normalizado é o certo
+    de qualquer jeito.
     """
     return "\n".join(
         f"[chunk {h.chunk_id} | doc {h.document_id} | dist {h.distance:.3f}] {h.text.strip()}"
@@ -310,13 +314,13 @@ async def rag_worker(state: State) -> dict:
         async with SessionLocal() as session:
             hits = await search_clauses(session, question, k=RAG_K)
     except Exception as exc:  # noqa: BLE001 — mesmo contrato do sql_worker: erro vira mensagem
-        # O supervisor enxerga o texto e encerra; o grafo não estoura no meio de um
-        # request que já pode ter gasto em outros nós.
+        # O texto segue pro synthesizer como qualquer outro resultado; o grafo não
+        # estoura no meio de um request que já pode ter gasto em outros nós.
         logger.warning("busca RAG falhou: %s", exc)
-        # O `.strip()` aqui é o mesmo guard do texto do hit, pela porta de trás: uma
-        # exceção sem mensagem (`raise SomeError()`) faria o conteúdo ser "RAG error: ",
-        # que termina em espaço — e a chamada seguinte ao supervisor morreria com 400
-        # justamente no caminho de erro, trocando uma falha diagnosticável por outra.
+        # Mesmo guard do texto do hit, pela porta de trás: uma exceção sem mensagem
+        # (`raise SomeError()`) faria o conteúdo ser "RAG error: ", com espaço no fim.
+        # Hoje inofensivo — nenhuma mensagem de worker volta pra API como turno
+        # assistente —, e mantido pelo mesmo motivo: ver `_formatar_hits`.
         return {
             "messages": [AIMessage(content=f"RAG error: {exc}".strip(), name="rag_worker")]
         }
@@ -375,13 +379,16 @@ async def synthesizer(state: State) -> dict:
         if isinstance(m, AIMessage) and m.name in WORKERS
     ]
 
-    # **As duas saídas estáticas só valem quando NÃO há trabalho a apresentar**, e essa
-    # ordem é a correção de um buraco real: o supervisor roda de novo depois de cada
-    # worker, então nada o impede de classificar como `unsupported` na segunda passada —
-    # e o gatilho mais natural é justamente ler o "não encontrei" do rag_worker e
-    # concluir que o assunto é de outro ramo. Checando `next` antes dos resultados, uma
+    # **As duas saídas estáticas só valem quando NÃO há trabalho a apresentar.** Com o
+    # grafo single-hop `next` e os resultados não podem se contradizer (o supervisor
+    # classifica ANTES de qualquer worker), então hoje a ordem é redundante — e fica
+    # porque o multi-hop a torna load-bearing de novo: com o supervisor decidindo depois
+    # de cada worker, nada o impede de classificar como `unsupported` na segunda passada,
+    # lendo justamente o "não encontrei" do rag_worker. Nessa ordem invertida, uma
     # pergunta legítima recebia "só respondo sobre seguro residencial" DEPOIS de a busca
-    # ter sido paga: a pior das três frases, porque manda o usuário embora.
+    # ter sido paga: a pior das três frases, porque manda o usuário embora. O teste
+    # chama o synthesizer direto, com o estado que o multi-hop reintroduz — via /ask o
+    # caso é inalcançável hoje, e um teste por /ask passaria sem exercitar nada.
     if not resultados:
         if state.get("next") == "unsupported":
             print("[synthesizer] fora de escopo -> frase fixa, sem LLM")
