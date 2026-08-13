@@ -12,7 +12,7 @@ Comparing home-insurance products in Brazil means reading dozens of 50–90 page
 
 ## Architecture
 
-A supervisor agent routes each question to specialized workers (canonical hub-and-spoke):
+A supervisor agent routes each question to specialized workers (hub-and-spoke, **single-hop** — see below):
 
 - **extraction** — turns a policy PDF into structured rows (insurer, product, coverages, perils, exclusions). *Offline pipeline only; no node in the graph yet.*
 - **SQL** — aggregates over the structured tables (coverage comparison, deductible structure, exclusion patterns).
@@ -22,15 +22,19 @@ A supervisor agent routes each question to specialized workers (canonical hub-an
 
 Two rules in the supervisor's prompt exist because both failures are silent and expensive. First, **"not covered" is an answer, not an out-of-scope question**: "is flooding covered?" is answered by the flood *exclusion* clause, which is in the corpus — classifying it as out of scope would refuse a question the system can answer. Second, the **tie-break is `rag_worker`**: refusing by mistake costs a legitimate user the right answer, while searching in vain costs fractions of a cent and comes back with "nothing found".
 
+**The graph is single-hop, and termination is structural.** The supervisor classifies the question **once, before any work**; each worker edges straight to the synthesizer and never back. That is a correction with a measured price tag: with the worker→supervisor edges in place, the supervisor re-classified the same question on every lap, re-routed to the same worker, and only stopped at the `MAX_ITERATIONS` circuit breaker — **10 LLM calls where 3 sufficed**, the supervisor burning **8,790 tokens against the worker's 4,204**, and on the RAG route **4 paid embeddings, 3 of them wasted**. A prompt instruction ("if a worker already answered, choose END") had been tried first: it lowers the *odds* of the loop, not the *cost of the bad case*. The circuit breaker stays as a guard even though nothing can reach it today — one edge pointed back at the supervisor is all it takes to make the cycle possible again.
+
+What this gives up is multi-hop: a compound question ("how many insurers cover windstorm **and** what does the clause say about the deductible?") is answered by a single worker today. That is deliberately a slice of its own — multi-hop needs an explicit stopping rule (who decides it's enough, and on what basis), and inheriting the cycle for free is exactly how the 10 calls happened.
+
 A **synthesizer** node closes every path and turns the worker's raw output into a single natural-language sentence, so the API answers in prose rather than tuples. It reads the result of the **most recent** worker, whichever one ran. Three of its outcomes are fixed sentences returned *without* calling the model — there is nothing to synthesize, and paying for a call to write a sentence that already exists is wasted money:
 
 | Sentence | Meaning | What happened |
 |---|---|---|
-| `NO_ANSWER` | "I should have been able to, and failed" | No worker produced a result (circuit breaker, or the supervisor ended immediately). Ours to fix; worth retrying. |
+| `NO_ANSWER` | "I should have been able to, and failed" | No worker produced a result — under single-hop, only if the supervisor returns `END` or an invalid value (the circuit breaker is unreachable today). Ours to fix; worth retrying. |
 | `NADA_RELEVANTE` | "I searched and the corpus has nothing" | The search ran and every neighbour was past the relevance threshold. A fact about the **corpus**. |
 | `FORA_DE_ESCOPO` | "I don't handle that subject" | The supervisor classified the question as another domain, before spending anything. A fact about the **system**; rewording won't help. |
 
-Swapping any of them for another does not break anything — it just lies plausibly — so each has its own test. The two "nothing to show" sentences are only reachable when **no worker produced a result**: the supervisor runs again after every worker, so it can answer `unsupported` on a later hop — most naturally by reading the RAG worker's own "found nothing" and concluding the subject is out of scope. Checking that classification *before* the results would send a legitimate question away with `FORA_DE_ESCOPO` after the search had already been paid for. Likewise `NADA_RELEVANTE` is final only when it is the sole result — if a SQL worker answered earlier, that answer is the one to synthesize.
+Swapping any of them for another does not break anything — it just lies plausibly — so each has its own test. The two "nothing to show" sentences are only reachable when **no worker produced a result**, and that ordering outlives single-hop on purpose: it is what multi-hop will need. Once the supervisor decides again after each worker, it can answer `unsupported` on a later hop — most naturally by reading the RAG worker's own "found nothing" and concluding the subject is out of scope — and checking that classification *before* the results would send a legitimate question away with `FORA_DE_ESCOPO` after the search had already been paid for. Likewise `NADA_RELEVANTE` is final only when it is the sole result: if a SQL worker answered earlier, that answer is the one to synthesize. Both guards are covered by calling the synthesizer directly with the state multi-hop reintroduces — through `/ask` they are unreachable today, and a test routed through it would pass without exercising anything.
 
 Each LLM call is cost-attributed per agent (one row per call: request id, agent, model, tokens, cost). Surface: WhatsApp (Meta Cloud API), with HMAC-verified webhooks.
 
@@ -204,7 +208,7 @@ curl localhost:8000/health      # {"status":"ok"}
 curl localhost:8000/health/db   # {"db":"ok"}  — API ↔ Postgres OK
 ```
 
-Ask the agent graph a question (needs `ANTHROPIC_API_KEY`, a populated database, and a token from `API_TOKENS` — this spends money: one LLM call per supervisor hop, per worker, and one for the synthesizer. A question routed to RAG also needs `VOYAGE_API_KEY` and an embedded corpus, and pays one embedding call):
+Ask the agent graph a question (needs `ANTHROPIC_API_KEY`, a populated database, and a token from `API_TOKENS` — this spends money: 3 LLM calls on a worker route — supervisor, worker, synthesizer — and 1 on the out-of-scope route. A question routed to RAG also needs `VOYAGE_API_KEY` and an embedded corpus, and pays one embedding call):
 
 ```bash
 # structure question -> sql_worker
@@ -212,7 +216,7 @@ curl -X POST localhost:8000/ask \
   -H 'Content-Type: application/json' \
   -H "Authorization: Bearer $YOUR_TOKEN" \
   -d '{"question":"Quantos perigos existem na base?"}'
-# {"answer":"Existem 7 perigos cadastrados na base.","iterations":2}
+# {"answer":"Existem 7 perigos cadastrados na base.","iterations":1}
 
 # wording question -> rag_worker
 curl -X POST localhost:8000/ask \
@@ -253,7 +257,7 @@ Anthropic API.
 
 ### Auth and rate limiting on `/ask`
 
-`POST /ask` is the only paid endpoint (each supervisor hop is an Anthropic call), so it is closed by default. `/health` and `/health/db` stay open — they are the Railway healthcheck, which sends no `Authorization` header.
+`POST /ask` is the only paid endpoint (up to three Anthropic calls plus, on the RAG route, one embedding), so it is closed by default. `/health` and `/health/db` stay open — they are the Railway healthcheck, which sends no `Authorization` header.
 
 | env | example | meaning |
 | --- | --- | --- |
@@ -353,7 +357,7 @@ PDF footer).
 - [x] CI on GitHub Actions — `pytest -q` on every PR and push to `main`, with no database configured (lazy engine)
 - [ ] Production extraction (LLM → tables)
 - [x] Postgres MCP SQL server + read-only `insurance_ro` role
-- [~] Agent layer — async LLM supervisor (structured output) routing to a single-pass SQL worker, a RAG worker or an out-of-scope refusal, closed by a synthesizer (natural-language answer), served at `POST /ask`; extraction worker + a ReAct refinement loop pending
+- [~] Agent layer — async LLM supervisor (structured output) classifying each question once into a single-pass SQL worker, a RAG worker or an out-of-scope refusal, closed by a synthesizer (natural-language answer), served at `POST /ask`; **single-hop by design** (measured: the cyclic version cost 10 LLM calls where 3 sufficed). Pending: multi-hop with an explicit stopping rule, the extraction worker, and a ReAct refinement loop
 - [x] `POST /ask` hardening — Bearer auth with identity + per-client and per-IP rate limits
 - [x] Cost attribution in the agent graph — one `cost_event` per LLM call, tagged with a per-request id and the calling client
 - [~] RAG worker — vector storage ready (pgvector extension, `clause_chunk` with an exclusive-arc origin, HNSW/cosine index, revoked from the SQL worker's role), chunks materialized from the extracted text (one source row = one chunk, idempotent re-indexing that invalidates the vector when the text changes), embeddings filled by a resumable, cost-attributed pass (Voyage `voyage-4-lite`, `input_type="document"`, one `cost_event` per batch), similarity search as a testable function (`search_clauses`, `input_type="query"`, relevance threshold, per-document filter), and a `rag_worker` node wired into the graph behind a three-way supervisor; **pending:** calibrating the threshold against the labelled question set

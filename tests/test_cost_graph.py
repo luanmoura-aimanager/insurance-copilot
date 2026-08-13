@@ -1,7 +1,7 @@
 """
 Custo por chamada DENTRO do grafo — ZERO chamada real à API Anthropic.
 
-O grafo roda inteiro (supervisor -> sql_worker -> supervisor -> synthesizer), com o client
+O grafo roda inteiro (supervisor -> sql_worker -> synthesizer), com o client
 Anthropic e o acesso ao Postgres trocados por fakes; o que se verifica aqui é a
 CONTABILIDADE: uma linha de cost_event por chamada de LLM, cada uma carimbada com o
 request_id do /ask e com o cliente autenticado.
@@ -155,14 +155,15 @@ def test_modelo_cobrado_tem_preco_cadastrado():
 
 
 async def test_ask_grava_uma_linha_de_custo_por_chamada(cost_rows, ask_client, fake_graph):
-    """supervisor -> sql_worker -> supervisor -> synthesizer = 4 chamadas pagas = 4 linhas.
+    """supervisor -> sql_worker -> synthesizer = 3 chamadas pagas = 3 linhas.
 
-    São 4, não 2: o supervisor roda de novo DEPOIS do worker (é ele quem decide o END),
-    o synthesizer fecha escrevendo a frase, e o grão do cost_event é a CHAMADA, não o
-    agente. Cada linha sai carimbada com o mesmo request_id — é o que permite somar
-    "quanto custou este /ask".
+    São 3, e a ordem importa: o supervisor roda UMA vez (o grafo é single-hop — o worker
+    vai direto pro synthesizer, sem passar de volta por ele), o worker trabalha, e o
+    synthesizer fecha escrevendo a frase. O grão do cost_event é a CHAMADA, não o agente.
+    Cada linha sai carimbada com o mesmo request_id — é o que permite somar "quanto
+    custou este /ask", e é o número que denunciou as 10 chamadas do grafo cíclico.
     """
-    fake_graph(["sql_worker", "END"])
+    fake_graph(["sql_worker"])
 
     r = await ask_client.post(
         "/ask", json={"question": "Quantos perigos existem?"}, headers=AUTH
@@ -170,9 +171,7 @@ async def test_ask_grava_uma_linha_de_custo_por_chamada(cost_rows, ask_client, f
     assert r.status_code == 200
 
     eventos = await _eventos(cost_rows)
-    assert [e.agent_name for e in eventos] == [
-        "supervisor", "sql_worker", "supervisor", "synthesizer",
-    ]
+    assert [e.agent_name for e in eventos] == ["supervisor", "sql_worker", "synthesizer"]
 
     request_ids = {e.request_id for e in eventos}
     assert len(request_ids) == 1              # um id por /ask, compartilhado pelas chamadas
@@ -208,7 +207,7 @@ async def test_falha_ao_gravar_custo_nao_derruba_o_ask(
     Perder a linha de custo é muito mais barato do que devolver 500 num /ask que
     custou dinheiro — então uma falha na gravação vira log e o request segue.
     """
-    fake_graph(["sql_worker", "END"])
+    fake_graph(["sql_worker"])
 
     async def _explode(**kwargs):
         raise RuntimeError("banco de custo fora do ar")

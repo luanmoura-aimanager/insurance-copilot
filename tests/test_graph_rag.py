@@ -158,12 +158,18 @@ async def test_rota_rag_worker_alimenta_o_synthesizer(ask_client, fake_graph):
     exemplo procurando só por `sql_worker`, como antes desta fatia) passaria verde —
     ele devolveria a frase do fake do mesmo jeito.
     """
-    f = fake_graph(["rag_worker", "END"])
+    f = fake_graph(["rag_worker"])
 
     r = await _perguntar(ask_client, "Infiltração por janela aberta é coberta?")
 
     assert r.status_code == 200
     assert r.json()["answer"] == FRASE
+
+    # UMA passada pelo supervisor: o rag_worker vai direto pro synthesizer, sem voltar
+    # a passar por ele. Com o ciclo antigo, este mesmo fake reroteava pro rag_worker até
+    # o circuit breaker — 4 embeddings pagos, 3 jogados fora.
+    assert r.json()["iterations"] == 1
+    assert f.client.messages.supervisor_calls == 1
 
     # A busca rodou uma vez, com a pergunta do usuário e SEM limiar: o corte é do nó,
     # pra que as distâncias descartadas continuem visíveis (ver test_corte_pelo_limiar).
@@ -191,6 +197,7 @@ async def test_unsupported_nao_gasta_nada_depois_da_decisao(ask_client, fake_gra
 
     assert r.status_code == 200
     assert r.json()["answer"] == graph_mod.FORA_DE_ESCOPO
+    assert r.json()["iterations"] == 1
     assert f.client.messages.calls == 1          # só o supervisor decidiu; nada além disso
     assert f.client.messages.synth_calls == 0
     assert f.buscas == []                        # nem a busca (que também é paga) rodou
@@ -202,7 +209,7 @@ async def test_busca_sem_hits_diz_que_nao_encontrou(ask_client, fake_graph):
     As duas frases são estáticas e as duas dispensam o LLM, o que as tornaria fáceis de
     confundir na implementação — daí a asserção explícita de que são diferentes.
     """
-    f = fake_graph(["rag_worker", "END"], hits=[])
+    f = fake_graph(["rag_worker"], hits=[])
 
     r = await _perguntar(ask_client, "Meteorito é coberto?")
 
@@ -230,7 +237,7 @@ async def test_corte_pelo_limiar_acontece_no_no(ask_client, fake_graph):
         text="Exclusão geral da apólice: danos por guerra.",
         distance=0.9,   # acima de MAX_DISTANCE_PADRAO
     )
-    f = fake_graph(["rag_worker", "END"], hits=[perto, longe])
+    f = fake_graph(["rag_worker"], hits=[perto, longe])
 
     r = await _perguntar(ask_client, "Infiltração por janela aberta é coberta?")
 
@@ -247,7 +254,7 @@ async def test_todos_acima_do_limiar_viram_nada_relevante(ask_client, fake_graph
         chunk_id=99, document_id=3, exclusion_id=1, coverage_id=None,
         text="Exclusão geral da apólice: danos por guerra.", distance=0.9,
     )
-    f = fake_graph(["rag_worker", "END"], hits=[longe])
+    f = fake_graph(["rag_worker"], hits=[longe])
 
     r = await _perguntar(ask_client, "Minha bicicleta foi roubada na rua?")
 
@@ -267,7 +274,7 @@ async def test_texto_do_hit_e_normalizado(ask_client, fake_graph):
         chunk_id=11, document_id=3, exclusion_id=42, coverage_id=None,
         text="Exclusão geral da apólice: danos por infiltração.\n\n", distance=0.21,
     )
-    fake_graph(["rag_worker", "END"], hits=[sujo])
+    fake_graph(["rag_worker"], hits=[sujo])
 
     r = await _perguntar(ask_client, "Infiltração é coberta?")
 
@@ -276,27 +283,50 @@ async def test_texto_do_hit_e_normalizado(ask_client, fake_graph):
     assert conteudo == conteudo.rstrip()
 
 
-async def test_unsupported_tardio_nao_apaga_o_trabalho_ja_pago(ask_client, fake_graph):
-    """O supervisor decide DE NOVO depois do worker — e pode classificar mal aí.
+async def test_unsupported_nao_apaga_resultado_de_worker_no_historico(monkeypatch):
+    """`unsupported` só produz FORA_DE_ESCOPO quando NÃO há trabalho a apresentar.
 
-    O gatilho realista é ele ler o "não encontrei" (ou as próprias cláusulas) e concluir
-    que o assunto é de outro ramo. Se `unsupported` tivesse prioridade sobre o resultado,
-    uma pergunta legítima receberia "só respondo sobre seguro residencial" depois de a
-    busca ter sido paga — a pior das três frases, porque manda o usuário embora.
+    Chamado direto, e é obrigatório que seja: com o grafo single-hop o supervisor fala
+    uma vez só, então via `/ask` a segunda decisão do fake nunca seria consumida e o
+    teste passaria sem exercitar nada. (Era exatamente o que acontecia — o teste que
+    existia aqui ficava verde mesmo com a ordem das checagens invertida.)
+
+    O estado abaixo é o do grafo cíclico, e é o que o multi-hop vai reintroduzir: um
+    worker já produziu resultado E o supervisor classificou como fora de escopo. Com a
+    ordem invertida, uma pergunta legítima recebe "só respondo sobre seguro residencial"
+    depois de a busca ter sido paga — a pior das três frases, porque manda o usuário
+    embora. É o único teste que cobre esse guard.
     """
-    f = fake_graph(["rag_worker", "unsupported"])
+    client = _FakeClient([])
+    monkeypatch.setattr(graph_mod, "get_async_client", lambda: client)
 
-    r = await _perguntar(ask_client, "Infiltração por janela aberta é coberta?")
+    async def _sem_custo(**kwargs):
+        return None
 
-    assert r.status_code == 200
-    assert r.json()["answer"] == FRASE
-    assert r.json()["answer"] != graph_mod.FORA_DE_ESCOPO
-    assert f.client.messages.synth_calls == 1   # o resultado foi sintetizado, não descartado
+    monkeypatch.setattr(graph_mod, "record_call_cost", _sem_custo)
+
+    state = {
+        "iterations": 2,
+        "next": "unsupported",
+        "messages": [
+            HumanMessage(content="Infiltração por janela aberta é coberta?"),
+            AIMessage(
+                content=f"Cláusulas recuperadas:\n{graph_mod._formatar_hits(HITS)}",
+                name="rag_worker",
+            ),
+        ],
+    }
+
+    out = await graph_mod.synthesizer(state)
+
+    assert out["messages"][0].content == FRASE
+    assert out["messages"][0].content != graph_mod.FORA_DE_ESCOPO
+    assert client.messages.synth_calls == 1   # o resultado foi sintetizado, não descartado
 
 
 async def test_erro_na_busca_vira_mensagem_e_nao_derruba_o_ask(ask_client, fake_graph):
     """Mesmo contrato do sql_worker: falha de infra vira texto no histórico, não 500."""
-    fake_graph(["rag_worker", "END"], erro="pgvector fora do ar")
+    fake_graph(["rag_worker"], erro="pgvector fora do ar")
 
     r = await _perguntar(ask_client, "Vendaval tem franquia?")
 
