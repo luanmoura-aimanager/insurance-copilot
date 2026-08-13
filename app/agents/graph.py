@@ -6,6 +6,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel
 
+from app.agents.context import get_client_name, get_request_id
 from app.cost import record_call_cost
 from app.llm import get_async_client
 from app.rag.search import MAX_DISTANCE_PADRAO, search_clauses
@@ -84,10 +85,13 @@ SUPERVISOR_SYSTEM = (
     "REGRA DE DESEMPATE: na dúvida entre unsupported e um worker, escolha rag_worker. "
     "Recusar por engano custa a resposta certa a quem tinha uma pergunta legítima; "
     "buscar à toa custa frações de centavo e devolve 'não encontrei'.\n\n"
-    "O schema da tool aceita um quarto valor, 'END'. Ele existe só por compatibilidade "
-    "e NUNCA deve ser escolhido: toda pergunta cai em uma das três classificações "
-    "acima, e responder 'END' faz o sistema devolver 'não consegui responder' sem nem "
-    "tentar.\n\n"
+    # A instrução diz o que NÃO fazer e para. A versão anterior explicava também o que
+    # o valor produz ("faz o sistema devolver 'não consegui responder' sem nem tentar")
+    # — e isso, na última posição antes do fecho, descrevia pro modelo uma saída de um
+    # token pra escapar de responder, competindo com a regra de desempate três linhas
+    # acima, que existe justamente pra evitar recusa. Proibir não precisa do prêmio.
+    "O schema da tool aceita um quarto valor, 'END', que existe só por compatibilidade: "
+    "ignore-o. Toda pergunta cai em uma das três classificações acima.\n\n"
     "Responda SEMPRE chamando a tool route_decision."
 )
 
@@ -200,9 +204,16 @@ async def supervisor(state: State) -> dict:
         # sistema talvez soubesse responder — indistinguível, de fora, de uma falha de
         # infra. O fail-safe do enum evita o 500; este WARNING é o que evita que ele
         # aconteça sem ninguém ficar sabendo.
+        # O `request_id` é o que torna o log utilizável: é a mesma chave de
+        # `cost_event.request_id`, então dá pra ligar este WARNING às linhas de custo,
+        # ao cliente e à pergunta daquele /ask. Sem ele, com dois requests concorrentes,
+        # o operador vê um aviso solto e continua sem saber QUAL resposta foi essa —
+        # que é exatamente a ambiguidade que este log existe pra desfazer.
         logger.warning(
             "supervisor devolveu END (proibido pelo prompt) — nenhum worker vai rodar. "
-            "reasoning: %s",
+            "request_id=%s client=%s reasoning: %s",
+            get_request_id(),
+            get_client_name(),
             decision.reasoning,
         )
 

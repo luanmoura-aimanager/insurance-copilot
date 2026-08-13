@@ -11,6 +11,7 @@ breaker, hoje inalcançável por aqui, tem teste próprio que forja o State.
 a fixture cadastra um token e todas as requisições mandam o header.
 """
 import logging
+import re
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -152,7 +153,14 @@ async def test_ask_end_e_fail_safe_e_nao_inventa_resposta(ask_client, fake_graph
     body = r.json()
     assert body["answer"] == "Não consegui responder essa pergunta com os dados disponíveis."
     assert body["iterations"] == 1
-    assert any("END" in rec.message for rec in caplog.records)
+
+    avisos = [rec.message for rec in caplog.records if "END" in rec.message]
+    assert avisos
+    # Com o request_id junto — é a mesma chave de `cost_event.request_id`, e sem ela o
+    # aviso não se liga a request nenhum: com dois /ask concorrentes o operador vê um
+    # WARNING solto e continua sem saber qual resposta foi essa.
+    assert re.search(r"request_id=[0-9a-f]{8}-[0-9a-f]{4}-", avisos[0]), avisos[0]
+    assert "client=teste" in avisos[0]
 
 
 async def test_ask_nao_reroteia_nem_com_supervisor_teimoso(ask_client, fake_graph):
