@@ -147,7 +147,7 @@ async def ask_client(db_url, monkeypatch):
 
 async def test_ask_devolve_frase_e_nao_resultado_cru(ask_client, fake_graph):
     """O ponto da fatia: o usuário recebe português, não `SQL: ... / Result: [(7,)]`."""
-    fake_graph(["sql_worker", "END"])
+    fake_graph(["sql_worker"])
 
     r = await ask_client.post(
         "/ask", json={"question": "Quantos perigos existem?"}, headers=AUTH
@@ -176,9 +176,10 @@ async def test_caminho_sem_worker_usa_fallback_estatico_sem_llm(ask_client, fake
 async def test_synthesizer_grava_seu_proprio_cost_event(cost_rows, ask_client, fake_graph):
     """O synthesizer é uma chamada de LLM como qualquer outra: tem que aparecer no custo.
 
-    São 4 linhas agora, não 3: supervisor -> sql_worker -> supervisor -> synthesizer.
+    São 3: supervisor -> sql_worker -> synthesizer. O supervisor roda UMA vez — o grafo
+    é single-hop, o worker vai direto pro synthesizer.
     """
-    fake_graph(["sql_worker", "END"], com_custo=True)
+    fake_graph(["sql_worker"], com_custo=True)
 
     r = await ask_client.post(
         "/ask", json={"question": "Quantos perigos existem?"}, headers=AUTH
@@ -188,9 +189,7 @@ async def test_synthesizer_grava_seu_proprio_cost_event(cost_rows, ask_client, f
     async with cost_rows() as s:
         eventos = list((await s.execute(select(CostEvent).order_by(CostEvent.id))).scalars())
 
-    assert [e.agent_name for e in eventos] == [
-        "supervisor", "sql_worker", "supervisor", "synthesizer",
-    ]
+    assert [e.agent_name for e in eventos] == ["supervisor", "sql_worker", "synthesizer"]
     # A linha do synthesizer carrega o mesmo request_id das outras (é o mesmo /ask).
     assert len({e.request_id for e in eventos}) == 1
 
@@ -201,7 +200,7 @@ async def test_falha_do_llm_do_synthesizer_nao_derruba_o_ask(ask_client, fake_gr
     Feio de ler, mas é um dado REAL — muito melhor do que 500 num /ask que já custou
     dinheiro e já tinha o resultado na mão.
     """
-    fake_graph(["sql_worker", "END"], synth_explode=True)
+    fake_graph(["sql_worker"], synth_explode=True)
 
     r = await ask_client.post(
         "/ask", json={"question": "Quantos perigos existem?"}, headers=AUTH

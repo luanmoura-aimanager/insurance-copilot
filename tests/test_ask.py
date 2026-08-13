@@ -110,8 +110,8 @@ async def ask_client(monkeypatch):
 
 
 async def test_ask_happy_path(ask_client, fake_graph):
-    """supervisor -> sql_worker -> supervisor -> synthesizer: a resposta vem em prosa."""
-    fake_graph(["sql_worker", "END"])
+    """supervisor -> sql_worker -> synthesizer: a resposta vem em prosa, em UMA passada."""
+    client = fake_graph(["sql_worker"])
 
     r = await ask_client.post(
         "/ask", json={"question": "Quantos perigos existem?"}, headers=AUTH
@@ -120,11 +120,19 @@ async def test_ask_happy_path(ask_client, fake_graph):
     assert r.status_code == 200
     body = r.json()
     assert body["answer"] == FRASE_FINAL    # frase do synthesizer, não o resultado cru
-    assert body["iterations"] == 2          # duas passadas pelo supervisor
+    assert body["iterations"] == 1          # UMA passada pelo supervisor
+    assert client.messages.supervisor_calls == 1
 
 
-async def test_ask_end_immediately_returns_fallback(ask_client, fake_graph):
-    """Supervisor encerra de cara: nenhum worker rodou, então não inventamos resposta."""
+async def test_ask_end_e_fail_safe_e_nao_inventa_resposta(ask_client, fake_graph):
+    """`END` saiu do prompt do supervisor, mas continua no enum — e tem que ser inócuo.
+
+    O supervisor não encerra mais nada (os workers vão direto pro synthesizer), então
+    `END` só apareceria por um modelo desalinhado com o prompt. Ele fica no `Literal`
+    justamente pra esse caso: fora do enum a resposta quebraria a validação e derrubaria
+    o request; dentro, cai no mesmo caminho do valor inválido — nenhum worker rodou,
+    então NO_ANSWER, sem inventar resposta.
+    """
     fake_graph(["END"])
 
     r = await ask_client.post(
@@ -137,21 +145,41 @@ async def test_ask_end_immediately_returns_fallback(ask_client, fake_graph):
     assert body["iterations"] == 1
 
 
-async def test_ask_circuit_breaker_stops_the_loop(ask_client, fake_graph):
-    """O teste que mais importa: supervisor que SEMPRE roteia pro worker não roda para sempre.
+async def test_ask_nao_reroteia_nem_com_supervisor_teimoso(ask_client, fake_graph):
+    """A terminação é ESTRUTURAL: um supervisor que só sabe dizer "sql_worker" para mesmo assim.
 
-    O guard de MAX_ITERATIONS em route() é mecânico (não pergunta pro LLM), então um
-    modelo teimoso — ou em loop — para de queimar chamadas pagas no limite.
+    Antes as arestas voltavam do worker pro supervisor, e este teste media o circuit
+    breaker: MAX_ITERATIONS passadas, MAX_ITERATIONS chamadas pagas. Medido num /ask
+    real, era o caso NORMAL e não o patológico — o supervisor reclassificava a mesma
+    pergunta e reroteava pro mesmo worker, 10 chamadas onde bastavam 3. Com o worker
+    indo direto pro synthesizer não há laço pra frear: o fake aqui é o mesmo supervisor
+    teimoso de antes, e ele só consegue falar uma vez.
     """
-    client = fake_graph(["sql_worker"])  # nunca escolhe END
+    client = fake_graph(["sql_worker"])  # nunca escolheria END
 
     r = await ask_client.post(
-        "/ask", json={"question": "Pergunta que gera loop"}, headers=AUTH
+        "/ask", json={"question": "Pergunta que antes gerava loop"}, headers=AUTH
     )
 
     assert r.status_code == 200
-    assert r.json()["iterations"] == graph_mod.MAX_ITERATIONS
-    assert client.messages.supervisor_calls == graph_mod.MAX_ITERATIONS
+    assert r.json()["iterations"] == 1
+    assert client.messages.supervisor_calls == 1
+
+
+def test_circuit_breaker_continua_armado():
+    """O guard de MAX_ITERATIONS fica, mesmo inalcançável pelo caminho normal.
+
+    Hoje `route` roda uma vez por request, então `iterations` nunca chega perto do
+    limite — por isso o estado é forjado à mão. Ele não é código morto: é o que segura
+    um ciclo reintroduzido por engano (basta uma aresta de worker voltando pro
+    supervisor), e guarda que nunca dispara continua sendo guarda.
+    """
+    from langgraph.graph import END
+
+    estado = {"iterations": graph_mod.MAX_ITERATIONS, "next": "sql_worker", "messages": []}
+    assert graph_mod.route(estado) == END        # nem com `next` válido ele deixa seguir
+    estado["iterations"] = graph_mod.MAX_ITERATIONS - 1
+    assert graph_mod.route(estado) == "sql_worker"
 
 
 async def test_ask_rejects_empty_question(ask_client):

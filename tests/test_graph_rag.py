@@ -158,12 +158,18 @@ async def test_rota_rag_worker_alimenta_o_synthesizer(ask_client, fake_graph):
     exemplo procurando só por `sql_worker`, como antes desta fatia) passaria verde —
     ele devolveria a frase do fake do mesmo jeito.
     """
-    f = fake_graph(["rag_worker", "END"])
+    f = fake_graph(["rag_worker"])
 
     r = await _perguntar(ask_client, "Infiltração por janela aberta é coberta?")
 
     assert r.status_code == 200
     assert r.json()["answer"] == FRASE
+
+    # UMA passada pelo supervisor: o rag_worker vai direto pro synthesizer, sem voltar
+    # a passar por ele. Com o ciclo antigo, este mesmo fake reroteava pro rag_worker até
+    # o circuit breaker — 4 embeddings pagos, 3 jogados fora.
+    assert r.json()["iterations"] == 1
+    assert f.client.messages.supervisor_calls == 1
 
     # A busca rodou uma vez, com a pergunta do usuário e SEM limiar: o corte é do nó,
     # pra que as distâncias descartadas continuem visíveis (ver test_corte_pelo_limiar).
@@ -191,6 +197,7 @@ async def test_unsupported_nao_gasta_nada_depois_da_decisao(ask_client, fake_gra
 
     assert r.status_code == 200
     assert r.json()["answer"] == graph_mod.FORA_DE_ESCOPO
+    assert r.json()["iterations"] == 1
     assert f.client.messages.calls == 1          # só o supervisor decidiu; nada além disso
     assert f.client.messages.synth_calls == 0
     assert f.buscas == []                        # nem a busca (que também é paga) rodou
@@ -202,7 +209,7 @@ async def test_busca_sem_hits_diz_que_nao_encontrou(ask_client, fake_graph):
     As duas frases são estáticas e as duas dispensam o LLM, o que as tornaria fáceis de
     confundir na implementação — daí a asserção explícita de que são diferentes.
     """
-    f = fake_graph(["rag_worker", "END"], hits=[])
+    f = fake_graph(["rag_worker"], hits=[])
 
     r = await _perguntar(ask_client, "Meteorito é coberto?")
 
@@ -230,7 +237,7 @@ async def test_corte_pelo_limiar_acontece_no_no(ask_client, fake_graph):
         text="Exclusão geral da apólice: danos por guerra.",
         distance=0.9,   # acima de MAX_DISTANCE_PADRAO
     )
-    f = fake_graph(["rag_worker", "END"], hits=[perto, longe])
+    f = fake_graph(["rag_worker"], hits=[perto, longe])
 
     r = await _perguntar(ask_client, "Infiltração por janela aberta é coberta?")
 
@@ -247,7 +254,7 @@ async def test_todos_acima_do_limiar_viram_nada_relevante(ask_client, fake_graph
         chunk_id=99, document_id=3, exclusion_id=1, coverage_id=None,
         text="Exclusão geral da apólice: danos por guerra.", distance=0.9,
     )
-    f = fake_graph(["rag_worker", "END"], hits=[longe])
+    f = fake_graph(["rag_worker"], hits=[longe])
 
     r = await _perguntar(ask_client, "Minha bicicleta foi roubada na rua?")
 
@@ -267,7 +274,7 @@ async def test_texto_do_hit_e_normalizado(ask_client, fake_graph):
         chunk_id=11, document_id=3, exclusion_id=42, coverage_id=None,
         text="Exclusão geral da apólice: danos por infiltração.\n\n", distance=0.21,
     )
-    fake_graph(["rag_worker", "END"], hits=[sujo])
+    fake_graph(["rag_worker"], hits=[sujo])
 
     r = await _perguntar(ask_client, "Infiltração é coberta?")
 
@@ -296,7 +303,7 @@ async def test_unsupported_tardio_nao_apaga_o_trabalho_ja_pago(ask_client, fake_
 
 async def test_erro_na_busca_vira_mensagem_e_nao_derruba_o_ask(ask_client, fake_graph):
     """Mesmo contrato do sql_worker: falha de infra vira texto no histórico, não 500."""
-    fake_graph(["rag_worker", "END"], erro="pgvector fora do ar")
+    fake_graph(["rag_worker"], erro="pgvector fora do ar")
 
     r = await _perguntar(ask_client, "Vendaval tem franquia?")
 

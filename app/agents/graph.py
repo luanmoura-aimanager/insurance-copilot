@@ -61,7 +61,10 @@ SUPERVISOR_SYSTEM = (
     "GERAIS de seguro residencial registradas na SUSEP. O corpus descreve PRODUTOS "
     "(o que cada seguradora cobre e exclui), não apólices de clientes — não há preço, "
     "nem dado de cliente, nem sinistro individual.\n\n"
-    "Sua função é rotear: olhe o histórico e escolha o próximo passo.\n\n"
+    "Sua função é CLASSIFICAR a pergunta, uma única vez, ANTES de qualquer trabalho: "
+    "quem responde depois é o worker que você escolher, e a resposta final é escrita "
+    "por outro nó. Você não volta a ser chamado — não há 'próximo passo' pra decidir "
+    "depois, e nada do que o worker devolver passa por você.\n\n"
     "  - sql_worker: perguntas de ESTRUTURA, que se respondem contando, filtrando ou "
     "comparando campos categóricos (seguradoras, coberturas, perigos, tipo de franquia). "
     "Ex.: 'quantas seguradoras cobrem vendaval?', 'quais coberturas não têm franquia?', "
@@ -72,11 +75,6 @@ SUPERVISOR_SYSTEM = (
     "  - unsupported: a pergunta é de OUTRO ASSUNTO — outro ramo de seguro (auto, vida, "
     "saúde, viagem), preço/cotação, ou nada a ver com seguro. Ex.: 'quanto custa meu "
     "seguro?', 'seguro de vida cobre suicídio?', 'qual a capital da França?'.\n"
-    "  - END: a pergunta já está respondida pelo resultado de um worker no histórico.\n\n"
-    "Se um worker JÁ RODOU e devolveu resultado — inclusive quando esse resultado é "
-    "'não encontrei nenhuma cláusula relevante' —, escolha END. Repetir o mesmo worker "
-    "com a mesma pergunta paga de novo pela mesma resposta; a regra de desempate abaixo "
-    "vale pra PRIMEIRA decisão, não pra insistir depois de já ter procurado.\n\n"
     "ATENÇÃO — o erro mais fácil de cometer aqui: uma pergunta cuja resposta é 'NÃO "
     "COBRE' continua sendo do escopo. 'Enchente é coberta?' se responde com a cláusula "
     "de exclusão de enchente, que existe no corpus. 'Não está coberto' é uma RESPOSTA, "
@@ -120,6 +118,12 @@ WORKERS = frozenset({"sql_worker", "rag_worker"})
 # --- 2. Supervisor decision: `next` é ENUM = o cinto de segurança ---
 class SupervisorDecision(BaseModel):
     # enum = o cinto: o modelo não consegue rotear pra um worker que não existe.
+    #
+    # `"END"` continua no enum mesmo tendo saído do prompt (o supervisor não encerra mais
+    # nada — os workers vão direto pro synthesizer). Ele fica como FAIL-SAFE: um modelo
+    # que devolvesse `END` num schema sem essa opção quebraria a validação e derrubaria
+    # o request; com ela, cai no mesmo caminho do valor inválido — synthesizer, que
+    # escreve `NO_ANSWER` porque não há resultado de worker nenhum.
     next: Literal["sql_worker", "rag_worker", "unsupported", "END"]
     reasoning: str                       # one line of why, for the message history
 
@@ -429,15 +433,21 @@ async def synthesizer(state: State) -> dict:
 
 # --- 5. Conditional edge: routes by reading State (with fail-closed fallback) ---
 def route(state: State) -> str:
+    # O circuit breaker FICA, e hoje é inalcançável pelo caminho normal: com os workers
+    # indo direto pro synthesizer, `route` roda uma vez só por request e `iterations`
+    # nunca passa de 1. Ele não é resto de código — é o que segura um ciclo reintroduzido
+    # por engano (uma aresta de worker apontando de volta pro supervisor volta a ser
+    # possível numa linha), e guarda que nunca dispara continua sendo guarda. O teste
+    # dele força `iterations` direto no State justamente por isso.
     if state["iterations"] >= MAX_ITERATIONS:  # mechanical guard: does not ask the LLM
         print("[route] circuit breaker -> END")
         return END
     nxt = state["next"]
     if nxt in WORKERS:
         return nxt
-    # "END" (decisão legítima de encerrar) e "unsupported" saem os dois pelo mesmo lugar:
-    # o synthesizer. A diferença entre eles é só a FRASE, e quem a escolhe é o
-    # synthesizer lendo `state["next"]` — route() decide o CAMINHO, não o texto.
+    # "END" (fail-safe do enum) e "unsupported" saem os dois pelo mesmo lugar: o
+    # synthesizer. A diferença entre eles é só a FRASE, e quem a escolhe é o synthesizer
+    # lendo `state["next"]` — route() decide o CAMINHO, não o texto.
     if nxt not in ("END", "unsupported"):  # suspenders: o enum deveria impedir, mas se escapar → END
         print(f"[route] invalid next '{nxt}' -> END (fail closed)")
     return END
@@ -451,16 +461,30 @@ builder.add_node("rag_worker", rag_worker)
 builder.add_node("synthesizer", synthesizer)
 
 builder.set_entry_point("supervisor")
-# Onde antes o route() ia direto pro END, agora passa pelo synthesizer — o mapa traduz
-# o valor devolvido pelo route (que continua sendo END) no nó de saída. `unsupported`
-# não aparece aqui de propósito: ele já virou END no route().
+# O route() devolve END pro que não é worker, e o mapa traduz esse END no nó de saída —
+# `unsupported` não aparece aqui de propósito, ele já virou END lá dentro.
 builder.add_conditional_edges("supervisor", route, {
     "sql_worker": "sql_worker",
     "rag_worker": "rag_worker",
     END: "synthesizer",
 })
-builder.add_edge("sql_worker", "supervisor")   # worker returns to the supervisor
-builder.add_edge("rag_worker", "supervisor")   # idem: o supervisor decide se já basta
+
+# **O grafo é SINGLE-HOP, e a terminação é ESTRUTURAL.** Os workers vão direto pro
+# synthesizer; nenhuma aresta volta pro supervisor. Antes voltavam, e a medição num
+# /ask real mostrou o preço: o supervisor re-classificava a pergunta a cada volta,
+# reroteava pro MESMO worker e só parava no circuit breaker — 10 chamadas de LLM onde
+# bastavam 3, 8.790 tokens de supervisor contra 4.204 do worker que fez o trabalho, e
+# na rota RAG 4 embeddings pagos com 3 jogados fora. A instrução de prompt "encerre se
+# um worker já respondeu" reduzia a chance disso, não o custo do caso ruim: pedir pro
+# modelo não repetir é mais frágil do que não lhe dar a chance.
+#
+# O que se perde é o multi-hop — uma pergunta composta ("quantas seguradoras cobrem
+# vendaval E o que a cláusula diz da franquia?") hoje é respondida por um worker só.
+# Isso é FATIA PRÓPRIA, e a razão de não voltar a aresta é justamente essa: multi-hop
+# exige uma regra de parada explícita (quem decide que já basta, e com base em quê),
+# e herdar o ciclo "de graça" é como se chegou às 10 chamadas.
+builder.add_edge("sql_worker", "synthesizer")
+builder.add_edge("rag_worker", "synthesizer")
 builder.add_edge("synthesizer", END)           # synthesizer é sempre o último nó
 
 graph = builder.compile()
