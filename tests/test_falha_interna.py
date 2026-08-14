@@ -408,6 +408,38 @@ async def test_falha_de_um_worker_nao_apaga_o_resultado_do_outro(synth_sem_custo
     assert synth_sem_custo.messages.synth_calls == 1
 
 
+async def test_rag_worker_contem_falha_depois_da_busca(monkeypatch):
+    """O `try` do `rag_worker` cobre o CORPO INTEIRO, não só a chamada de busca.
+
+    A busca é o degrau mais provável, não o único: o que vem depois dela também mexe em
+    dado que veio do banco. Um `Hit` com `distance=None` (nada no dataclass `frozen`
+    proíbe) estoura no filtro do limiar e no `f"{...:.3f}"` do `_formatar_hits` — depois do
+    `except`, se ele cobrisse só a busca. Aí a exceção escapa do nó, aborta o grafo e
+    devolve o 500 que esta fatia existe pra eliminar. Era a mesma assimetria que o
+    `sql_worker` corrigiu ao envolver o corpo todo, e o code review pegou que o irmão
+    tinha ficado pela metade.
+    """
+    from app.rag.search import Hit
+
+    monkeypatch.setattr("app.db.SessionLocal", lambda **kw: _FakeSession())
+
+    async def _busca(session, question, **kw):
+        return [
+            Hit(
+                chunk_id=1, document_id=1, exclusion_id=1, coverage_id=None,
+                text="cláusula", distance=None,   # a busca devolve, o resto quebra
+            )
+        ]
+
+    monkeypatch.setattr(graph_mod, "search_clauses", _busca)
+
+    out = await graph_mod.rag_worker(
+        {"iterations": 1, "next": "rag_worker", "messages": [HumanMessage(content="oi?")]}
+    )
+
+    assert out["messages"][0].name == graph_mod.WORKER_ERROR
+
+
 # --- A última porta: o texto de erro do `run_query` ---
 async def test_falha_de_conexao_no_run_query_nao_vaza(ask_client, fake_graph, monkeypatch):
     """`run_query` real, `_connect` quebrado: era o caminho que sobrava pro vazamento.
@@ -439,6 +471,51 @@ async def test_falha_de_conexao_no_run_query_nao_vaza(ask_client, fake_graph, mo
     # O worker gastou a chamada que gera o SQL (supervisor + worker), e o synthesizer não:
     # um erro de conexão não se parafraseia.
     assert f.client.messages.calls == 2
+
+
+@pytest.mark.parametrize(
+    "erro_nome,mensagem",
+    [
+        ("QueryCanceled", "canceling statement due to statement timeout"),
+        ("StatementTooComplex", "stack depth limit exceeded"),
+    ],
+)
+def test_operational_error_da_query_nao_e_incidente(monkeypatch, erro_nome, mensagem):
+    """`OperationalError` NÃO é sinônimo de infraestrutura, e esta é a exceção que importa.
+
+    `QueryCanceled` (57014, `statement_timeout`) e a classe 54 (`program_limit_exceeded`:
+    `StatementTooComplex`, `TooManyColumns`, `TooManyArguments`) são `OperationalError`
+    **causados pela query** — um cartesian join escrito pelo modelo num Postgres gerenciado,
+    que costuma vir com `statement_timeout` configurado, chega exatamente aqui. Se subissem
+    junto com as falhas de conexão, o operador seria paginado com traceback pra investigar
+    infra por causa de SQL ruim, e o worker perderia a chance de reportar o que houve.
+    Continuam voltando como texto — é o que `_ERROS_DA_QUERY` subtrai do `raise`.
+    """
+    from mcp_servers import postgres_mcp_server as mcp_mod
+
+    erro = getattr(mcp_mod.psycopg.errors, erro_nome)(mensagem)
+
+    class _Cursor:
+        def execute(self, sql):
+            raise erro
+
+    class _Conn:
+        closed = False
+
+        def cursor(self):
+            return _Cursor()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(mcp_mod, "_connect", lambda: _Conn())
+
+    saida = mcp_mod.run_query("SELECT * FROM coverage, peril, exclusion")
+
+    assert saida.startswith("Error executing query:")
+    assert mensagem in saida
+    # E o texto é seguro de repassar: nenhuma dessas mensagens carrega conninfo.
+    assert "password" not in saida
 
 
 def test_erro_de_query_continua_voltando_como_texto(monkeypatch):

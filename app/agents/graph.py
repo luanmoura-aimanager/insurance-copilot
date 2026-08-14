@@ -332,11 +332,14 @@ async def sql_worker(state: State) -> dict:
         tool_use = next(b for b in resp.content if b.type == "tool_use")
         sql = SqlQuery.model_validate(tool_use.input).sql
 
-        # 4. Executa pelo guard + role read-only. run_query nunca levanta: erros de SQL e
-        #    de conexão voltam como TEXTO (contrato do MCP server), então uma query que o
-        #    modelo escreveu errado continua sendo resultado de worker — e não falha de
-        #    infra — pro synthesizer. Síncrono também (mesma conexão psycopg3), então vai
-        #    pra thread igual ao get_schema.
+        # 4. Executa pelo guard + role read-only. Contrato do MCP server: erro de QUERY
+        #    volta como TEXTO (SQL inválido é resultado — o modelo errou, e o synthesizer
+        #    precisa poder dizer isso), erro de CONEXÃO **levanta** e cai no `except` deste
+        #    nó. Não confie na versão antiga desta linha ("run_query nunca levanta"): ela é
+        #    falsa desde que a divisão entrou, e o `except` largo abaixo depende do
+        #    contrário — tirá-lo acreditando nela devolve o 500 numa senha RO rotacionada.
+        #    Síncrono também (mesma conexão psycopg3), então vai pra thread igual ao
+        #    get_schema.
         rows = await asyncio.to_thread(run_query, sql)
     except Exception:  # noqa: BLE001 — nada sobe daqui: ver _falha_de_worker
         return _falha_de_worker("sql_worker")
@@ -402,43 +405,49 @@ async def rag_worker(state: State) -> dict:
     # `monkeypatch.setattr("app.db.SessionLocal", ...)` dos testes pegar.
     from app.db import SessionLocal
 
+    # O corpo INTEIRO no try, como no sql_worker, e pelo mesmo motivo: qualquer exceção que
+    # escape de um nó do LangGraph aborta o grafo e devolve 500. A busca é só o degrau mais
+    # provável — o que vem depois dela também toca dado que vem do banco (`h.distance` num
+    # `f"{...:.3f}"` estoura com TypeError se algum dia vier `None`, e nada no dataclass
+    # `Hit` proíbe isso), e não há razão pra um nó ter duas políticas de erro. Cobrir só a
+    # busca era exatamente a assimetria que o sql_worker corrigiu.
     try:
         async with SessionLocal() as session:
             hits = await search_clauses(session, question, k=RAG_K)
+
+        relevantes = [h for h in hits if h.distance <= MAX_DISTANCE_PADRAO]
+        print(
+            f"[rag_worker] {len(relevantes)}/{len(hits)} cláusula(s) dentro do limiar "
+            f"{MAX_DISTANCE_PADRAO}"
+        )
+        if not relevantes:
+            if hits:
+                # O único registro de quanto faltou. Enquanto o limiar não for calibrado,
+                # é este número que diz se ele está apertado demais ou se a pergunta era
+                # mesmo de outro mundo.
+                logger.info(
+                    "busca RAG sem hits: melhor distância %.3f > limiar %.2f",
+                    hits[0].distance,
+                    MAX_DISTANCE_PADRAO,
+                )
+            # Mensagem EXPLÍCITA, nunca string vazia: uma mensagem em branco no histórico é
+            # indistinguível de "o worker não rodou", e o synthesizer cairia no NO_ANSWER
+            # ("falhei") em vez de dizer a verdade ("procurei e não achei").
+            return {"messages": [AIMessage(content=NADA_RELEVANTE, name="rag_worker")]}
+        return {
+            "messages": [
+                AIMessage(
+                    content=f"Cláusulas recuperadas:\n{_formatar_hits(relevantes)}",
+                    name="rag_worker",
+                )
+            ]
+        }
     except Exception:  # noqa: BLE001 — mesmo contrato do sql_worker: erro vira mensagem
         # Falha de infra vira mensagem MARCADA (o grafo não estoura no meio de um request
         # que já pode ter gasto em outros nós), e o texto da exceção fica no log. Aqui ele
         # era especialmente ruim de vazar: uma `voyageai.error.AuthenticationError` fala
         # de chave de API, e um erro de conexão do asyncpg fala do host do Postgres.
         return _falha_de_worker("rag_worker")
-
-    relevantes = [h for h in hits if h.distance <= MAX_DISTANCE_PADRAO]
-    print(
-        f"[rag_worker] {len(relevantes)}/{len(hits)} cláusula(s) dentro do limiar "
-        f"{MAX_DISTANCE_PADRAO}"
-    )
-    if not relevantes:
-        if hits:
-            # O único registro de quanto faltou. Enquanto o limiar não for calibrado,
-            # é este número que diz se ele está apertado demais ou se a pergunta era
-            # mesmo de outro mundo.
-            logger.info(
-                "busca RAG sem hits: melhor distância %.3f > limiar %.2f",
-                hits[0].distance,
-                MAX_DISTANCE_PADRAO,
-            )
-        # Mensagem EXPLÍCITA, nunca string vazia: uma mensagem em branco no histórico é
-        # indistinguível de "o worker não rodou", e o synthesizer cairia no NO_ANSWER
-        # ("falhei") em vez de dizer a verdade ("procurei e não achei").
-        return {"messages": [AIMessage(content=NADA_RELEVANTE, name="rag_worker")]}
-    return {
-        "messages": [
-            AIMessage(
-                content=f"Cláusulas recuperadas:\n{_formatar_hits(relevantes)}",
-                name="rag_worker",
-            )
-        ]
-    }
 
 
 # --- 4.5 Synthesizer: último nó SEMPRE. Vira o resultado cru em frase. ---

@@ -52,7 +52,11 @@ def test_migration_in_process_nao_mexe_no_logging_do_pytest(db_url):
     from alembic import command
     from alembic.config import Config
 
-    sentinela = logging.Handler()
+    # `NullHandler`, não `Handler()`: `Handler.emit` é abstrato e levanta
+    # NotImplementedError, então o sentinela viraria um erro de teste no dia em que
+    # qualquer coisa emitisse pra raiz durante o upgrade (hoje não emite só porque a raiz
+    # está em WARNING e o upgrade no-op loga em INFO — `--log-level=INFO` já bastaria).
+    sentinela = logging.NullHandler()
     logging.getLogger().addHandler(sentinela)
     try:
         cfg = Config("alembic.ini")

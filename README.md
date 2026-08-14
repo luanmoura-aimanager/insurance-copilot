@@ -257,11 +257,16 @@ including pytest's own collection phase, before the container existed.
 `tests/test_lazy_db.py` pins that: it imports `app.main` in a subprocess with a
 scrubbed environment and asserts it exits 0.
 
-One trap, if you write a test that asserts on log output: Alembic's `env.py` passes
-`disable_existing_loggers=False` to `fileConfig` on purpose. The migrations run **inside**
-the pytest process, and `fileConfig`'s default disables every logger created so far — so
-without that flag, any `caplog` assertion in a test that runs after the container boots
-silently sees nothing and passes.
+One trap, if you write a test that asserts on log output — or if you add another
+in-process `command.upgrade` call: the migrations run **inside** the pytest process, and
+configuring logging is a process-global act. `alembic/env.py` therefore skips `fileConfig`
+entirely when the caller passes `configure_logger=False` in the Config's `attributes`,
+which is what `tests/conftest.py` does. Both of `fileConfig`'s defaults are hostile here:
+it disables every logger created so far, **and** it replaces the root handlers — where
+pytest's `caplog` handler lives. Either one makes a log assertion silently see nothing
+and pass. (`env.py` also passes `disable_existing_loggers=False` as a net for callers that
+don't know about the flag, but that alone does not cover the root-handler half.)
+`tests/test_migration.py` pins both properties.
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on every pull request
 and on pushes to `main`: Python 3.11, `pip install -r requirements.txt`, `pytest -q`.

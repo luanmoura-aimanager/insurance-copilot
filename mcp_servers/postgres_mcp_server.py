@@ -37,6 +37,25 @@ _CTE_RE = re.compile(
 )
 
 
+# `OperationalError` cuja CAUSA é a query, não a infraestrutura — a exceção à regra do
+# `except` do run_query, e ela existe porque a hierarquia do psycopg não separa as duas
+# coisas. `statement_timeout` (57014) e a classe 54 inteira (`program_limit_exceeded`:
+# query complexa demais, colunas/argumentos demais) são resultado direto do SQL que o
+# modelo escreveu — um cartesian join num Postgres gerenciado, que costuma vir com
+# `statement_timeout` configurado, chega aqui. Tratá-las como incidente pagaria o operador
+# pra investigar infra por causa de uma query ruim, e tiraria do worker a chance de
+# reportar o que aconteceu. Ficam de fora de propósito a classe 53
+# (`insufficient_resources`: disk full, out of memory) e o resto da 57 (`admin_shutdown`,
+# `crash_shutdown`): mesmo quando uma query pesada os provoca, o operador quer saber.
+_ERROS_DA_QUERY = (
+    psycopg.errors.QueryCanceled,          # 57014 — statement_timeout / cancel
+    psycopg.errors.ProgramLimitExceeded,   # 54000
+    psycopg.errors.StatementTooComplex,    # 54001
+    psycopg.errors.TooManyColumns,         # 54011
+    psycopg.errors.TooManyArguments,       # 54023
+)
+
+
 def _conninfo() -> str:
     """String de conexão libpq. Prefere a role read-only (`DATABASE_URL_RO`) quando
     presente — é a garantia real de segurança: mesmo se o filtro de texto do run_query
@@ -170,10 +189,11 @@ def run_query(sql: str) -> str:
         cursor.execute(body)
         columns = [desc[0] for desc in cursor.description]
         rows = cursor.fetchall()
-    except psycopg.OperationalError:
-        # **Falha de INFRAESTRUTURA sobe.** Antes ela voltava como texto igual a um erro de
-        # query, e isso era o último caminho por onde detalhe de infra chegava ao usuário:
-        # a mensagem de uma `OperationalError` de conexão é
+    except psycopg.Error as exc:
+        # **Falha de INFRAESTRUTURA sobe; erro de QUERY continua voltando como texto.**
+        #
+        # Antes tudo voltava como texto, e isso era o último caminho por onde detalhe de
+        # infra chegava ao usuário: a mensagem de uma `OperationalError` de conexão é
         # `connection to server at "host" (ip), port 5432 failed: password authentication
         # failed for user "insurance_ro"` — host, porta, usuário e banco. Como o texto ia
         # como RESULTADO do worker, entrava no prompt do synthesizer e, no fallback dele
@@ -186,19 +206,21 @@ def run_query(sql: str) -> str:
         # `logger.exception` com `request_id`/`client`. Também economiza a chamada de LLM
         # que o synthesizer gastaria pra parafrasear um erro de conexão.
         #
-        # A divisão é a do próprio psycopg, e ela cai exatamente onde precisa: tudo que o
-        # LLM consegue causar (`SyntaxError`, `UndefinedColumn`, `UndefinedTable`,
-        # `InsufficientPrivilege`) é `ProgrammingError` e continua voltando como texto;
-        # `OperationalError` é banco inalcançável, conexão derrubada no meio, shutdown,
-        # statement timeout — nenhum deles é resposta a uma pergunta.
+        # O texto continua sendo o certo pro erro de QUERY, e é o ponto de "run_query nunca
+        # levanta" que de fato importava: o LLM escreveu SQL inválido, e o worker precisa
+        # poder contar isso ao synthesizer em vez de estourar. Tudo que o modelo causa por
+        # ESCREVER errado é `ProgrammingError` (`SyntaxError`, `UndefinedColumn`,
+        # `UndefinedTable`, `InsufficientPrivilege`) — mas **`OperationalError` não é
+        # sinônimo de infraestrutura**, e é por isso que `_ERROS_DA_QUERY` existe: uma query
+        # que estoura o `statement_timeout` ou os limites de complexidade também cai lá, e
+        # tratá-la como incidente pagaria o operador pra investigar um runaway query.
+        # `sqlstate` é `None` numa falha de conexão (não há resposta do servidor), o que é
+        # justamente o caso que tem que subir.
         #
         # No servidor stdio isso vira erro de tool em vez de texto de resultado, o que é
         # honesto: "o banco está fora" não é o resultado de uma query.
-        raise
-    except psycopg.Error as exc:
-        # Erro de QUERY continua sendo texto, e é o ponto de "run_query nunca levanta" que
-        # de fato importava: o LLM escreveu SQL inválido, o worker precisa poder dizer isso
-        # ao synthesizer em vez de estourar. Nenhuma dessas mensagens carrega conninfo.
+        if isinstance(exc, psycopg.OperationalError) and not isinstance(exc, _ERROS_DA_QUERY):
+            raise
         return f"Error executing query: {exc}"
     finally:
         if conn is not None and not conn.closed:
