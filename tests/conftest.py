@@ -58,8 +58,17 @@ def db_url():
         async_url = pg.get_connection_url().replace("+psycopg2", "+asyncpg")
         os.environ["DATABASE_URL"] = async_url  # env.py reads this (and swaps to sync for Alembic)
 
-        # apply the real migrations against the clean container — this also exercises them
-        command.upgrade(Config("alembic.ini"), "head")
+        # apply the real migrations against the clean container — this also exercises them.
+        #
+        # `configure_logger=False` é lido pelo `alembic/env.py` e é o que impede a migration
+        # de RECONFIGURAR O LOGGING DO PYTEST: rodando in-process, o `fileConfig` do env.py
+        # desligava todos os loggers já criados (`disable_existing_loggers`) e substituía os
+        # handlers da raiz — onde vive o `LogCaptureHandler` que alimenta o `caplog`. Nos
+        # dois casos o sintoma é o mesmo e é o pior possível: teste de log que passa sem ver
+        # log nenhum. Ver o comentário longo em `alembic/env.py`.
+        cfg = Config("alembic.ini")
+        cfg.attributes["configure_logger"] = False
+        command.upgrade(cfg, "head")
 
         yield async_url
     # container is torn down here, at the end of the whole session

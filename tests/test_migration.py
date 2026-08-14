@@ -24,3 +24,46 @@ async def test_migration_created_all_tables(db_session):
     )
     tables = {row[0] for row in result}
     assert EXPECTED_TABLES <= tables
+
+
+def test_migration_in_process_nao_mexe_no_logging_do_pytest(db_url):
+    """A migration roda DENTRO do processo do pytest — e não pode reconfigurar o logging.
+
+    `fileConfig`, em `alembic/env.py`, é ação global no processo, e com os defaults faz
+    duas estragas independentes: (1) marca `disabled = True` em todo logger já criado
+    (`disable_existing_loggers`), e (2) SUBSTITUI os handlers da raiz, por causa do
+    `[logger_root] handlers = console` do alembic.ini — e é exatamente na raiz que vive o
+    `LogCaptureHandler` que alimenta o `caplog`, pelo tempo de cada teste.
+
+    O sintoma das duas é o mesmo, e é o pior possível: teste de log que passa sem ver log
+    nenhum. Quem paga a conta é `tests/test_falha_interna.py`, o único lugar que prova que
+    uma falha de worker deixa traceback com `request_id`/`client` pro operador — a ÚNICA
+    descrição do incidente, já que o usuário recebe uma frase genérica. A estraga (1) já
+    aconteceu de verdade (os testes de log passavam sozinhos e falhavam na suíte completa);
+    a (2) hoje não morde só porque o container sobe num teste que não usa `caplog`, o que
+    é ordem alfabética de arquivo, não garantia.
+
+    A defesa é o `configure_logger=False` que `tests/conftest.py` passa nos `attributes` da
+    Config e o `env.py` respeita. Este teste repete a mesma chamada (o `upgrade` é no-op,
+    o banco já está na head) e afirma as duas propriedades; sem a flag, fica vermelho.
+    """
+    import logging
+
+    from alembic import command
+    from alembic.config import Config
+
+    # `NullHandler`, não `Handler()`: `Handler.emit` é abstrato e levanta
+    # NotImplementedError, então o sentinela viraria um erro de teste no dia em que
+    # qualquer coisa emitisse pra raiz durante o upgrade (hoje não emite só porque a raiz
+    # está em WARNING e o upgrade no-op loga em INFO — `--log-level=INFO` já bastaria).
+    sentinela = logging.NullHandler()
+    logging.getLogger().addHandler(sentinela)
+    try:
+        cfg = Config("alembic.ini")
+        cfg.attributes["configure_logger"] = False
+        command.upgrade(cfg, "head")
+
+        assert sentinela in logging.getLogger().handlers, "os handlers da raiz foram trocados"
+        assert not logging.getLogger("app.agents.graph").disabled, "logger do app desligado"
+    finally:
+        logging.getLogger().removeHandler(sentinela)

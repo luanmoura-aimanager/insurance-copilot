@@ -10,6 +10,7 @@ caso da outra: o REVOKE não participa quando `DATABASE_URL_RO` não está confi
 o `_conninfo()` cai pro DATABASE_URL admin; a allowlist não impediria uma role com
 permissão de escrita de fazer estrago se o filtro de SELECT fosse burlado.
 """
+import psycopg
 import pytest
 
 from mcp_servers.postgres_mcp_server import TABLES, run_query
@@ -53,9 +54,14 @@ def test_rejeita_tabela_fora_do_dominio(sql, proibida):
         "SELECT c.coverage_name FROM coverage c "
         "JOIN coverage_peril cp ON cp.coverage_id = c.id "
         "JOIN peril p ON p.id = cp.peril_id",
-        # CTE: `x` é referenciável mas não é tabela — não pode ser confundido com uma
-        # tabela proibida, senão a allowlist quebraria queries legítimas.
-        "WITH x AS (SELECT id FROM coverage) SELECT count(*) FROM x",
+        # CTE dentro de subquery: `y` é referenciável mas não é tabela — não pode ser
+        # confundido com uma tabela proibida, senão a allowlist quebraria queries legítimas.
+        #
+        # É esta forma, e não `WITH x AS (...) SELECT ...`, que exercita o `_CTE_RE`: a
+        # versão de topo nunca chega à allowlist (é barrada antes por não começar com
+        # SELECT — ver test_cte_de_topo_e_rejeitada_pelo_filtro_de_select), então ela
+        # passava neste teste sem provar nada sobre CTE nenhuma.
+        "SELECT * FROM (WITH y AS (SELECT id FROM coverage) SELECT id FROM y) z",
         # Subquery no FROM: o alias `sub` também não é tabela.
         "SELECT count(*) FROM (SELECT id FROM exclusion) AS sub",
     ],
@@ -66,11 +72,38 @@ def test_aceita_as_tabelas_do_dominio(sql, monkeypatch):
     Sem este lado, `return "Error"` incondicional passaria nos testes de rejeição e
     derrubaria o worker inteiro em silêncio. Não há banco aqui, então o que se afirma é
     que a query **passou da allowlist** — a execução falha depois, no connect.
+
+    E falhar no connect agora significa `OperationalError` SUBINDO, não voltando como
+    texto: falha de infraestrutura deixou de ser resultado de query (ver o `except` do
+    `run_query`), justamente pra não vazar host/porta/usuário pela resposta do `/ask`.
+    Chegar até lá é a prova que este teste procura, então a exceção conta como sucesso.
     """
     monkeypatch.delenv("DATABASE_URL_RO", raising=False)
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@127.0.0.1:1/none")
-    resultado = run_query(sql)
+    try:
+        resultado = run_query(sql)
+    except psycopg.OperationalError:
+        return   # passou da allowlist e morreu no connect — que é o esperado sem banco
+    # As queries que não chegam ao connect (a CTE, barrada antes por não começar com
+    # SELECT) caem aqui, e o que vale pra elas é a mesma coisa: não foi a allowlist.
     assert not resultado.startswith("Error: table(s) not allowed")
+
+
+def test_cte_de_topo_e_rejeitada_pelo_filtro_de_select():
+    """LIMITAÇÃO CONHECIDA, registrada: o worker SQL não pode usar `WITH ... SELECT`.
+
+    O filtro 2 exige que a query COMECE com `select`, então uma CTE de topo morre ali —
+    não na allowlist. Isso não é acidente que dá pra "consertar" removendo o filtro: no
+    Postgres, `WITH x AS (...) DELETE FROM ...` é válido, então é justamente o
+    `startswith("select")` que impede escrita disfarçada de CTE. Liberar `WITH` exige que
+    a checagem de escrita passe a olhar o statement final, e isso é fatia própria.
+
+    O teste existe porque a alternativa é pior: a CTE de topo estava na lista de queries
+    "aprovadas" (passando pelo motivo errado — a asserção era só "não foi a allowlist"),
+    e a doc anunciava suporte a CTE. Agora o comportamento real está fixado por teste.
+    """
+    resultado = run_query("WITH x AS (SELECT id FROM coverage) SELECT count(*) FROM x")
+    assert resultado == "Error: only SELECT queries are allowed."
 
 
 def test_filtros_anteriores_continuam_valendo():

@@ -44,6 +44,17 @@ def _final_answer(state: dict) -> str:
     o que não roda worker nenhum), então a resposta é literalmente a última mensagem.
     O NO_ANSWER aqui é só cinto: se o histórico vier com outra coisa no fim, não
     devolvemos o raciocínio interno de um agente como se fosse resposta.
+
+    **Falha de worker também sai 200, com a frase `FALHA_INTERNA`.** A superfície deste
+    sistema é conversa (hoje `/ask`, amanhã WhatsApp): um 5xx entrega ao usuário uma tela
+    de erro do framework ou um balão vazio — ele fica sem resposta E sem saber se vale
+    tentar de novo. Uma frase que diz "falhei do meu lado, tente em instantes" é a
+    informação que ele pode usar. O que o STATUS resolveria — alarme, dashboard,
+    investigação — é necessidade do operador, e o operador é servido pelo LOG: cada uma
+    dessas respostas tem um `logger.exception` com traceback, `request_id` e `client`
+    (ver `_falha_de_worker` em `app/agents/graph.py`), que é estritamente mais do que um
+    500 opaco carregaria. Trocar o diagnóstico do operador pela resposta do usuário seria
+    piorar os dois lados.
     """
     last = state["messages"][-1]
     if isinstance(last, AIMessage) and last.name == "final":

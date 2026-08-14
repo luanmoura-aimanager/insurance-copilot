@@ -324,36 +324,26 @@ async def test_unsupported_nao_apaga_resultado_de_worker_no_historico(monkeypatc
     assert client.messages.synth_calls == 1   # o resultado foi sintetizado, não descartado
 
 
-async def test_erro_na_busca_vira_mensagem_e_nao_derruba_o_ask(ask_client, fake_graph):
-    """Mesmo contrato do sql_worker: falha de infra vira texto no histórico, não 500."""
-    fake_graph(["rag_worker"], erro="pgvector fora do ar")
+async def test_erro_na_busca_nao_derruba_o_ask(ask_client, fake_graph):
+    """Falha de infra vira mensagem MARCADA no histórico, não 500 — e não vira resposta.
+
+    Só o contrato mínimo fica aqui: 200, e nem a busca nem a exceção viram texto pro
+    usuário. O resto do caminho de falha (a frase FALHA_INTERNA, o traceback com
+    `request_id`/`client`, a ausência do texto da exceção na resposta, e a ordem entre as
+    quatro frases quando elas competem) mora em `tests/test_falha_interna.py`.
+
+    Até esta fatia, este teste afirmava o contrário do que afirma agora: o `rag_worker`
+    devolvia `f"RAG error: {exc}"` como se fosse resultado e o synthesizer sintetizava
+    *o erro*, o que fazia detalhe de infraestrutura chegar ao usuário parafraseado.
+    """
+    f = fake_graph(["rag_worker"], erro="pgvector fora do ar")
 
     r = await _perguntar(ask_client, "Vendaval tem franquia?")
 
     assert r.status_code == 200
-    assert r.json()["answer"] == FRASE   # o synthesizer sintetiza até o erro; ninguém quebra
-
-
-async def test_erro_sem_mensagem_nao_termina_em_espaco(monkeypatch):
-    """`raise SomeError()` produziria "RAG error: " — espaço no fim, 400 na volta.
-
-    É o mesmo guard do texto do hit entrando pela porta de trás: seria uma falha de
-    infra diagnosticável virando um 500 opaco no `/ask`, justamente no caminho de erro.
-    """
-    monkeypatch.setattr("app.db.SessionLocal", lambda **kw: _FakeSession())
-
-    async def _explode(session, question, **kw):
-        raise RuntimeError()   # sem mensagem, de propósito
-
-    monkeypatch.setattr(graph_mod, "search_clauses", _explode)
-
-    out = await graph_mod.rag_worker(
-        {"iterations": 1, "next": "rag_worker", "messages": [HumanMessage(content="oi?")]}
-    )
-
-    conteudo = out["messages"][0].content
-    assert conteudo == conteudo.rstrip()
-    assert conteudo == "RAG error:"
+    assert r.json()["answer"] == graph_mod.FALHA_INTERNA
+    assert "pgvector" not in r.text
+    assert f.client.messages.synth_calls == 0   # não se sintetiza (nem se paga por) um erro
 
 
 def test_route_fail_closed_continua_indo_pro_synthesizer():
