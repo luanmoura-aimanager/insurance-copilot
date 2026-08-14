@@ -10,6 +10,7 @@ caso da outra: o REVOKE não participa quando `DATABASE_URL_RO` não está confi
 o `_conninfo()` cai pro DATABASE_URL admin; a allowlist não impediria uma role com
 permissão de escrita de fazer estrago se o filtro de SELECT fosse burlado.
 """
+import psycopg
 import pytest
 
 from mcp_servers.postgres_mcp_server import TABLES, run_query
@@ -66,10 +67,20 @@ def test_aceita_as_tabelas_do_dominio(sql, monkeypatch):
     Sem este lado, `return "Error"` incondicional passaria nos testes de rejeição e
     derrubaria o worker inteiro em silêncio. Não há banco aqui, então o que se afirma é
     que a query **passou da allowlist** — a execução falha depois, no connect.
+
+    E falhar no connect agora significa `OperationalError` SUBINDO, não voltando como
+    texto: falha de infraestrutura deixou de ser resultado de query (ver o `except` do
+    `run_query`), justamente pra não vazar host/porta/usuário pela resposta do `/ask`.
+    Chegar até lá é a prova que este teste procura, então a exceção conta como sucesso.
     """
     monkeypatch.delenv("DATABASE_URL_RO", raising=False)
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@127.0.0.1:1/none")
-    resultado = run_query(sql)
+    try:
+        resultado = run_query(sql)
+    except psycopg.OperationalError:
+        return   # passou da allowlist e morreu no connect — que é o esperado sem banco
+    # As queries que não chegam ao connect (a CTE, barrada antes por não começar com
+    # SELECT) caem aqui, e o que vale pra elas é a mesma coisa: não foi a allowlist.
     assert not resultado.startswith("Error: table(s) not allowed")
 
 

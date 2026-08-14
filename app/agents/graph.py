@@ -26,22 +26,29 @@ SYNTHESIZER_MODEL = "claude-haiku-4-5"  # transformar linha de resultado em fras
 # e pouco o bastante pra caber no contexto do synthesizer sem virar despejo de texto.
 RAG_K = 5
 
-# --- As TRÊS frases finais possíveis, e elas NÃO são intercambiáveis ---
+# --- As QUATRO frases finais possíveis, e elas NÃO são intercambiáveis ---
 #
 # Cada uma responde a uma pergunta diferente do usuário sobre o que aconteceu, e trocá-las
 # entre si é mentir de um jeito plausível:
 #
 #   NO_ANSWER      "eu deveria conseguir, mas falhei"  — nenhum worker chegou a produzir
-#                  resultado. Com o grafo single-hop isso só acontece se o supervisor
-#                  devolver `END` ou um valor inválido, ou se o circuit breaker cortar
-#                  (hoje inalcançável). É um problema NOSSO, e dá pra tentar de novo.
+#                  resultado, e nada estourou. Com o grafo single-hop isso só acontece se
+#                  o supervisor devolver `END` ou um valor inválido, ou se o circuit
+#                  breaker cortar (hoje inalcançável). É um problema NOSSO de ROTEAMENTO,
+#                  e dá pra tentar de novo.
 #   NADA_RELEVANTE "eu procurei e o corpus não tem"    — a busca rodou e todos os vizinhos
 #                  ficaram acima do limiar de relevância. É um fato sobre o CORPUS.
 #   FORA_DE_ESCOPO "eu não trato desse assunto"        — o supervisor classificou a
 #                  pergunta como de outro domínio, antes de gastar qualquer busca. É um
 #                  fato sobre o SISTEMA, e reformular a pergunta não muda nada.
+#   FALHA_INTERNA  "algo quebrou do nosso lado"        — um worker levantou exceção (banco
+#                  fora do ar, API de embedding recusando, payload malformado). É um fato
+#                  sobre a INFRAESTRUTURA: nada a ver com a pergunta, e tentar de novo
+#                  mais tarde é a única ação útil do lado do usuário. A diferença prática
+#                  com NO_ANSWER é o que o operador tem pra investigar — a FALHA_INTERNA
+#                  sempre tem um traceback correspondente no log, o NO_ANSWER não.
 #
-# As três moram aqui, e não na API, porque quem escreve a resposta final é o synthesizer
+# As quatro moram aqui, e não na API, porque quem escreve a resposta final é o synthesizer
 # — o /ask só lê a última mensagem.
 NO_ANSWER = "Não consegui responder essa pergunta com os dados disponíveis."
 NADA_RELEVANTE = (
@@ -51,6 +58,20 @@ FORA_DE_ESCOPO = (
     "Só respondo perguntas sobre as condições gerais de seguro residencial — coberturas, "
     "perigos cobertos, exclusões e franquias."
 )
+FALHA_INTERNA = (
+    "Tive uma falha interna ao consultar as condições gerais. Tente de novo em alguns "
+    "instantes."
+)
+
+# O nome da mensagem que MARCA uma falha de worker, e é a marca ser o `name` que importa:
+# a alternativa era um prefixo mágico no conteúdo (`"SQL error: ..."`, como era antes), e
+# aí quem lê a mensagem tem que reconhecer a string — um `startswith` frágil que uma
+# cláusula recuperada com o texto errado poderia acionar por acidente, e que se perde na
+# primeira vez que alguém reescreve a frase. O `name` é campo estruturado da própria
+# AIMessage: não colide com conteúdo nenhum e é o mesmo mecanismo que já distingue
+# `sql_worker`/`rag_worker`/`final`. Fica FORA de `WORKERS` de propósito — uma falha não é
+# resultado de worker, e é justamente essa distinção que o synthesizer lê.
+WORKER_ERROR = "worker_error"
 
 # Structured output canônico (mesmo padrão da extração de seguros): expõe UM tool
 # cujo input_schema é o JSON Schema do Pydantic e força tool_choice pra ele. O modelo
@@ -170,6 +191,44 @@ async def _record_cost(agent_name: str, resp) -> None:
         logger.warning("falha ao gravar custo de %s: %s", agent_name, exc)
 
 
+# --- 2.6 Falha de worker: traceback pro operador, frase genérica pro usuário ---
+def _falha_de_worker(worker: str) -> dict:
+    """Registra a exceção corrente e devolve a mensagem MARCADA como falha.
+
+    Chamar só de dentro de um `except`: `logger.exception` é o que anexa o traceback,
+    e é ele que faz o log valer a pena — o texto da exceção não vai a lugar nenhum além
+    daqui.
+
+    **Nada da exceção entra no conteúdo da mensagem, e isso é o ponto da função.** Antes,
+    os dois workers devolviam `f"SQL error: {exc}"` / `f"RAG error: {exc}"`, e esse texto
+    seguia como qualquer outro resultado: ia pro prompt do synthesizer (que podia
+    parafraseá-lo de volta pro usuário) e, no caminho de degradação do synthesizer
+    (`frase or resultado`), virava *literalmente* a resposta do `/ask`. O que vazava por
+    ali não era ruído inofensivo — `psycopg.OperationalError` carrega host, porta, usuário
+    e nome de banco, e um erro de driver carrega caminhos internos. Detalhe de
+    infraestrutura é informação do OPERADOR, e o canal do operador é o log.
+
+    `request_id`/`client` vêm dos ContextVars e são as MESMAS chaves de `cost_event`: é o
+    que liga este traceback às linhas de custo daquele `/ask` (e à pergunta, e ao cliente).
+    Sem elas, com dois requests concorrentes, sobra um traceback solto — e como o usuário
+    recebe uma frase genérica, este log é a ÚNICA descrição do que aconteceu.
+    """
+    logger.exception(
+        "%s falhou — devolvendo falha interna. request_id=%s client=%s",
+        worker,
+        get_request_id(),
+        get_client_name(),
+    )
+    # O conteúdo é genérico de propósito (o synthesizer nem o lê: ele curto-circuita pela
+    # marca do `name`), mas nomeia o worker, porque quem lê o histórico do grafo num trace
+    # precisa saber QUAL nó caiu — e o nome do nó não é dado da exceção.
+    return {
+        "messages": [
+            AIMessage(content=f"{worker}: falha interna.", name=WORKER_ERROR)
+        ]
+    }
+
+
 # --- 3. Supervisor node: decide de verdade, via LLM com structured output ---
 async def supervisor(state: State) -> dict:
     i = state["iterations"] + 1
@@ -233,49 +292,54 @@ async def sql_worker(state: State) -> dict:
         "",
     )
 
-    # 2. Schema numa chamada só — dá os nomes de tabela/coluna pro modelo. Se a conexão
-    #    falhar aqui, curto-circuita: sem schema não dá pra gerar SQL, então volta o erro
-    #    como mensagem (que o synthesizer lê) em vez de estourar o grafo.
-    #    get_schema é psycopg3 SÍNCRONO: roda numa thread pra não travar o event loop.
+    # O nó INTEIRO roda dentro do try, não só o `get_schema`: qualquer degrau daqui pra
+    # baixo pode estourar (conexão de banco, API da Anthropic fora, resposta sem bloco
+    # `tool_use`, payload que não valida) e nenhum deles pode subir. Uma exceção que
+    # escapa de um nó do LangGraph aborta o grafo, e o `/ask` responde 500 — sem resposta
+    # nenhuma pro usuário, e num request que já pode ter pago o supervisor.
     try:
+        # 2. Schema numa chamada só — dá os nomes de tabela/coluna pro modelo.
+        #    get_schema é psycopg3 SÍNCRONO: roda numa thread pra não travar o event loop.
         schema = await asyncio.to_thread(get_schema)
-    except Exception as exc:  # noqa: BLE001 — qualquer falha de DB vira mensagem, não crash
-        return {"messages": [AIMessage(content=f"SQL error (schema): {exc}", name="sql_worker")]}
 
-    # 3. LLM gera UMA query, via structured output (devolve {"sql": "..."}).
-    client = get_async_client()
-    resp = await client.messages.create(
-        model=SQL_MODEL,
-        max_tokens=1024,
-        system=SQL_SYSTEM,
-        tools=[
-            {
-                "name": _SQL_TOOL,
-                "description": "Emite a query SQL que responde a pergunta.",
-                "input_schema": SqlQuery.model_json_schema(),
-            }
-        ],
-        tool_choice={"type": "tool", "name": _SQL_TOOL},
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    f"Schema:\n{schema}\n"
-                    f"Pergunta: {question}\n\n"
-                    "Gere o SELECT que a responde."
-                ),
-            }
-        ],
-    )
-    await _record_cost("sql_worker", resp)
+        # 3. LLM gera UMA query, via structured output (devolve {"sql": "..."}).
+        client = get_async_client()
+        resp = await client.messages.create(
+            model=SQL_MODEL,
+            max_tokens=1024,
+            system=SQL_SYSTEM,
+            tools=[
+                {
+                    "name": _SQL_TOOL,
+                    "description": "Emite a query SQL que responde a pergunta.",
+                    "input_schema": SqlQuery.model_json_schema(),
+                }
+            ],
+            tool_choice={"type": "tool", "name": _SQL_TOOL},
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        f"Schema:\n{schema}\n"
+                        f"Pergunta: {question}\n\n"
+                        "Gere o SELECT que a responde."
+                    ),
+                }
+            ],
+        )
+        await _record_cost("sql_worker", resp)
 
-    tool_use = next(b for b in resp.content if b.type == "tool_use")
-    sql = SqlQuery.model_validate(tool_use.input).sql
+        tool_use = next(b for b in resp.content if b.type == "tool_use")
+        sql = SqlQuery.model_validate(tool_use.input).sql
 
-    # 4. Executa pelo guard + role read-only. run_query nunca levanta: erros voltam como
-    #    texto, então o supervisor os enxerga em vez do grafo estourar. Síncrono também
-    #    (mesma conexão psycopg3), então vai pra thread igual ao get_schema.
-    rows = await asyncio.to_thread(run_query, sql)
+        # 4. Executa pelo guard + role read-only. run_query nunca levanta: erros de SQL e
+        #    de conexão voltam como TEXTO (contrato do MCP server), então uma query que o
+        #    modelo escreveu errado continua sendo resultado de worker — e não falha de
+        #    infra — pro synthesizer. Síncrono também (mesma conexão psycopg3), então vai
+        #    pra thread igual ao get_schema.
+        rows = await asyncio.to_thread(run_query, sql)
+    except Exception:  # noqa: BLE001 — nada sobe daqui: ver _falha_de_worker
+        return _falha_de_worker("sql_worker")
 
     print(f"[sql_worker] SQL: {sql}")
     return {"messages": [AIMessage(content=f"SQL: {sql}\nResult: {rows}", name="sql_worker")]}
@@ -341,17 +405,12 @@ async def rag_worker(state: State) -> dict:
     try:
         async with SessionLocal() as session:
             hits = await search_clauses(session, question, k=RAG_K)
-    except Exception as exc:  # noqa: BLE001 — mesmo contrato do sql_worker: erro vira mensagem
-        # O texto segue pro synthesizer como qualquer outro resultado; o grafo não
-        # estoura no meio de um request que já pode ter gasto em outros nós.
-        logger.warning("busca RAG falhou: %s", exc)
-        # Mesmo guard do texto do hit, pela porta de trás: uma exceção sem mensagem
-        # (`raise SomeError()`) faria o conteúdo ser "RAG error: ", com espaço no fim.
-        # Hoje inofensivo — nenhuma mensagem de worker volta pra API como turno
-        # assistente —, e mantido pelo mesmo motivo: ver `_formatar_hits`.
-        return {
-            "messages": [AIMessage(content=f"RAG error: {exc}".strip(), name="rag_worker")]
-        }
+    except Exception:  # noqa: BLE001 — mesmo contrato do sql_worker: erro vira mensagem
+        # Falha de infra vira mensagem MARCADA (o grafo não estoura no meio de um request
+        # que já pode ter gasto em outros nós), e o texto da exceção fica no log. Aqui ele
+        # era especialmente ruim de vazar: uma `voyageai.error.AuthenticationError` fala
+        # de chave de API, e um erro de conexão do asyncpg fala do host do Postgres.
+        return _falha_de_worker("rag_worker")
 
     relevantes = [h for h in hits if h.distance <= MAX_DISTANCE_PADRAO]
     print(
@@ -390,49 +449,85 @@ async def synthesizer(state: State) -> dict:
     por isso é ele, e não o supervisor, quem produz a última mensagem. A API só precisa
     ler `messages[-1]`.
 
-    Sem chamada de LLM em NENHUM dos três caminhos estáticos (fora de escopo, nada
-    encontrado, nenhum worker): não há o que sintetizar, e pagar uma chamada só pra
-    reescrever uma frase que já está pronta seria queimar dinheiro à toa.
+    Sem chamada de LLM em NENHUM dos quatro caminhos estáticos (falha interna, nada
+    encontrado, fora de escopo, nenhum worker): não há o que sintetizar, e pagar uma
+    chamada só pra reescrever uma frase que já está pronta seria queimar dinheiro à toa.
     """
     question = next(
         (m.content for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
         "",
     )
+
+    # **Só o que ESTE turno produziu.** A fatia começa depois da última `HumanMessage`, que
+    # é a mesma pergunta lida acima — o que está antes dela foi respondido em outro turno.
+    # Hoje é no-op: o `/ask` monta um State novo, com uma `HumanMessage` só, por request.
+    # Vira load-bearing quando o histórico atravessar turnos (a superfície de WhatsApp), e
+    # o modo de falha é do tipo que ninguém liga a esta função: uma falha de worker do
+    # turno 1 faria o turno 5 responder FALHA_INTERNA sobre um resultado perfeitamente
+    # bom — e mandaria o operador procurar um traceback de OUTRO request. Vale igual pros
+    # resultados: sem a fatia, um turno sem worker nenhum sintetizaria em cima da resposta
+    # anterior, com a confiança de quem acabou de consultar.
+    i_pergunta = max(
+        (i for i, m in enumerate(state["messages"]) if isinstance(m, HumanMessage)),
+        default=-1,
+    )
+    turno = state["messages"][i_pergunta + 1:]
+
     # Os resultados de worker, do mais recente pro mais antigo. Fixar `sql_worker` faria
     # uma resposta de RAG ser sintetizada em cima de um SQL antigo do mesmo histórico —
     # ou, sem SQL nenhum, cair no NO_ANSWER com as cláusulas certas na mensagem anterior.
+    # `WORKERS` não inclui `WORKER_ERROR`: falha não é resultado, e é por isso que ela
+    # não aparece aqui nem pode ser escolhida como payload de síntese.
     resultados = [
-        m.content
-        for m in reversed(state["messages"])
-        if isinstance(m, AIMessage) and m.name in WORKERS
+        m.content for m in reversed(turno) if isinstance(m, AIMessage) and m.name in WORKERS
     ]
+    # As falhas de worker, reconhecidas pelo `name` — nunca por prefixo do conteúdo. O
+    # conteúdo delas não é lido em lugar nenhum: o que importa é que existiu falha. É
+    # `any`, e não "a mais recente": com dois workers no turno, um que caiu invalida a
+    # afirmação do outro (ver a ordem das frases abaixo), então a ordem entre eles não muda
+    # nada — o que importa é o turno ter tido falha.
+    falhou = any(isinstance(m, AIMessage) and m.name == WORKER_ERROR for m in turno)
 
-    # **As duas saídas estáticas só valem quando NÃO há trabalho a apresentar.** Com o
-    # grafo single-hop `next` e os resultados não podem se contradizer (o supervisor
-    # classifica ANTES de qualquer worker), então hoje a ordem é redundante — e fica
-    # porque o multi-hop a torna load-bearing de novo: com o supervisor decidindo depois
-    # de cada worker, nada o impede de classificar como `unsupported` na segunda passada,
-    # lendo justamente o "não encontrei" do rag_worker. Nessa ordem invertida, uma
-    # pergunta legítima recebia "só respondo sobre seguro residencial" DEPOIS de a busca
-    # ter sido paga: a pior das três frases, porque manda o usuário embora. O teste
-    # chama o synthesizer direto, com o estado que o multi-hop reintroduz — via /ask o
-    # caso é inalcançável hoje, e um teste por /ask passaria sem exercitar nada.
-    if not resultados:
+    # A busca rodou e não achou nada dentro do limiar: a frase do worker já É a resposta
+    # final. Mas ela só vale como final se for o ÚNICO resultado — se um sql_worker
+    # respondeu antes, a resposta está lá, e dizer "não encontrei nada" jogaria fora o
+    # dado certo. Daí separar o que é resultado SUBSTANTIVO do que é "procurei e nada".
+    substantivos = [r for r in resultados if r != NADA_RELEVANTE]
+
+    # **Nenhuma frase estática vale quando há trabalho a apresentar** — só entramos aqui
+    # sem nada substantivo na mão. Dentro, a ordem é da mais específica sobre o que
+    # aconteceu pra menos, e cada degrau tem um motivo:
+    #
+    #  1. FALHA_INTERNA na frente de tudo. Se um worker caiu, qualquer outra frase mente
+    #     sobre a causa: "não achei nada no corpus" e "não trato desse assunto" são
+    #     afirmações sobre o corpus e sobre o escopo, e nenhuma das duas foi verificada
+    #     quando a consulta nem chegou a rodar. FORA_DE_ESCOPO seria a pior, porque manda
+    #     o usuário embora por causa de um banco fora do ar.
+    #  2. NADA_RELEVANTE só quando a busca de fato rodou (é o que `resultados` não-vazio
+    #     significa neste ponto: todos os resultados eram NADA_RELEVANTE).
+    #  3. FORA_DE_ESCOPO depois dos resultados, e não antes. Com o grafo single-hop `next`
+    #     e os resultados não podem se contradizer (o supervisor classifica ANTES de
+    #     qualquer worker), então hoje essa ordem é redundante — e fica porque o multi-hop
+    #     a torna load-bearing de novo: com o supervisor decidindo depois de cada worker,
+    #     nada o impede de classificar como `unsupported` na segunda passada, lendo
+    #     justamente o "não encontrei" do rag_worker. Invertida, uma pergunta legítima
+    #     recebia "só respondo sobre seguro residencial" DEPOIS de a busca ter sido paga.
+    #     O teste chama o synthesizer direto, com o estado que o multi-hop reintroduz —
+    #     via /ask o caso é inalcançável hoje, e um teste por /ask passaria sem exercitar
+    #     nada.
+    #  4. NO_ANSWER é o resto: ninguém trabalhou e nada quebrou — falha de roteamento.
+    if not substantivos:
+        if falhou:
+            print("[synthesizer] falha de worker -> frase fixa, sem LLM")
+            return {"messages": [AIMessage(content=FALHA_INTERNA, name="final")]}
+        if resultados:
+            print("[synthesizer] busca sem hits -> frase do worker, sem LLM")
+            return {"messages": [AIMessage(content=NADA_RELEVANTE, name="final")]}
         if state.get("next") == "unsupported":
             print("[synthesizer] fora de escopo -> frase fixa, sem LLM")
             return {"messages": [AIMessage(content=FORA_DE_ESCOPO, name="final")]}
         print("[synthesizer] sem resultado de worker -> fallback estático")
         return {"messages": [AIMessage(content=NO_ANSWER, name="final")]}
-
-    # A busca rodou e não achou nada dentro do limiar. A frase do worker já É a resposta
-    # final; mandá-la pro LLM só pagaria pra reescrever "não encontrei" com outras
-    # palavras — e arriscaria que ele inventasse um "mas talvez..." em cima do vazio.
-    # Mas ela só vale se for o ÚNICO resultado: se um sql_worker respondeu antes, a
-    # resposta está lá e dizer "não encontrei nada" seria jogar fora o dado certo.
-    substantivos = [r for r in resultados if r != NADA_RELEVANTE]
-    if not substantivos:
-        print("[synthesizer] busca sem hits -> frase do worker, sem LLM")
-        return {"messages": [AIMessage(content=NADA_RELEVANTE, name="final")]}
     resultado = substantivos[0]
 
     # Texto livre, não structured output: a saída é UMA frase em prosa, e forçar uma

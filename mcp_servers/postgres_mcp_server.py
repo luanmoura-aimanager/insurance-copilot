@@ -129,6 +129,10 @@ def run_query(sql: str) -> str:
     Executa uma query read-only (SELECT) e retorna até 100 linhas.
     Rejeita statements empilhados, qualquer coisa que não comece com SELECT, e
     qualquer leitura de tabela fora das 5 do domínio.
+
+    **Erro de QUERY volta como texto; erro de CONEXÃO sobe como exceção.** Ver o
+    comentário no `except`: o primeiro é resultado (o LLM escreveu SQL inválido e precisa
+    ser informado), o segundo é incidente.
     """
     stripped = sql.strip()
 
@@ -159,8 +163,6 @@ def run_query(sql: str) -> str:
     if not re.search(r"\blimit\b", body, re.IGNORECASE):
         body = f"{body} LIMIT 100"
 
-    # _connect() dentro do try: uma falha de conexão (senha RO errada, banco fora do ar)
-    # também volta como texto — o worker SQL conta com "run_query nunca levanta".
     conn = None
     try:
         conn = _connect()
@@ -168,7 +170,35 @@ def run_query(sql: str) -> str:
         cursor.execute(body)
         columns = [desc[0] for desc in cursor.description]
         rows = cursor.fetchall()
+    except psycopg.OperationalError:
+        # **Falha de INFRAESTRUTURA sobe.** Antes ela voltava como texto igual a um erro de
+        # query, e isso era o último caminho por onde detalhe de infra chegava ao usuário:
+        # a mensagem de uma `OperationalError` de conexão é
+        # `connection to server at "host" (ip), port 5432 failed: password authentication
+        # failed for user "insurance_ro"` — host, porta, usuário e banco. Como o texto ia
+        # como RESULTADO do worker, entrava no prompt do synthesizer e, no fallback dele
+        # (`frase or resultado`), virava a resposta do /ask ao pé da letra.
+        #
+        # Deixar subir é mais do que não vazar: é a MESMA falha que o `get_schema()` já
+        # propagava (ele não tem `except` nenhum), e as duas chamadas de banco deste worker
+        # não podem tratar o mesmo `OperationalError` de dois jeitos. Quem recebe é o `try`
+        # que envolve o `sql_worker` inteiro, que a transforma em `FALHA_INTERNA` + um
+        # `logger.exception` com `request_id`/`client`. Também economiza a chamada de LLM
+        # que o synthesizer gastaria pra parafrasear um erro de conexão.
+        #
+        # A divisão é a do próprio psycopg, e ela cai exatamente onde precisa: tudo que o
+        # LLM consegue causar (`SyntaxError`, `UndefinedColumn`, `UndefinedTable`,
+        # `InsufficientPrivilege`) é `ProgrammingError` e continua voltando como texto;
+        # `OperationalError` é banco inalcançável, conexão derrubada no meio, shutdown,
+        # statement timeout — nenhum deles é resposta a uma pergunta.
+        #
+        # No servidor stdio isso vira erro de tool em vez de texto de resultado, o que é
+        # honesto: "o banco está fora" não é o resultado de uma query.
+        raise
     except psycopg.Error as exc:
+        # Erro de QUERY continua sendo texto, e é o ponto de "run_query nunca levanta" que
+        # de fato importava: o LLM escreveu SQL inválido, o worker precisa poder dizer isso
+        # ao synthesizer em vez de estourar. Nenhuma dessas mensagens carrega conninfo.
         return f"Error executing query: {exc}"
     finally:
         if conn is not None and not conn.closed:

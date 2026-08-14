@@ -26,15 +26,22 @@ Two rules in the supervisor's prompt exist because both failures are silent and 
 
 What this gives up is multi-hop: a compound question ("how many insurers cover windstorm **and** what does the clause say about the deductible?") is answered by a single worker today. That is deliberately a slice of its own — multi-hop needs an explicit stopping rule (who decides it's enough, and on what basis), and inheriting the cycle for free is exactly how the 10 calls happened.
 
-A **synthesizer** node closes every path and turns the worker's raw output into a single natural-language sentence, so the API answers in prose rather than tuples. It reads the result of the **most recent** worker, whichever one ran. Three of its outcomes are fixed sentences returned *without* calling the model — there is nothing to synthesize, and paying for a call to write a sentence that already exists is wasted money:
+A **synthesizer** node closes every path and turns the worker's raw output into a single natural-language sentence, so the API answers in prose rather than tuples. It reads the result of the **most recent** worker, whichever one ran. Four of its outcomes are fixed sentences returned *without* calling the model — there is nothing to synthesize, and paying for a call to write a sentence that already exists is wasted money:
 
-| Sentence | Meaning | What happened |
-|---|---|---|
-| `NO_ANSWER` | "I should have been able to, and failed" | No worker produced a result — under single-hop, only if the supervisor returns `END` or an invalid value (the circuit breaker is unreachable today). Ours to fix; worth retrying. |
-| `NADA_RELEVANTE` | "I searched and the corpus has nothing" | The search ran and every neighbour was past the relevance threshold. A fact about the **corpus**. |
-| `FORA_DE_ESCOPO` | "I don't handle that subject" | The supervisor classified the question as another domain, before spending anything. A fact about the **system**; rewording won't help. |
+| Sentence | Meaning | What happened | Traceback in the log? |
+|---|---|---|---|
+| `NO_ANSWER` | "I should have been able to, and failed" | No worker produced a result **and nothing broke** — under single-hop, only if the supervisor returns `END` or an invalid value (the circuit breaker is unreachable today). A **routing** failure: ours to fix, worth retrying. | no |
+| `NADA_RELEVANTE` | "I searched and the corpus has nothing" | The search ran and every neighbour was past the relevance threshold. A fact about the **corpus**. | no |
+| `FORA_DE_ESCOPO` | "I don't handle that subject" | The supervisor classified the question as another domain, before spending anything. A fact about the **system**; rewording won't help. | no |
+| `FALHA_INTERNA` | "something broke on our side" | A worker raised (database down, embedding API refusing, malformed payload). A fact about the **infrastructure** — nothing to do with the question. | **yes** |
 
-Swapping any of them for another does not break anything — it just lies plausibly — so each has its own test. The two "nothing to show" sentences are only reachable when **no worker produced a result**, and that ordering outlives single-hop on purpose: it is what multi-hop will need. Once the supervisor decides again after each worker, it can answer `unsupported` on a later hop — most naturally by reading the RAG worker's own "found nothing" and concluding the subject is out of scope — and checking that classification *before* the results would send a legitimate question away with `FORA_DE_ESCOPO` after the search had already been paid for. Likewise `NADA_RELEVANTE` is final only when it is the sole result: if a SQL worker answered earlier, that answer is the one to synthesize. Both guards are covered by calling the synthesizer directly with the state multi-hop reintroduces — through `/ask` they are unreachable today, and a test routed through it would pass without exercising anything.
+Swapping any of them for another does not break anything — it just lies plausibly — so each has its own test. That last column is what separates `FALHA_INTERNA` from `NO_ANSWER`, which from the outside are both "our problem": one always has an incident to investigate, the other has none, so confusing them sends the operator hunting a traceback that doesn't exist — or ignoring one that does.
+
+None of the four is reachable while there is a real result to present, and inside that case the order runs from the most specific claim to the least: `FALHA_INTERNA` → `NADA_RELEVANTE` → `FORA_DE_ESCOPO` → `NO_ANSWER`. A crashed worker comes first because "the corpus has nothing" and "I don't handle that" are claims **nobody verified** when the query never ran, and `FORA_DE_ESCOPO` would be the worst of them: it sends the user away over a database being down. The out-of-scope check sits *after* the results rather than before, which outlives single-hop on purpose — it is what multi-hop will need, since a supervisor that decides again after each worker can answer `unsupported` on a later hop by reading the RAG worker's own "found nothing", and checking that first would refuse a legitimate question after the search had already been paid for. Likewise `NADA_RELEVANTE` and `FALHA_INTERNA` are final only when there is no other result: if a SQL worker answered earlier, that answer is the one to synthesize. These guards are covered by calling the synthesizer directly with the state multi-hop reintroduces — through `/ask` they are unreachable today, and a test routed through it would pass without exercising anything.
+
+**A worker's exception never reaches the user, and `/ask` still answers 200.** Both workers run their whole body inside a `try`; on failure they log `logger.exception` (traceback + `request_id` + `client`, the same keys as `cost_event`, so the incident links back to the cost rows and the question) and return a message *marked* by `name="worker_error"` whose content is not derived from the exception. Before this, the workers returned `f"SQL error: {exc}"` as if it were a result: that text went into the synthesizer's prompt, and on its degradation path it became *literally* the API's answer — a Postgres `OperationalError` carries host, port, user and database, and a Voyage auth error names an API key. Infrastructure detail is the **operator's** information, and the operator's channel is the log. The status code stays 200 because the surface is a conversation (today `/ask`, tomorrow WhatsApp): a 5xx hands the user an error page or an empty bubble — no answer, and no idea whether retrying helps — while "something broke on my side, try again shortly" is actionable. What the status would buy (alerts, dashboards, investigation) is an operator need, and the log serves it with strictly more than an opaque 500 would carry.
+
+The same split applies one layer down, in the MCP server: `run_query` returns a **query** error as text (the model wrote invalid SQL — that is a result the worker must be able to report) but lets a **connection** error propagate, so it becomes `FALHA_INTERNA` like any other infrastructure failure. That is also what makes the two database calls consistent: `get_schema()` never caught anything, so the same `OperationalError` used to be handled two different ways depending on which call hit it. Still uncovered, and deliberately left for its own slice: the **supervisor** node has no `try`, so an Anthropic outage there still surfaces as a 5xx.
 
 Each LLM call is cost-attributed per agent (one row per call: request id, agent, model, tokens, cost). Surface: WhatsApp (Meta Cloud API), with HMAC-verified webhooks.
 
@@ -232,6 +239,8 @@ curl -X POST localhost:8000/ask \
 # {"answer":"Só respondo perguntas sobre as condições gerais de seguro residencial...","iterations":1}
 ```
 
+If a worker breaks (database down, embedding API refusing), the call still returns **200** with `{"answer":"Tive uma falha interna ao consultar as condições gerais. Tente de novo em alguns instantes.", ...}` — the diagnosis is in the server log, not in the response. See the sentence table under [Architecture](#architecture).
+
 ### Tests and CI
 
 ```bash
@@ -247,6 +256,12 @@ with `KeyError: 'DATABASE_URL'` in any environment without a database configured
 including pytest's own collection phase, before the container existed.
 `tests/test_lazy_db.py` pins that: it imports `app.main` in a subprocess with a
 scrubbed environment and asserts it exits 0.
+
+One trap, if you write a test that asserts on log output: Alembic's `env.py` passes
+`disable_existing_loggers=False` to `fileConfig` on purpose. The migrations run **inside**
+the pytest process, and `fileConfig`'s default disables every logger created so far — so
+without that flag, any `caplog` assertion in a test that runs after the container boots
+silently sees nothing and passes.
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on every pull request
 and on pushes to `main`: Python 3.11, `pip install -r requirements.txt`, `pytest -q`.
@@ -358,7 +373,7 @@ PDF footer).
 - [ ] Production extraction (LLM → tables)
 - [x] Postgres MCP SQL server + read-only `insurance_ro` role
 - [~] Agent layer — async LLM supervisor (structured output) classifying each question once into a single-pass SQL worker, a RAG worker or an out-of-scope refusal, closed by a synthesizer (natural-language answer), served at `POST /ask`; **single-hop by design** (measured: the cyclic version cost 10 LLM calls where 3 sufficed). Pending: multi-hop with an explicit stopping rule, the extraction worker, and a ReAct refinement loop
-- [x] `POST /ask` hardening — Bearer auth with identity + per-client and per-IP rate limits
+- [x] `POST /ask` hardening — Bearer auth with identity + per-client and per-IP rate limits; a worker's exception never reaches the caller (marked failure message → `FALHA_INTERNA`, traceback with `request_id`/`client` in the log)
 - [x] Cost attribution in the agent graph — one `cost_event` per LLM call, tagged with a per-request id and the calling client
 - [~] RAG worker — vector storage ready (pgvector extension, `clause_chunk` with an exclusive-arc origin, HNSW/cosine index, revoked from the SQL worker's role), chunks materialized from the extracted text (one source row = one chunk, idempotent re-indexing that invalidates the vector when the text changes), embeddings filled by a resumable, cost-attributed pass (Voyage `voyage-4-lite`, `input_type="document"`, one `cost_event` per batch), similarity search as a testable function (`search_clauses`, `input_type="query"`, relevance threshold, per-document filter), and a `rag_worker` node wired into the graph behind a three-way supervisor; **pending:** calibrating the threshold against the labelled question set
 - [ ] WhatsApp surface
