@@ -23,6 +23,16 @@ mcp = FastMCP("postgres-mcp-server")
 # As 5 tabelas do domínio — a fronteira do que o worker SQL pode enxergar.
 TABLES = ("policy_document", "coverage", "peril", "coverage_peril", "exclusion")
 
+# Prefixo de TODA saída de erro do `run_query` — as três rejeições do guard e o erro de
+# query. Existe como CONSTANTE porque o `sql_worker` precisa distinguir "o banco me
+# respondeu" de "não cheguei a consultar": as duas voltam como string (é o contrato), e a
+# resposta declara sua base ("Base: N apólice(s) analisada(s)"), que seria uma afirmação
+# FALSA em cima de um SELECT que nunca rodou. Constante compartilhada, e não um
+# `startswith("Error")` escrito do outro lado, pra que produtor e leitor não possam
+# divergir — a lição de `WORKER_ERROR` ser o `name` da mensagem e não um prefixo adivinhado.
+# Não colide com resultado: sucesso sempre começa em "Columns: ".
+ERRO_PREFIXO = "Error"
+
 # Alvo de FROM/JOIN. Não é um parser de SQL, e não precisa ser: subquery e CTE também
 # usam FROM, então toda leitura de tabela passa por aqui. `FROM (SELECT ...)` não casa
 # (o próximo char é `(`, não identificador), que é o certo — o que importa está dentro.
@@ -161,20 +171,20 @@ def run_query(sql: str) -> str:
         body = body[:-1].rstrip()
     if ";" in body:
         return (
-            "Error: multiple SQL statements are not allowed "
+            f"{ERRO_PREFIXO}: multiple SQL statements are not allowed "
             "(only a single SELECT per call)."
         )
 
     # 2. Só SELECT.
     if not body.lower().startswith("select"):
-        return "Error: only SELECT queries are allowed."
+        return f"{ERRO_PREFIXO}: only SELECT queries are allowed."
 
     # 3. Só as 5 tabelas do domínio. Sem isto o filtro acima aprova qualquer SELECT,
     #    inclusive em clause_chunk (vetores) e cost_event.
     fora = _tabelas_fora_da_allowlist(body)
     if fora:
         return (
-            f"Error: table(s) not allowed: {', '.join(sorted(fora))}. "
+            f"{ERRO_PREFIXO}: table(s) not allowed: {', '.join(sorted(fora))}. "
             f"Only these tables can be queried: {', '.join(TABLES)}."
         )
 
@@ -221,7 +231,7 @@ def run_query(sql: str) -> str:
         # honesto: "o banco está fora" não é o resultado de uma query.
         if isinstance(exc, psycopg.OperationalError) and not isinstance(exc, _ERROS_DA_QUERY):
             raise
-        return f"Error executing query: {exc}"
+        return f"{ERRO_PREFIXO} executing query: {exc}"
     finally:
         if conn is not None and not conn.closed:
             conn.close()

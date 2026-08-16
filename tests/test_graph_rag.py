@@ -105,6 +105,23 @@ class _FakeSession:
         return False
 
 
+def _sem_base_do_corpus(monkeypatch):
+    """Desliga os rodapés CONTADOS ("N apólice(s) analisada(s)" / "pesquisada(s)").
+
+    Contá-los exige banco, e este módulo roda sem container — mesma forma e mesmo motivo
+    do no-op de `record_call_cost`. O patch é em `_contando`, o ponto único por onde as
+    duas contagens passam. Note que isto NÃO desliga o rodapé da rota RAG ("Base: k
+    cláusula(s) de d apólice(s)"): esse sai dos próprios hits, sem tocar no banco, e é por
+    isso que ele continua aparecendo (e sendo asserido) nos testes daqui. Quem testa a
+    declaração de base com banco de verdade é tests/test_base_declarada.py.
+    """
+
+    async def _nada(rotulo, conta):
+        return None
+
+    monkeypatch.setattr(graph_mod, "_contando", _nada)
+
+
 @pytest.fixture
 def fake_graph(monkeypatch):
     """Instala LLM falso + busca falsa e devolve (client, chamadas_da_busca)."""
@@ -130,6 +147,7 @@ def fake_graph(monkeypatch):
             return None
 
         monkeypatch.setattr(graph_mod, "record_call_cost", _sem_custo)
+        _sem_base_do_corpus(monkeypatch)
         return SimpleNamespace(client=client, buscas=buscas)
 
     return _install
@@ -163,7 +181,10 @@ async def test_rota_rag_worker_alimenta_o_synthesizer(ask_client, fake_graph):
     r = await _perguntar(ask_client, "Infiltração por janela aberta é coberta?")
 
     assert r.status_code == 200
-    assert r.json()["answer"] == FRASE
+    # A frase do synthesizer MAIS o rodapé da rota RAG: os dois HITS são do doc 3 e os dois
+    # passam no limiar. Ele não vem do LLM (o fake devolve só FRASE) — é montado no código,
+    # a partir dos hits que sobraram. Ver tests/test_base_declarada.py.
+    assert r.json()["answer"] == f"{FRASE}\n\nBase: 2 cláusula(s) de 1 apólice(s)."
 
     # UMA passada pelo supervisor: o rag_worker vai direto pro synthesizer, sem voltar
     # a passar por ele. Com o ciclo antigo, este mesmo fake reroteava pro rag_worker até
@@ -304,6 +325,7 @@ async def test_unsupported_nao_apaga_resultado_de_worker_no_historico(monkeypatc
         return None
 
     monkeypatch.setattr(graph_mod, "record_call_cost", _sem_custo)
+    _sem_base_do_corpus(monkeypatch)
 
     state = {
         "iterations": 2,
@@ -374,6 +396,7 @@ async def test_synthesizer_usa_o_worker_MAIS_RECENTE(monkeypatch):
         return None
 
     monkeypatch.setattr(graph_mod, "record_call_cost", _sem_custo)
+    _sem_base_do_corpus(monkeypatch)
 
     state = {
         "iterations": 3,
@@ -408,6 +431,7 @@ async def test_nada_relevante_nao_apaga_resultado_de_outro_worker(monkeypatch):
         return None
 
     monkeypatch.setattr(graph_mod, "record_call_cost", _sem_custo)
+    _sem_base_do_corpus(monkeypatch)
 
     state = {
         "iterations": 4,

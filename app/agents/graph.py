@@ -5,14 +5,20 @@ from langchain_core.messages import HumanMessage, AIMessage
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel
+from sqlalchemy import func, select
 
 from app.agents.context import get_client_name, get_request_id
 from app.cost import record_call_cost
 from app.llm import get_async_client
-from app.rag.search import MAX_DISTANCE_PADRAO, search_clauses
+from app.models import PolicyDocument
+from app.rag.search import (
+    MAX_DISTANCE_PADRAO,
+    contar_documentos_pesquisaveis,
+    search_clauses,
+)
 # Import direto das funções core do MCP server (mesmo processo, sem protocolo MCP).
 # run_query já carrega o guard SELECT-only + LIMIT e conecta pela role read-only.
-from mcp_servers.postgres_mcp_server import get_schema, run_query
+from mcp_servers.postgres_mcp_server import ERRO_PREFIXO, get_schema, run_query
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +54,11 @@ RAG_K = 5
 #                  com NO_ANSWER é o que o operador tem pra investigar — a FALHA_INTERNA
 #                  sempre tem um traceback correspondente no log, o NO_ANSWER não.
 #
+# Só UMA das quatro declara a base (o rodapé "Base: N apólice(s)..." da seção 2.7): a
+# NADA_RELEVANTE, porque ela é a única que afirma algo sobre o CORPUS e sem o denominador
+# lê como "isso não existe" em vez de "não achei nas que eu tenho". Nas outras três nada
+# chegou a ser consultado, e declarar base ali afirmaria uma verificação que não houve.
+#
 # As quatro moram aqui, e não na API, porque quem escreve a resposta final é o synthesizer
 # — o /ask só lê a última mensagem.
 NO_ANSWER = "Não consegui responder essa pergunta com os dados disponíveis."
@@ -72,6 +83,25 @@ FALHA_INTERNA = (
 # `sql_worker`/`rag_worker`/`final`. Fica FORA de `WORKERS` de propósito — uma falha não é
 # resultado de worker, e é justamente essa distinção que o synthesizer lê.
 WORKER_ERROR = "worker_error"
+
+# A chave, em `AIMessage.additional_kwargs`, onde o worker declara SOBRE O QUE ele
+# respondeu — e é o worker quem declara porque é ele quem consultou. É o MESMO caminho que
+# já carrega o resultado (a própria mensagem marcada), e é campo ESTRUTURADO pelo mesmo
+# motivo de `WORKER_ERROR` ser o `name` e não um prefixo no conteúdo: a alternativa seria o
+# synthesizer contar as linhas de `_formatar_hits` de volta, o que amarra a declaração de
+# base ao formato de um texto que existe pra ser lido por um LLM. Não é campo do State de
+# propósito: isto é um fato sobre UMA consulta, não sobre o grafo, e todo nó futuro teria
+# que carregar um campo que não é do domínio dele.
+#
+# **A ausência da chave significa "não declaro base", e esse default é DELIBERADO.** O
+# desenho anterior era o inverso — quem não dissesse nada ganhava o rodapé do corpus —, e
+# aí a saída insegura era a padrão: um worker novo que esquecesse de preencher afirmaria,
+# em toda resposta, que o corpus inteiro foi lido. Rodapé a menos é uma resposta sem
+# procedência; rodapé a mais é uma afirmação falsa de cobertura, que é o único erro que
+# este rodapé nunca pode cometer.
+BASE = "base_declarada"
+BASE_CORPUS = "corpus"          # "respondi agregando sobre as tabelas inteiras"
+BASE_RECUPERADO = "recuperado"  # "respondi lendo estas k cláusulas de d documentos"
 
 # Structured output canônico (mesmo padrão da extração de seguros): expõe UM tool
 # cujo input_schema é o JSON Schema do Pydantic e força tool_choice pra ele. O modelo
@@ -229,6 +259,122 @@ def _falha_de_worker(worker: str) -> dict:
     }
 
 
+# --- 2.7 A resposta declara sua BASE, e quem monta isso é o CÓDIGO ---
+#
+# O sufixo é DETERMINÍSTICO: números contados em Python, colados numa string fixa. Nada
+# disso passa pelo modelo, e o prompt do synthesizer não menciona base nenhuma — de
+# propósito. Pedir pro LLM declarar a base seria pedir pra ele *afirmar quantos documentos
+# consultamos*, que é exatamente o tipo de número que ele inventa com confiança quando não
+# está no payload; e quando está, ele ainda pode arredondar, omitir ou reescrever. Uma
+# declaração de cobertura errada é pior do que nenhuma: ela dá ao usuário uma razão falsa
+# para confiar na resposta. Por isso a frase vem do modelo e o rodapé vem daqui.
+
+
+async def _base_do_corpus(session) -> int:
+    """Quantos documentos de condições gerais existem na base, agora.
+
+    É a base da rota SQL, que agrega sobre as tabelas do domínio — todas as linhas de
+    `policy_document` participam de um `count`/`GROUP BY`, embeddadas ou não. A rota RAG
+    tem base MENOR e conta por outra função (`contar_documentos_pesquisaveis`).
+    """
+    return await session.scalar(select(func.count()).select_from(PolicyDocument))
+
+
+def _com_base(frase: str, sufixo: str | None) -> str:
+    """Cola a declaração de base na frase — o ÚNICO ponto do módulo que monta isso.
+
+    Separador único (linha em branco) porque o rodapé é um bloco à parte, não uma oração
+    da resposta: quem lê tem que conseguir ver onde a resposta acaba e onde começa a
+    afirmação sobre a cobertura dela. Sem sufixo devolve a frase INTACTA — nem separador
+    nem espaço sobrando: quando a contagem falha (ver `_sufixo_do_corpus`), o usuário
+    recebe uma resposta normal, e não uma resposta com um rodapé pela metade.
+    """
+    if not sufixo:
+        return frase
+    return f"{frase}\n\n{sufixo}"
+
+
+async def _contando(rotulo: str, conta) -> int | None:
+    """Roda uma contagem de base numa sessão própria. **Best effort, como `_record_cost`.**
+
+    Sessão própria e import local, como `record_call_cost` e o `rag_worker`: o nó não
+    conhece a borda HTTP e não recebe session por parâmetro, e resolver `SessionLocal` na
+    hora da chamada é o que faz o `monkeypatch.setattr("app.db.SessionLocal", ...)` dos
+    testes pegar.
+
+    Se a contagem falhar, devolve `None` e a resposta sai SEM rodapé em vez de estourar:
+    quando chegamos aqui a pergunta já foi paga e já tem resposta, e trocar uma resposta
+    boa por um 500 (ou por uma FALHA_INTERNA) só porque um `count` não pôde ser lido
+    destruiria o que já se comprou. Silenciar é a única saída que não mente — um rodapé
+    com número errado é pior do que rodapé nenhum.
+    """
+    from app.db import SessionLocal
+
+    try:
+        async with SessionLocal() as session:
+            return await conta(session)
+    except Exception as exc:  # noqa: BLE001 — best effort é o ponto: nada aqui pode subir
+        logger.warning("não consegui contar a base (%s): %s", rotulo, exc)
+        return None
+
+
+async def _sufixo_do_corpus() -> str | None:
+    """"Respondi agregando sobre N apólices" — a base da rota SQL."""
+    n = await _contando("corpus", _base_do_corpus)
+    # "apólice(s)" e não "condições gerais": a palavra tecnicamente certa pro corpus é CG,
+    # mas o rodapé é lido por quem perguntou, não por quem modelou o schema.
+    return None if n is None else f"Base: {n} apólice(s) analisada(s)."
+
+
+async def _sufixo_pesquisado() -> str | None:
+    """"Procurei em N apólices e não achei" — a base do NADA_RELEVANTE.
+
+    **Não é o mesmo número do corpus, e a diferença é exatamente o que essa frase afirma.**
+    A busca semântica só alcança chunk com vetor do modelo atual, então um documento
+    extraído e ainda não embeddado (ou um `--remodel` interrompido) está na base e fora do
+    alcance. Declarar o corpus aqui diria "procurei nas 40" quando 30 foram procuradas — e
+    numa frase cujo trabalho inteiro é dizer "não achei NAS QUE EU TENHO", esse é o pior
+    lugar possível pra inflar o número. Quem conta é `contar_documentos_pesquisaveis`, que
+    mora junto do filtro da busca justamente pra que os dois não possam divergir.
+    """
+    n = await _contando("pesquisável", contar_documentos_pesquisaveis)
+    return None if n is None else f"Base: {n} apólice(s) pesquisada(s)."
+
+
+async def _sufixo_da_resposta(msg: AIMessage) -> str | None:
+    """A base que ESTA mensagem declara — e nenhuma, se ela não declarar nada.
+
+    Duas bases, porque as duas rotas respondem coisas diferentes. O `rag_worker` responde
+    lendo k cláusulas de d documentos, e é ISSO que sua resposta cobre — declarar o corpus
+    ali implicaria que as apólices foram lidas inteiras quando algumas cláusulas foram. Já
+    o `sql_worker` agrega sobre as tabelas, então a base dele é o corpus.
+
+    Lê a declaração do `additional_kwargs` da própria mensagem, e nunca o `name` do worker:
+    é o worker que sabe se chegou a consultar (um `run_query` que voltou erro NÃO declara
+    base) e o que a consulta cobriu. Sem declaração, sem rodapé — ver o comentário de
+    `BASE` pra por que o default é esse.
+
+    Best effort inteiro, pelo mesmo motivo de `_contando`: os subscritos abaixo leem um
+    dicionário que veio de outro nó, e um `KeyError` aqui abortaria o grafo e devolveria
+    500 no último nó de um request que já tem resposta na mão.
+    """
+    try:
+        base = msg.additional_kwargs.get(BASE)
+        if not isinstance(base, dict):
+            return None
+        tipo = base.get("tipo")
+        if tipo == BASE_RECUPERADO:
+            return (
+                f"Base: {base['clausulas']} cláusula(s) de {base['documentos']} apólice(s)."
+            )
+        if tipo == BASE_CORPUS:
+            return await _sufixo_do_corpus()
+        return None
+    except Exception as exc:  # noqa: BLE001 — nada aqui pode derrubar o último nó
+        logger.warning("declaração de base malformada (%s); resposta sai sem rodapé", exc)
+        return None
+
+
 # --- 3. Supervisor node: decide de verdade, via LLM com structured output ---
 async def supervisor(state: State) -> dict:
     i = state["iterations"] + 1
@@ -344,8 +490,24 @@ async def sql_worker(state: State) -> dict:
     except Exception:  # noqa: BLE001 — nada sobe daqui: ver _falha_de_worker
         return _falha_de_worker("sql_worker")
 
+    # **Erro de query não declara base.** `run_query` devolve como TEXTO tanto as linhas
+    # quanto as recusas do guard e o erro do Postgres (é o contrato: SQL inválido é
+    # resultado, o synthesizer precisa poder contar isso). Só que "houve mensagem" não é
+    # "houve consulta": num `UndefinedColumn` o SELECT não leu apólice nenhuma, e um
+    # rodapé "Base: 30 apólice(s) analisada(s)" embaixo da paráfrase desse erro afirmaria
+    # uma verificação que não houve. O prefixo vem da CONSTANTE do produtor, não de um
+    # literal escrito aqui, pra que os dois lados não possam divergir.
+    consultou = not rows.startswith(ERRO_PREFIXO)
     print(f"[sql_worker] SQL: {sql}")
-    return {"messages": [AIMessage(content=f"SQL: {sql}\nResult: {rows}", name="sql_worker")]}
+    return {
+        "messages": [
+            AIMessage(
+                content=f"SQL: {sql}\nResult: {rows}",
+                name="sql_worker",
+                additional_kwargs=({BASE: {"tipo": BASE_CORPUS}} if consultou else {}),
+            )
+        ]
+    }
 
 
 # --- 4.2 RAG worker: recupera cláusulas por similaridade. Sem LLM próprio. ---
@@ -439,6 +601,18 @@ async def rag_worker(state: State) -> dict:
                 AIMessage(
                     content=f"Cláusulas recuperadas:\n{_formatar_hits(relevantes)}",
                     name="rag_worker",
+                    # A base viaja com a recuperação, e é contada sobre `relevantes` — o que
+                    # sobrou DEPOIS do corte —, nunca sobre `hits`. Contar antes inflaria o
+                    # rodapé com cláusulas que o synthesizer nunca viu: "5 cláusulas de 3
+                    # apólices" numa resposta escrita em cima de uma só é uma afirmação de
+                    # cobertura falsa, e é justamente a que faz o usuário confiar mais.
+                    additional_kwargs={
+                        BASE: {
+                            "tipo": BASE_RECUPERADO,
+                            "clausulas": len(relevantes),
+                            "documentos": len({h.document_id for h in relevantes}),
+                        }
+                    },
                 )
             ]
         }
@@ -461,6 +635,9 @@ async def synthesizer(state: State) -> dict:
     Sem chamada de LLM em NENHUM dos quatro caminhos estáticos (falha interna, nada
     encontrado, fora de escopo, nenhum worker): não há o que sintetizar, e pagar uma
     chamada só pra reescrever uma frase que já está pronta seria queimar dinheiro à toa.
+
+    É também aqui que a resposta ganha o rodapé que DECLARA SUA BASE — montado em código,
+    nunca pelo modelo (ver a seção 2.7). Quem consultou declara; quem não consultou, não.
     """
     question = next(
         (m.content for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
@@ -487,8 +664,12 @@ async def synthesizer(state: State) -> dict:
     # ou, sem SQL nenhum, cair no NO_ANSWER com as cláusulas certas na mensagem anterior.
     # `WORKERS` não inclui `WORKER_ERROR`: falha não é resultado, e é por isso que ela
     # não aparece aqui nem pode ser escolhida como payload de síntese.
+    #
+    # Guardamos as MENSAGENS, não só o `.content`: é no `additional_kwargs` delas que o
+    # worker declarou o que a resposta cobre (ver `BASE`), e a base tem que sair da mesma
+    # mensagem que virou payload — não de "a última que passou por aqui".
     resultados = [
-        m.content for m in reversed(turno) if isinstance(m, AIMessage) and m.name in WORKERS
+        m for m in reversed(turno) if isinstance(m, AIMessage) and m.name in WORKERS
     ]
     # As falhas de worker, reconhecidas pelo `name` — nunca por prefixo do conteúdo. O
     # conteúdo delas não é lido em lugar nenhum: o que importa é que existiu falha. É
@@ -501,7 +682,7 @@ async def synthesizer(state: State) -> dict:
     # final. Mas ela só vale como final se for o ÚNICO resultado — se um sql_worker
     # respondeu antes, a resposta está lá, e dizer "não encontrei nada" jogaria fora o
     # dado certo. Daí separar o que é resultado SUBSTANTIVO do que é "procurei e nada".
-    substantivos = [r for r in resultados if r != NADA_RELEVANTE]
+    substantivos = [m for m in resultados if m.content != NADA_RELEVANTE]
 
     # **Nenhuma frase estática vale quando há trabalho a apresentar** — só entramos aqui
     # sem nada substantivo na mão. Dentro, a ordem é da mais específica sobre o que
@@ -525,19 +706,34 @@ async def synthesizer(state: State) -> dict:
     #     via /ask o caso é inalcançável hoje, e um teste por /ask passaria sem exercitar
     #     nada.
     #  4. NO_ANSWER é o resto: ninguém trabalhou e nada quebrou — falha de roteamento.
+    #
+    # **Só uma das quatro declara base, e a regra é: só declara quem CONSULTOU.**
+    #  - FALHA_INTERNA: a consulta não chegou a rodar. Um "Base: N apólice(s) analisada(s)"
+    #    embaixo de "tive uma falha interna" afirmaria uma verificação que não houve — e
+    #    ainda por cima daria um ar de completude à única frase que significa o contrário.
+    #  - FORA_DE_ESCOPO: o supervisor classificou ANTES de gastar qualquer coisa; nada foi
+    #    aberto, e a frase é sobre o sistema, não sobre o corpus.
+    #  - NO_ANSWER: ninguém trabalhou (falha de roteamento). Mesma razão.
+    #  - NADA_RELEVANTE: esta SIM. É a única afirmação sobre o CORPUS, e sem a base ela lê
+    #    como "isso não existe" quando o que ela quer dizer é "não achei nas que eu tenho".
+    #    O rodapé é o que separa as duas leituras, e a diferença é enorme pra quem pergunta
+    #    sobre uma cobertura que só existe numa apólice que ainda não foi indexada. Ele usa
+    #    a base PESQUISÁVEL, não a do corpus — ver `_sufixo_pesquisado`.
     if not substantivos:
         if falhou:
             print("[synthesizer] falha de worker -> frase fixa, sem LLM")
             return {"messages": [AIMessage(content=FALHA_INTERNA, name="final")]}
         if resultados:
             print("[synthesizer] busca sem hits -> frase do worker, sem LLM")
-            return {"messages": [AIMessage(content=NADA_RELEVANTE, name="final")]}
+            frase = _com_base(NADA_RELEVANTE, await _sufixo_pesquisado())
+            return {"messages": [AIMessage(content=frase, name="final")]}
         if state.get("next") == "unsupported":
             print("[synthesizer] fora de escopo -> frase fixa, sem LLM")
             return {"messages": [AIMessage(content=FORA_DE_ESCOPO, name="final")]}
         print("[synthesizer] sem resultado de worker -> fallback estático")
         return {"messages": [AIMessage(content=NO_ANSWER, name="final")]}
-    resultado = substantivos[0]
+    msg_resultado = substantivos[0]
+    resultado = msg_resultado.content
 
     # Texto livre, não structured output: a saída é UMA frase em prosa, e forçar uma
     # tool aqui só embrulharia uma string em JSON sem ganhar nada.
@@ -566,8 +762,14 @@ async def synthesizer(state: State) -> dict:
 
     # `or resultado` cobre os dois modos de falha (exceção e resposta vazia): o texto
     # cru é feio, mas é uma resposta REAL e já paga — melhor que estourar o grafo.
+    #
+    # O rodapé entra nos DOIS casos, e não só na frase bonita: a base é uma afirmação sobre
+    # o que foi consultado, e o que foi consultado não muda quando o synthesizer cai. A
+    # degradação já entrega um texto feio; entregá-lo também sem procedência seria tirar
+    # justamente a informação que torna um despejo cru interpretável.
     print(f"[synthesizer] resposta final {'sintetizada' if frase else 'CRUA (degradou)'}")
-    return {"messages": [AIMessage(content=frase or resultado, name="final")]}
+    final = _com_base(frase or resultado, await _sufixo_da_resposta(msg_resultado))
+    return {"messages": [AIMessage(content=final, name="final")]}
 
 
 # --- 5. Conditional edge: routes by reading State (with fail-closed fallback) ---

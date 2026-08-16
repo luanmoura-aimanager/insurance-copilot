@@ -93,6 +93,15 @@ def fake_graph(monkeypatch):
         monkeypatch.setattr(graph_mod, "get_async_client", lambda: client)
         monkeypatch.setattr(graph_mod, "get_schema", lambda: "TABLE peril(id int, nome text)")
         monkeypatch.setattr(graph_mod, "run_query", lambda sql: "[(7,)]")
+
+        # Os rodapés contados ("Base: N apólice(s) ...") viram no-op: o assunto aqui é a
+        # CONTABILIDADE, e a contagem sairia do container, fazendo as asserções sobre o
+        # texto da resposta dependerem de quantos documentos outro módulo deixou
+        # commitados. Quem testa a base é tests/test_base_declarada.py.
+        async def _sem_base(rotulo, conta):
+            return None
+
+        monkeypatch.setattr(graph_mod, "_contando", _sem_base)
         return client
 
     return _install

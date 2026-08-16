@@ -98,6 +98,37 @@ class Hit:
     distance: float
 
 
+def _filtro_pesquisavel():
+    """As duas condições que definem um chunk ALCANÇÁVEL pela busca.
+
+    Extraídas pra cá porque `contar_documentos_pesquisaveis` tem que usar exatamente as
+    mesmas: quem pergunta "de quantas apólices eu procurei" está perguntando sobre este
+    predicado, e uma cópia dele em outro módulo divergiria na primeira vez que a busca
+    ganhasse mais um filtro — devolvendo um número que descreve um recorte que a busca
+    não faz mais. É o "índice que mente" entrando pela contagem.
+    """
+    return (
+        ClauseChunk.embedding.is_not(None),
+        ClauseChunk.embedding_model == EMBED_MODEL,
+    )
+
+
+async def contar_documentos_pesquisaveis(session: AsyncSession) -> int:
+    """Quantos documentos a busca semântica de fato ALCANÇA hoje.
+
+    Não é `count(*) FROM policy_document`, e a diferença é o ponto: chunking e embedding
+    são passos separados e pagos (`scripts/embed_chunks.py`), então um documento extraído
+    e ainda não embeddado — ou um `--remodel` interrompido no meio — está no banco e
+    **fora** do alcance da busca. Contar a tabela de documentos faria a resposta "procurei
+    e não achei" declarar uma cobertura que ela não teve.
+    """
+    return await session.scalar(
+        select(func.count(func.distinct(ClauseChunk.document_id))).where(
+            *_filtro_pesquisavel()
+        )
+    )
+
+
 async def search_clauses(
     session: AsyncSession,
     question: str,
@@ -190,14 +221,14 @@ async def search_clauses(
             ClauseChunk.text,
             distancia,
         )
-        .where(ClauseChunk.embedding.is_not(None))
-        # Só vetores do modelo ATUAL entram no ranking. `embed_pending` commita por lote
-        # (de propósito), então um `--remodel` interrompido deixa metade do corpus no
-        # modelo novo e metade no antigo — distâncias de cosseno de modelos diferentes
-        # não são comparáveis, e sem este filtro a busca ordenaria os dois juntos e
-        # devolveria vizinhos errados sem erro nenhum. `contar_desatualizados` já guarda
-        # esse estado do lado da ESCRITA; aqui é a mesma guarda do lado da leitura.
-        .where(ClauseChunk.embedding_model == EMBED_MODEL)
+        # `embedding IS NOT NULL` + só vetores do modelo ATUAL (ver `_filtro_pesquisavel`,
+        # que é a definição única desse recorte). `embed_pending` commita por lote (de
+        # propósito), então um `--remodel` interrompido deixa metade do corpus no modelo
+        # novo e metade no antigo — distâncias de cosseno de modelos diferentes não são
+        # comparáveis, e sem este filtro a busca ordenaria os dois juntos e devolveria
+        # vizinhos errados sem erro nenhum. `contar_desatualizados` já guarda esse estado
+        # do lado da ESCRITA; aqui é a mesma guarda do lado da leitura.
+        .where(*_filtro_pesquisavel())
         .order_by(distancia)
         .limit(k)
     )

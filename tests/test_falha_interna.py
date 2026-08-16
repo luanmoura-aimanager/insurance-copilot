@@ -103,6 +103,23 @@ class _FakeSession:
         return False
 
 
+def _sem_base(monkeypatch):
+    """Desliga os rodapés CONTADOS ("N apólice(s) analisada(s)" / "pesquisada(s)").
+
+    Mesma forma (e mesmo motivo) do no-op de `record_call_cost`: este módulo roda sem
+    container, e o assunto dele é o que a resposta NÃO pode conter. `_contando` é o ponto
+    único por onde as duas contagens passam. Sem o no-op o rodapé sumiria por acidente — a
+    contagem falharia no `_FakeSession` — e voltaria a aparecer no dia em que a suíte
+    rodasse depois de um módulo que sobe o banco. Quem testa a declaração de base é
+    tests/test_base_declarada.py.
+    """
+
+    async def _nada(rotulo, conta):
+        return None
+
+    monkeypatch.setattr(graph_mod, "_contando", _nada)
+
+
 @pytest.fixture
 def fake_graph(monkeypatch):
     """Instala os fakes e escolhe ONDE plantar a exceção."""
@@ -140,6 +157,7 @@ def fake_graph(monkeypatch):
             return None
 
         monkeypatch.setattr(graph_mod, "record_call_cost", _sem_custo)
+        _sem_base(monkeypatch)
         return SimpleNamespace(client=client, buscas=buscas)
 
     return _install
@@ -340,6 +358,7 @@ def synth_sem_custo(monkeypatch):
         return None
 
     monkeypatch.setattr(graph_mod, "record_call_cost", _sem_custo)
+    _sem_base(monkeypatch)
     return client
 
 
