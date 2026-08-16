@@ -1,20 +1,29 @@
 """A resposta declara sua BASE — e a declaração é montada em CÓDIGO, nunca pelo LLM.
 
-Este é o único módulo que exercita o rodapé de verdade: o da rota SQL e o do
-NADA_RELEVANTE precisam contar `policy_document`, então aqui o `SessionLocal` aponta pro
-container e há documentos REALMENTE inseridos (dois), commitados, pra que o número da
-resposta venha do banco e não de uma constante. Os outros módulos do grafo desligam esse
-rodapé com um no-op explícito, do mesmo jeito que já desligam `record_call_cost`: contar
-exige banco, e uma asserção sobre o texto da resposta não pode depender de quantos
-documentos outro módulo deixou commitados.
+Este é o único módulo que exercita os rodapés CONTADOS de verdade: os da rota SQL e do
+NADA_RELEVANTE consultam o banco, então aqui o `SessionLocal` aponta pro container e há
+documentos REALMENTE inseridos e commitados, pra que o número da resposta venha do banco e
+não de uma constante. Os outros módulos do grafo desligam essas contagens com um no-op
+explícito, do mesmo jeito que já desligam `record_call_cost`: contar exige banco, e uma
+asserção sobre o texto da resposta não pode depender de quantos documentos outro módulo
+deixou commitados.
+
+O corpus de teste é desenhado pra que os três números possíveis sejam DIFERENTES entre si
+— com um corpus uniforme, usar a contagem errada passaria verde:
+
+  - 5 linhas em `policy_document`, porque um dos produtos tem duas versões;
+  - 4 PRODUTOS (`distinct susep_process`), que é o número honesto do rodapé;
+  - 2 produtos ALCANÇÁVEIS pela busca — dos outros dois, um não tem vetor nenhum e o
+    outro tem vetor de um modelo antigo.
 
 O que se prova aqui, e por que cada um importa:
 
-  - o número da rota SQL vem do BANCO (2 documentos ⇒ "2 apólice(s)"), não de um literal;
+  - o número da rota SQL vem do BANCO e conta PRODUTOS, não linhas de tabela;
   - o da rota RAG conta os hits que sobraram DEPOIS do corte por distância — um hit
     descartado não pode inflar nem as cláusulas nem as apólices;
-  - `NADA_RELEVANTE` declara a base (é afirmação sobre o corpus: sem o rodapé ela lê como
-    "isso não existe" em vez de "não achei nas que eu tenho");
+  - `NADA_RELEVANTE` declara a base PESQUISÁVEL, que é menor que o corpus;
+  - quem declara é o WORKER: sem declaração reconhecida (ou com erro de query), sem
+    rodapé — o default é fail-closed;
   - `FORA_DE_ESCOPO` e `FALHA_INTERNA` **não** declaram (nada foi consultado nos dois
     casos — o rodapé afirmaria uma verificação que não houve);
   - o prompt do synthesizer não menciona base nenhuma, que é a guarda contra alguém
@@ -42,16 +51,23 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
 FRASE = "A cláusula exclui danos por infiltração de janela aberta."
 
-# A fixture planta QUATRO documentos e deixa só DOIS ao alcance da busca. Os outros dois
-# são as duas maneiras de um documento estar na base e fora do alcance, e as duas são
-# estados reais e documentados: um sem vetor nenhum (o intervalo normal entre a extração e
+# A fixture planta QUATRO produtos e deixa só DOIS ao alcance da busca. Os outros dois são
+# as duas maneiras de um documento estar na base e fora do alcance, e as duas são estados
+# reais e documentados: um sem vetor nenhum (o intervalo normal entre a extração e
 # `scripts/embed_chunks.py`) e um com vetor de OUTRO modelo (um `--remodel` interrompido,
 # que o commit-por-lote do `embed_pending` torna possível). São eles que tornam as duas
 # bases numericamente diferentes, e é essa diferença que prova que a rota SQL e o "não
 # achei" não podem usar a mesma contagem.
-DOCS_NA_BASE = 4
-DOCS_PESQUISAVEIS = 2
+PRODUTOS_NA_BASE = 4
+PRODUTOS_PESQUISAVEIS = 2
 MODELO_ANTIGO = "voyage-modelo-anterior"
+
+# Um dos produtos entra com DUAS versões, então a tabela tem 5 linhas pra 4 produtos. O
+# grão de `policy_document` é `(susep_process, version)` e `susep_harvest.py
+# --all-versions` existe pra baixar o histórico inteiro — sem esta linha extra, `count(*)`
+# e `count(distinct susep_process)` dariam o mesmo número e o rodapé poderia contar versões
+# como se fossem seguradoras diferentes sem nada ficar vermelho.
+LINHAS_NA_BASE = 5
 
 # As strings LITERAIS, escritas à mão. Montá-las a partir de constantes do módulo faria o
 # teste concordar com o código por construção.
@@ -106,6 +122,12 @@ class _FakeMessages:
         if kwargs["tools"][0]["name"] == graph_mod._DECISION_TOOL:
             i = self.supervisor_calls
             self.supervisor_calls += 1
+            # `min(i, len-1)` daria `[-1]` com a lista vazia, ou seja, um IndexError vindo
+            # de dentro do fake em vez de uma mensagem legível. Os testes que chamam o
+            # synthesizer direto constroem `_FakeClient([])` e nunca chegam aqui — este
+            # assert é o que faz o dia em que um deles passar a rotear por `/ask` sair como
+            # diagnóstico, e não como erro de indexação.
+            assert self._decisions, "supervisor chamado sem roteiro de decisões"
             nxt = self._decisions[min(i, len(self._decisions) - 1)]
             return _FakeResponse([_FakeToolUse({"next": nxt, "reasoning": f"fake #{i}"})])
         return _FakeResponse([_FakeToolUse({"sql": "SELECT count(*) FROM peril"})])
@@ -120,10 +142,11 @@ class _FakeClient:
 async def corpus(engine, monkeypatch):
     """Planta o corpus de teste COMMITADO e aponta `SessionLocal` pro container.
 
-    São `DOCS_NA_BASE` documentos, dos quais `DOCS_PESQUISAVEIS` recebem uma exclusão com
-    chunk embeddado no modelo atual. O documento restante fica sem vetor de propósito: é a
-    diferença entre "o que está na base" e "o que a busca alcança", e sem ela os dois
-    rodapés dariam o mesmo número e o teste não distinguiria nada.
+    `PRODUTOS_NA_BASE` produtos em `LINHAS_NA_BASE` linhas (um produto entra com duas
+    versões), dos quais `PRODUTOS_PESQUISAVEIS` recebem uma exclusão com chunk embeddado no
+    modelo atual. Os outros dois ficam fora do alcance da busca de maneiras diferentes — um
+    sem vetor, outro com vetor de modelo antigo. As três contagens têm que sair diferentes,
+    senão usar a errada passaria verde.
 
     As contagens são lidas por uma sessão que os nós abrem sozinhos (mesmo padrão de
     `record_call_cost`), fora da transação do teste — então documento inserido via
@@ -159,11 +182,25 @@ async def corpus(engine, monkeypatch):
                 insurer=f"Seguradora {i}",
                 product="Residencial",
                 susep_process=f"15414.{i:06d}/2024-11",
+                version="1",
                 pdf_url=f"https://exemplo/{i}.pdf",
                 pdf_hash=f"{MARCA}-{i}",
             )
-            for i in range(DOCS_NA_BASE)
+            for i in range(PRODUTOS_NA_BASE)
         ]
+        # A segunda versão do PRIMEIRO produto: linha nova, produto que já existe. É ela
+        # que separa `count(*)` de `count(distinct susep_process)`.
+        docs.append(
+            PolicyDocument(
+                insurer="Seguradora 0",
+                product="Residencial",
+                susep_process=docs[0].susep_process,
+                version="2",
+                pdf_url="https://exemplo/0-v2.pdf",
+                pdf_hash=f"{MARCA}-0-v2",
+            )
+        )
+        assert len(docs) == LINHAS_NA_BASE
         s.add_all(docs)
         await s.flush()
 
@@ -173,7 +210,11 @@ async def corpus(engine, monkeypatch):
         # sem chunk nenhum; o ÚLTIMO tem chunk com vetor de outro modelo — dentro do
         # `IS NOT NULL` e fora do alcance da busca, que é o caso que um filtro de contagem
         # escrito à mão (em vez de compartilhado com a busca) erraria.
-        modelos = [EMBED_MODEL] * DOCS_PESQUISAVEIS + [None, MODELO_ANTIGO]
+        # A quinta linha (segunda versão do produto 0) TAMBÉM é embeddada, e isso é
+        # deliberado: assim três *linhas* são alcançáveis mas só dois *produtos*, e uma
+        # contagem por `distinct document_id` diria 3 onde a honesta diz 2. Sem essa
+        # sobreposição, contar linha e contar produto dariam o mesmo número aqui.
+        modelos = [EMBED_MODEL] * PRODUTOS_PESQUISAVEIS + [None, MODELO_ANTIGO, EMBED_MODEL]
         for doc, modelo in zip(docs, modelos):
             if modelo is None:
                 continue
@@ -244,7 +285,7 @@ async def _perguntar(ask_client, pergunta: str) -> str:
 
 # --- Rota SQL: a base é o CORPUS, e o número vem do banco ---
 async def test_rota_sql_declara_a_base_do_corpus(ask_client, fake_graph):
-    """Três documentos no banco ⇒ "3 apólice(s)". O 3 é CONTADO, não escrito.
+    """Quatro produtos no banco ⇒ "4 apólice(s)". O 4 é CONTADO, não escrito.
 
     A asserção de igualdade cobre as três metades de uma vez: a frase do modelo, o
     separador (linha em branco — o rodapé é um bloco à parte, não uma oração da resposta)
@@ -266,10 +307,10 @@ async def test_rota_sql_declara_a_base_do_corpus(ask_client, fake_graph):
 async def test_o_numero_da_base_sai_do_banco_e_nao_de_uma_constante(
     ask_client, fake_graph, corpus
 ):
-    """Apagar os documentos muda o rodapé. Sem isto, um literal "3" passaria igual.
+    """Apagar os documentos muda o rodapé. Sem isto, um literal "4" passaria igual.
 
     É o mesmo `/ask`, com a base esvaziada entre uma pergunta e outra: se o número fosse
-    fixo (ou cacheado no processo), a segunda resposta continuaria dizendo "3".
+    fixo (ou cacheado no processo), a segunda resposta continuaria dizendo "4".
     """
     fake_graph(["sql_worker"])
 
@@ -306,6 +347,68 @@ async def test_erro_de_query_nao_declara_base(ask_client, fake_graph):
     assert answer == FRASE          # o erro ainda vira frase (isso não mudou)...
     assert "Base:" not in answer    # ...mas sem declaração de base nenhuma
     assert f.client.messages.synth_calls == 1
+
+
+async def test_nada_relevante_sem_declaracao_nao_ganha_rodape(monkeypatch, corpus):
+    """Até o "não achei" tira a base da MENSAGEM — a frase não escolhe uma base sozinha.
+
+    É o que impede o fail-open de voltar por essa porta. Enquanto a busca for global os
+    dois caminhos dão o mesmo número, então nenhum teste de ponta a ponta os distingue:
+    este pega a diferença estruturalmente, com uma mensagem que não declarou nada. Um
+    synthesizer que chamasse `_sufixo_pesquisado()` direto no branch carimbaria a base
+    global aqui — e faria o mesmo, no dia do recorte por `document_ids`, numa busca que
+    varreu um documento só.
+    """
+    client = _FakeClient([])
+    monkeypatch.setattr(graph_mod, "get_async_client", lambda: client)
+
+    async def _sem_custo(**kwargs):
+        return None
+
+    monkeypatch.setattr(graph_mod, "record_call_cost", _sem_custo)
+
+    state = {
+        "iterations": 1,
+        "next": "END",
+        "messages": [
+            HumanMessage(content="Meteorito é coberto?"),
+            AIMessage(content=graph_mod.NADA_RELEVANTE, name="rag_worker"),  # sem declaração
+        ],
+    }
+
+    out = await graph_mod.synthesizer(state)
+
+    assert out["messages"][0].content == graph_mod.NADA_RELEVANTE
+    assert "Base:" not in out["messages"][0].content
+    assert client.messages.synth_calls == 0
+
+
+@pytest.mark.parametrize(
+    "sql_recusado",
+    [
+        pytest.param("SELECT 1; DROP TABLE peril", id="statements-empilhados"),
+        pytest.param("UPDATE peril SET name = 'x'", id="nao-e-select"),
+        pytest.param("SELECT * FROM clause_chunk", id="tabela-fora-da-allowlist"),
+    ],
+)
+def test_toda_recusa_do_run_query_carrega_o_prefixo(sql_recusado):
+    """As recusas do guard também têm que ser reconhecíveis como "não consultei".
+
+    `test_erro_de_query_nao_declara_base` monta a string de erro A PARTIR de
+    `ERRO_PREFIXO`, então ele prova que o LEITOR reconhece o prefixo — nunca que o
+    PRODUTOR o emite. Um quinto `return` adicionado ao `run_query` sem o prefixo (uma
+    guarda nova, ou uma mensagem reescrita em pt-BR) faria `consultou` virar `True` em
+    silêncio, e toda query recusada ganharia "Base: N apólice(s) analisada(s)" embaixo da
+    paráfrase do erro, com a suíte verde. Este teste fecha o outro lado do par, exercitando
+    os três caminhos que rejeitam ANTES de tocar no banco (então roda sem container).
+    """
+    from mcp_servers.postgres_mcp_server import ERRO_PREFIXO, run_query
+
+    saida = run_query(sql_recusado)
+
+    assert saida.startswith(ERRO_PREFIXO), saida
+    # E é isso, literalmente, que o sql_worker vai perguntar.
+    assert not saida.startswith("Columns:")
 
 
 async def test_rodape_sobrevive_a_queda_do_synthesizer(ask_client, fake_graph):
@@ -500,7 +603,7 @@ async def test_nada_relevante_declara_a_base_PESQUISADA_e_nao_a_do_corpus(
     A segunda, e é o bug que este teste guarda: o número **não** pode ser o do corpus. A
     busca só alcança chunk com vetor do modelo atual, então o documento que a fixture
     deixou sem embedding — o estado normal entre a extração e `embed_chunks.py` — está na
-    base e fora do alcance. Contar `policy_document` diria "procurei em 3" quando 2 foram
+    base e fora do alcance. Contar `policy_document` diria "procurei em 4" quando 2 foram
     procuradas, inflando justamente a frase cujo trabalho é dizer "não achei NAS QUE EU
     TENHO". A desigualdade explícita no fim é o que impede a regressão: com uma contagem
     só, os dois rodapés voltam a ser o mesmo e nada mais reclama.
@@ -519,7 +622,7 @@ async def test_nada_relevante_declara_a_base_PESQUISADA_e_nao_a_do_corpus(
 async def test_fora_de_escopo_nao_declara_base(ask_client, fake_graph):
     """Nada foi consultado: o supervisor classificou antes de gastar qualquer coisa.
 
-    Um "Base: 2 apólice(s) analisada(s)" aqui afirmaria uma verificação que não houve — e
+    Um "Base: 4 apólice(s) analisada(s)" aqui afirmaria uma verificação que não houve — e
     a frase nem é sobre o corpus, é sobre o escopo do sistema.
     """
     fake_graph(["unsupported"])

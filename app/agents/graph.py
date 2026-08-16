@@ -102,6 +102,7 @@ WORKER_ERROR = "worker_error"
 BASE = "base_declarada"
 BASE_CORPUS = "corpus"          # "respondi agregando sobre as tabelas inteiras"
 BASE_RECUPERADO = "recuperado"  # "respondi lendo estas k cláusulas de d documentos"
+BASE_PESQUISADO = "pesquisado"  # "procurei em tudo que a busca alcança, e não achei"
 
 # Structured output canônico (mesmo padrão da extração de seguros): expõe UM tool
 # cujo input_schema é o JSON Schema do Pydantic e força tool_choice pra ele. O modelo
@@ -271,13 +272,22 @@ def _falha_de_worker(worker: str) -> dict:
 
 
 async def _base_do_corpus(session) -> int:
-    """Quantos documentos de condições gerais existem na base, agora.
+    """Quantos PRODUTOS de condições gerais existem na base, agora.
 
     É a base da rota SQL, que agrega sobre as tabelas do domínio — todas as linhas de
     `policy_document` participam de um `count`/`GROUP BY`, embeddadas ou não. A rota RAG
     tem base MENOR e conta por outra função (`contar_documentos_pesquisaveis`).
+
+    **`distinct susep_process`, e NÃO `count(*)`.** O grão de `policy_document` é
+    `(susep_process, version)` — está no `UniqueConstraint` da tabela —, e
+    `scripts/susep_harvest.py --all-versions` existe justamente pra baixar o histórico
+    completo de cada processo. Num corpus assim, três versões do mesmo produto virariam
+    "3 apólices" num rodapé que o usuário lê como três seguradoras diferentes. O produto
+    é o processo SUSEP; a versão é a mesma apólice registrada de novo.
     """
-    return await session.scalar(select(func.count()).select_from(PolicyDocument))
+    return await session.scalar(
+        select(func.count(func.distinct(PolicyDocument.susep_process)))
+    )
 
 
 def _com_base(frase: str, sufixo: str | None) -> str:
@@ -344,35 +354,47 @@ async def _sufixo_pesquisado() -> str | None:
 async def _sufixo_da_resposta(msg: AIMessage) -> str | None:
     """A base que ESTA mensagem declara — e nenhuma, se ela não declarar nada.
 
-    Duas bases, porque as duas rotas respondem coisas diferentes. O `rag_worker` responde
-    lendo k cláusulas de d documentos, e é ISSO que sua resposta cobre — declarar o corpus
-    ali implicaria que as apólices foram lidas inteiras quando algumas cláusulas foram. Já
-    o `sql_worker` agrega sobre as tabelas, então a base dele é o corpus.
+    Três bases, porque as três saídas cobrem coisas diferentes: o `sql_worker` agrega
+    sobre as tabelas (base = corpus), o `rag_worker` responde lendo k cláusulas de d
+    documentos (declarar o corpus ali implicaria que as apólices foram lidas inteiras
+    quando algumas cláusulas foram), e o "não achei" fala do que a busca ALCANÇA.
 
     Lê a declaração do `additional_kwargs` da própria mensagem, e nunca o `name` do worker:
     é o worker que sabe se chegou a consultar (um `run_query` que voltou erro NÃO declara
     base) e o que a consulta cobriu. Sem declaração, sem rodapé — ver o comentário de
     `BASE` pra por que o default é esse.
 
-    Best effort inteiro, pelo mesmo motivo de `_contando`: os subscritos abaixo leem um
-    dicionário que veio de outro nó, e um `KeyError` aqui abortaria o grafo e devolveria
-    500 no último nó de um request que já tem resposta na mão.
+    **Este é o ÚNICO caminho pra um rodapé.** Nenhuma saída pode chamar
+    `_sufixo_do_corpus`/`_sufixo_pesquisado` por conta própria: fazer isso reintroduz o
+    fail-open que `BASE` existe pra fechar — a saída passaria a declarar uma base fixa
+    independentemente do que o worker de fato consultou, que é como o "não achei" ia
+    declarar o corpus inteiro no dia em que a busca ganhasse recorte por documento
+    (`search_clauses` já aceita `document_ids`).
     """
-    try:
-        base = msg.additional_kwargs.get(BASE)
-        if not isinstance(base, dict):
-            return None
-        tipo = base.get("tipo")
-        if tipo == BASE_RECUPERADO:
+    base = msg.additional_kwargs.get(BASE)
+    if not isinstance(base, dict):
+        return None
+    tipo = base.get("tipo")
+    if tipo == BASE_CORPUS:
+        return await _sufixo_do_corpus()
+    if tipo == BASE_PESQUISADO:
+        return await _sufixo_pesquisado()
+    if tipo == BASE_RECUPERADO:
+        # O `try` cobre SÓ os dois subscritos, e essa estreiteza é o ponto: eles leem um
+        # dicionário montado em OUTRO nó, então um `KeyError` aqui abortaria o grafo no
+        # último nó de um request que já tem resposta. Envolver também as chamadas acima
+        # (que `_contando` já protege inteiras) faria um defeito real no caminho do corpus
+        # sair como "declaração malformada", mandando o operador caçar um payload de
+        # worker que não existe.
+        try:
             return (
                 f"Base: {base['clausulas']} cláusula(s) de {base['documentos']} apólice(s)."
             )
-        if tipo == BASE_CORPUS:
-            return await _sufixo_do_corpus()
-        return None
-    except Exception as exc:  # noqa: BLE001 — nada aqui pode derrubar o último nó
-        logger.warning("declaração de base malformada (%s); resposta sai sem rodapé", exc)
-        return None
+        except Exception as exc:  # noqa: BLE001 — nada aqui pode derrubar o último nó
+            logger.warning(
+                "declaração de base recuperada malformada (%s); resposta sai sem rodapé", exc
+            )
+    return None
 
 
 # --- 3. Supervisor node: decide de verdade, via LLM com structured output ---
@@ -498,6 +520,16 @@ async def sql_worker(state: State) -> dict:
     # uma verificação que não houve. O prefixo vem da CONSTANTE do produtor, não de um
     # literal escrito aqui, pra que os dois lados não possam divergir.
     consultou = not rows.startswith(ERRO_PREFIXO)
+    if not consultou:
+        # Sem este log, uma resposta SEM rodapé tem três causas indistinguíveis de fora
+        # (query recusada, contagem falhou, worker não declarou) e o usuário não recebe
+        # sinal nenhum. As outras duas já logam; esta era a que faltava — e é a que
+        # aparece em massa quando, por exemplo, a role RO perde SELECT numa tabela.
+        logger.info(
+            "run_query não consultou (sem declaração de base). request_id=%s client=%s",
+            get_request_id(),
+            get_client_name(),
+        )
     print(f"[sql_worker] SQL: {sql}")
     return {
         "messages": [
@@ -595,7 +627,22 @@ async def rag_worker(state: State) -> dict:
             # Mensagem EXPLÍCITA, nunca string vazia: uma mensagem em branco no histórico é
             # indistinguível de "o worker não rodou", e o synthesizer cairia no NO_ANSWER
             # ("falhei") em vez de dizer a verdade ("procurei e não achei").
-            return {"messages": [AIMessage(content=NADA_RELEVANTE, name="rag_worker")]}
+            #
+            # E ela DECLARA a base, como qualquer outra saída de worker: "procurei em N e
+            # não achei" é afirmação sobre o que foi varrido, e quem varreu é este nó. O
+            # synthesizer não pode escolher essa base sozinho — no dia em que a busca usar
+            # `document_ids` (a assinatura já aceita), o recorte é conhecido aqui e não lá,
+            # e um sufixo global embaixo de uma busca de um documento diria "procurei em
+            # 30" com 1 procurado.
+            return {
+                "messages": [
+                    AIMessage(
+                        content=NADA_RELEVANTE,
+                        name="rag_worker",
+                        additional_kwargs={BASE: {"tipo": BASE_PESQUISADO}},
+                    )
+                ]
+            }
         return {
             "messages": [
                 AIMessage(
@@ -725,7 +772,10 @@ async def synthesizer(state: State) -> dict:
             return {"messages": [AIMessage(content=FALHA_INTERNA, name="final")]}
         if resultados:
             print("[synthesizer] busca sem hits -> frase do worker, sem LLM")
-            frase = _com_base(NADA_RELEVANTE, await _sufixo_pesquisado())
+            # A base sai da MENSAGEM (a mais recente), pelo mesmo caminho de toda outra
+            # saída — nunca de uma chamada direta a `_sufixo_pesquisado` aqui, que voltaria
+            # a fixar uma base global independente do que o worker varreu.
+            frase = _com_base(NADA_RELEVANTE, await _sufixo_da_resposta(resultados[0]))
             return {"messages": [AIMessage(content=frase, name="final")]}
         if state.get("next") == "unsupported":
             print("[synthesizer] fora de escopo -> frase fixa, sem LLM")
@@ -767,6 +817,16 @@ async def synthesizer(state: State) -> dict:
     # o que foi consultado, e o que foi consultado não muda quando o synthesizer cai. A
     # degradação já entrega um texto feio; entregá-lo também sem procedência seria tirar
     # justamente a informação que torna um despejo cru interpretável.
+    #
+    # **LIMITAÇÃO CONHECIDA, e ela vence no dia do multi-turno:** o rodapé é gravado DENTRO
+    # do `content` da mensagem `final`, ou seja, dentro do histórico. Hoje isso é inócuo (o
+    # `/ask` monta um State novo por request, e nada relê a resposta anterior), mas na
+    # superfície de WhatsApp o supervisor converte o histórico inteiro em turnos e o número
+    # que este desenho mantém FORA do contexto do modelo volta pra dentro dele como texto
+    # de assistente — de onde dá pra parafrasear, arredondar ou carregar pra um turno em
+    # que worker nenhum rodou. A saída é o rodapé viajar fora do `content` (em
+    # `additional_kwargs`, com a junção na borda HTTP), e ela é da fatia do multi-turno
+    # porque é lá que se decide o que o supervisor enxerga do histórico.
     print(f"[synthesizer] resposta final {'sintetizada' if frase else 'CRUA (degradou)'}")
     final = _com_base(frase or resultado, await _sufixo_da_resposta(msg_resultado))
     return {"messages": [AIMessage(content=final, name="final")]}

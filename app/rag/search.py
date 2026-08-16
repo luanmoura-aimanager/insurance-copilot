@@ -23,7 +23,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cost import record_call_cost
-from app.models import ClauseChunk
+from app.models import ClauseChunk, PolicyDocument
 
 from .embedding import EMBED_MODEL, embed_query_with_tokens
 
@@ -114,18 +114,25 @@ def _filtro_pesquisavel():
 
 
 async def contar_documentos_pesquisaveis(session: AsyncSession) -> int:
-    """Quantos documentos a busca semântica de fato ALCANÇA hoje.
+    """Quantos PRODUTOS a busca semântica de fato ALCANÇA hoje.
 
     Não é `count(*) FROM policy_document`, e a diferença é o ponto: chunking e embedding
     são passos separados e pagos (`scripts/embed_chunks.py`), então um documento extraído
     e ainda não embeddado — ou um `--remodel` interrompido no meio — está no banco e
     **fora** do alcance da busca. Contar a tabela de documentos faria a resposta "procurei
     e não achei" declarar uma cobertura que ela não teve.
+
+    Conta `distinct susep_process` (e não `distinct document_id`) pela mesma razão de
+    `_base_do_corpus`: o grão da tabela é `(susep_process, version)`, então num corpus
+    baixado com `--all-versions` as versões do mesmo produto contariam separado. Os dois
+    rodapés têm que falar da mesma unidade — se um contasse versões e o outro produtos, a
+    diferença entre eles deixaria de significar "o que ainda não foi embeddado".
     """
     return await session.scalar(
-        select(func.count(func.distinct(ClauseChunk.document_id))).where(
-            *_filtro_pesquisavel()
-        )
+        select(func.count(func.distinct(PolicyDocument.susep_process)))
+        .select_from(ClauseChunk)
+        .join(PolicyDocument, PolicyDocument.id == ClauseChunk.document_id)
+        .where(*_filtro_pesquisavel())
     )
 
 
