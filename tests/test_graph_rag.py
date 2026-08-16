@@ -106,7 +106,7 @@ class _FakeSession:
 
 
 def _sem_base_do_corpus(monkeypatch):
-    """Desliga os rodapés CONTADOS ("N apólice(s) analisada(s)" / "pesquisada(s)").
+    """Desliga os rodapés CONTADOS ("corpus de N apólice(s)" / "N apólice(s) pesquisada(s)").
 
     Contá-los exige banco, e este módulo roda sem container — mesma forma e mesmo motivo
     do no-op de `record_call_cost`. O patch é em `_contando`, o ponto único por onde as

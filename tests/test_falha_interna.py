@@ -104,7 +104,7 @@ class _FakeSession:
 
 
 def _sem_base(monkeypatch):
-    """Desliga os rodapés CONTADOS ("N apólice(s) analisada(s)" / "pesquisada(s)").
+    """Desliga os rodapés CONTADOS ("corpus de N apólice(s)" / "N apólice(s) pesquisada(s)").
 
     Mesma forma (e mesmo motivo) do no-op de `record_call_cost`: este módulo roda sem
     container, e o assunto dele é o que a resposta NÃO pode conter. `_contando` é o ponto

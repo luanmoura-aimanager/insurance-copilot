@@ -54,9 +54,9 @@ RAG_K = 5
 #                  com NO_ANSWER é o que o operador tem pra investigar — a FALHA_INTERNA
 #                  sempre tem um traceback correspondente no log, o NO_ANSWER não.
 #
-# Só UMA das quatro declara a base (o rodapé "Base: N apólice(s)..." da seção 2.7): a
-# NADA_RELEVANTE, porque ela é a única que afirma algo sobre o CORPUS e sem o denominador
-# lê como "isso não existe" em vez de "não achei nas que eu tenho". Nas outras três nada
+# Só UMA das quatro declara a base (o rodapé da seção 2.7): a NADA_RELEVANTE, porque ela é
+# a única que afirma algo sobre o CORPUS — e sem dizer em quantas apólices procurou, ela lê
+# como "isso não existe" em vez de "não achei nas que eu tenho". Nas outras três nada
 # chegou a ser consultado, e declarar base ali afirmaria uma verificação que não houve.
 #
 # As quatro moram aqui, e não na API, porque quem escreve a resposta final é o synthesizer
@@ -329,11 +329,26 @@ async def _contando(rotulo: str, conta) -> int | None:
 
 
 async def _sufixo_do_corpus() -> str | None:
-    """"Respondi agregando sobre N apólices" — a base da rota SQL."""
+    """"Este acervo tem N apólices" — a base da rota SQL.
+
+    **Fala do ACERVO, não do que a query cobriu, e a diferença é o motivo da frase ser
+    esta.** A versão anterior dizia "N apólice(s) analisada(s)", e isso era falso na
+    pergunta mais comum que existe: o supervisor manda perguntas de FILTRO pro sql_worker
+    ("quais coberturas a seguradora X oferece?"), o SELECT lê um documento, e o rodapé
+    afirmava que 30 tinham sido analisadas. Saber o escopo real exigiria interpretar o SQL
+    que o modelo escreveu — e o `consultou` do worker só distingue "rodou" de "deu erro",
+    nunca "cobriu quanto".
+
+    "Corpus de N" é verdadeiro para QUALQUER query, e continua entregando o que o rodapé
+    existe pra entregar: a escala do acervo, que sozinha o usuário não tem como conhecer.
+    As outras duas bases seguem afirmando cobertura, porque nelas nós sabemos exatamente o
+    que foi lido — k cláusulas de d documentos, ou o conjunto inteiro que a busca alcança.
+
+    "apólice(s)" e não "condições gerais": a palavra tecnicamente certa pro corpus é CG,
+    mas o rodapé é lido por quem perguntou, não por quem modelou o schema.
+    """
     n = await _contando("corpus", _base_do_corpus)
-    # "apólice(s)" e não "condições gerais": a palavra tecnicamente certa pro corpus é CG,
-    # mas o rodapé é lido por quem perguntou, não por quem modelou o schema.
-    return None if n is None else f"Base: {n} apólice(s) analisada(s)."
+    return None if n is None else f"Base: corpus de {n} apólice(s)."
 
 
 async def _sufixo_pesquisado() -> str | None:
@@ -516,7 +531,7 @@ async def sql_worker(state: State) -> dict:
     # quanto as recusas do guard e o erro do Postgres (é o contrato: SQL inválido é
     # resultado, o synthesizer precisa poder contar isso). Só que "houve mensagem" não é
     # "houve consulta": num `UndefinedColumn` o SELECT não leu apólice nenhuma, e um
-    # rodapé "Base: 30 apólice(s) analisada(s)" embaixo da paráfrase desse erro afirmaria
+    # rodapé "Base: corpus de N apólice(s)" embaixo da paráfrase desse erro afirmaria
     # uma verificação que não houve. O prefixo vem da CONSTANTE do produtor, não de um
     # literal escrito aqui, pra que os dois lados não possam divergir.
     consultou = not rows.startswith(ERRO_PREFIXO)
@@ -755,7 +770,7 @@ async def synthesizer(state: State) -> dict:
     #  4. NO_ANSWER é o resto: ninguém trabalhou e nada quebrou — falha de roteamento.
     #
     # **Só uma das quatro declara base, e a regra é: só declara quem CONSULTOU.**
-    #  - FALHA_INTERNA: a consulta não chegou a rodar. Um "Base: N apólice(s) analisada(s)"
+    #  - FALHA_INTERNA: a consulta não chegou a rodar. Um "Base: corpus de N apólice(s)"
     #    embaixo de "tive uma falha interna" afirmaria uma verificação que não houve — e
     #    ainda por cima daria um ar de completude à única frase que significa o contrário.
     #  - FORA_DE_ESCOPO: o supervisor classificou ANTES de gastar qualquer coisa; nada foi

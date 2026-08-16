@@ -71,7 +71,7 @@ LINHAS_NA_BASE = 5
 
 # As strings LITERAIS, escritas à mão. Montá-las a partir de constantes do módulo faria o
 # teste concordar com o código por construção.
-SUFIXO_CORPUS = "Base: 4 apólice(s) analisada(s)."
+SUFIXO_CORPUS = "Base: corpus de 4 apólice(s)."
 SUFIXO_PESQUISADO = "Base: 2 apólice(s) pesquisada(s)."
 
 # Marca de todo documento plantado por este módulo: a fixture apaga por ela no teardown.
@@ -325,7 +325,7 @@ async def test_o_numero_da_base_sai_do_banco_e_nao_de_uma_constante(
         await s.commit()
 
     segunda = await _perguntar(ask_client, "Quantos perigos existem na base?")
-    assert segunda.endswith("Base: 0 apólice(s) analisada(s).")
+    assert segunda.endswith("Base: corpus de 0 apólice(s).")
 
 
 async def test_erro_de_query_nao_declara_base(ask_client, fake_graph):
@@ -335,7 +335,7 @@ async def test_erro_de_query_nao_declara_base(ask_client, fake_graph):
     contrato que faz o SQL inválido ser reportável em vez de fatal. Mas aí o worker produz
     uma mensagem normal, o synthesizer a parafraseia ("não consegui obter essa
     informação") e, sem esta guarda, o rodapé afirmaria em cima disso que N apólices foram
-    analisadas — numa resposta em que o SELECT não leu nenhuma.
+    corpus — numa resposta em que o SELECT não chegou a ler nada.
     """
     from mcp_servers.postgres_mcp_server import ERRO_PREFIXO
 
@@ -398,7 +398,7 @@ def test_toda_recusa_do_run_query_carrega_o_prefixo(sql_recusado):
     `ERRO_PREFIXO`, então ele prova que o LEITOR reconhece o prefixo — nunca que o
     PRODUTOR o emite. Um quinto `return` adicionado ao `run_query` sem o prefixo (uma
     guarda nova, ou uma mensagem reescrita em pt-BR) faria `consultou` virar `True` em
-    silêncio, e toda query recusada ganharia "Base: N apólice(s) analisada(s)" embaixo da
+    silêncio, e toda query recusada ganharia "Base: corpus de N apólice(s)" embaixo da
     paráfrase do erro, com a suíte verde. Este teste fecha o outro lado do par, exercitando
     os três caminhos que rejeitam ANTES de tocar no banco (então roda sem container).
     """
@@ -586,7 +586,7 @@ async def test_rota_rag_nao_declara_a_base_do_corpus(ask_client, fake_graph):
 
     assert answer == f"{FRASE}\n\nBase: 2 cláusula(s) de 1 apólice(s)."
     assert SUFIXO_CORPUS not in answer
-    assert "analisada" not in answer
+    assert "corpus" not in answer
 
 
 # --- As quatro frases estáticas: só uma declara base ---
@@ -622,7 +622,7 @@ async def test_nada_relevante_declara_a_base_PESQUISADA_e_nao_a_do_corpus(
 async def test_fora_de_escopo_nao_declara_base(ask_client, fake_graph):
     """Nada foi consultado: o supervisor classificou antes de gastar qualquer coisa.
 
-    Um "Base: 4 apólice(s) analisada(s)" aqui afirmaria uma verificação que não houve — e
+    Um "Base: corpus de 4 apólice(s)" aqui afirmaria uma verificação que não houve — e
     a frase nem é sobre o corpus, é sobre o escopo do sistema.
     """
     fake_graph(["unsupported"])
