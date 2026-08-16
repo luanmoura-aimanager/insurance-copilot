@@ -103,6 +103,16 @@ def fake_graph(monkeypatch):
                 return None
 
             monkeypatch.setattr(graph_mod, "record_call_cost", _sem_custo)
+
+        # Os rodapés contados ("Base: N apólice(s) ...") viram no-op SEMPRE (inclusive com
+        # `com_custo`): o assunto aqui é a última milha — prosa em vez de tupla —, e a
+        # contagem viria do container, fazendo estas asserções dependerem de quantos
+        # documentos outro módulo deixou commitados. Quem testa a base é
+        # tests/test_base_declarada.py.
+        async def _sem_base(rotulo, conta):
+            return None
+
+        monkeypatch.setattr(graph_mod, "_contando", _sem_base)
         return client
 
     return _install

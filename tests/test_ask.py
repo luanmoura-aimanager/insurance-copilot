@@ -99,6 +99,19 @@ def fake_graph(monkeypatch):
             return None
 
         monkeypatch.setattr(graph_mod, "record_call_cost", _sem_custo)
+
+        # O rodapé "Base: ..." também vira no-op explícito, e pelo mesmo motivo do custo:
+        # contá-lo exige banco, e este módulo não tem nenhum. O patch é em `_contando`, o
+        # ponto único por onde passam TODAS as contagens de base (corpus e pesquisável),
+        # pra que uma terceira não reintroduza a dependência sem ninguém notar. Sem isso o
+        # rodapé sumiria sozinho (a contagem falha, o sufixo some), mas só POR ACIDENTE —
+        # e se a suíte rodar depois de um teste que subiu o container a contagem funciona,
+        # e a resposta passa a depender de quantos documentos outro módulo deixou
+        # commitados. Quem testa a base, com banco de verdade, é tests/test_base_declarada.py.
+        async def _sem_base(rotulo, conta):
+            return None
+
+        monkeypatch.setattr(graph_mod, "_contando", _sem_base)
         return client
 
     return _install
