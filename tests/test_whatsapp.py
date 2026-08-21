@@ -5,6 +5,7 @@ Sem rede e sem banco — o webhook não toca no Postgres, então este módulo n�
 fixture `client` do conftest (aquela sobe container). Nenhum teste gasta dinheiro:
 não há chamada de LLM nem de embedding neste caminho.
 """
+import base64
 import hashlib
 import hmac
 import json
@@ -348,11 +349,13 @@ async def test_uma_mensagem_ruim_nao_engole_as_seguintes(client, caplog, monkeyp
     with caplog.at_level(logging.INFO, logger="app.main"):
         r = await client.post("/webhook/whatsapp", content=body, headers=assinar(body))
 
+    from app.whatsapp import id_curto
+
     registrado = "\n".join(rec.getMessage() for rec in caplog.records)
     assert r.status_code == 200
-    assert "wamid.1" in registrado
-    assert "wamid.3" in registrado          # a que viria DEPOIS da falha
-    assert "falha ao registrar mensagem (wamid=wamid.2)" in registrado
+    assert id_curto("wamid.1") in registrado
+    assert id_curto("wamid.3") in registrado          # a que viria DEPOIS da falha
+    assert f"falha ao registrar mensagem (id={id_curto('wamid.2')})" in registrado
 
 
 async def test_corpo_que_nao_e_json_continua_200(client, caplog):
@@ -377,17 +380,130 @@ async def test_mensagem_de_texto_e_logada_sem_pii(client, caplog):
     with caplog.at_level(logging.INFO, logger="app.main"):
         r = await client.post("/webhook/whatsapp", content=body, headers=assinar(body))
 
+    from app.whatsapp import id_curto
+
     assert r.status_code == 200
     linhas = [rec.getMessage() for rec in caplog.records if rec.levelno == logging.INFO]
-    assert any(WAMID in linha for linha in linhas)
-
     inteiro = "\n".join(linhas)
+
+    # Identifica a mensagem por um DIGEST, não pelo wamid — ver abaixo.
+    assert id_curto(WAMID) in inteiro
+    assert "8888" in inteiro          # os 4 últimos, que é o que se mascara PARA
+    assert str(len(TEXTO)) in inteiro
+
+    # E não carrega nada de PII. A busca é palavra por palavra porque uma versão que
+    # truncasse o texto continuaria vazando o começo dele.
     assert TEXTO not in inteiro
     for palavra in TEXTO.split():
         assert palavra not in inteiro
     assert TELEFONE not in inteiro
-    assert "8888" in inteiro          # os 4 últimos, que é o que se mascara PARA
-    assert str(len(TEXTO)) in inteiro
+
+    # A metade que faltava, e que fazia este teste ser CEGO por construção: o wamid
+    # EMBUTE o telefone em base64, então logá-lo inteiro publicaria, reversível, o
+    # mesmo número que `mascarar_telefone` acabou de esconder — e um `TELEFONE not in
+    # inteiro` nunca perceberia, porque a busca é por substring e o número está
+    # codificado. A asserção tem que ser sobre o wamid CRU.
+    assert TELEFONE.encode() in base64.b64decode(WAMID.split(".", 1)[1])  # a premissa
+    assert WAMID not in inteiro
+
+
+async def test_phone_number_id_chega_junto():
+    """O número que RECEBEU, não só o que mandou.
+
+    Um app secret da Meta cobre todos os números da conta e o envio é
+    `POST /{phone_number_id}/messages`; sem carregar isso na borda, a W2 fixaria um
+    número no código — errado em silêncio no dia em que a conta ganhar o segundo.
+    """
+    from app.whatsapp import extract_messages
+
+    (msg,) = extract_messages(PAYLOAD)
+
+    assert msg.phone_number_id == "999"
+    assert extract_messages({"entry": [{"changes": [{"value": {"messages": [
+        {"id": "w", "from": "5511", "type": "text"}]}}]}]})[0].phone_number_id is None
+
+
+@pytest.mark.parametrize("valor", ["²", "nao-e-numero", "-1", ""])
+async def test_content_length_invalido_nao_vira_500(client, valor):
+    """`"²".isdigit()` é True e `int("²")` levanta — 500 com traceback, antes do HMAC.
+
+    Alcançável por qualquer anônimo, na rota pública, antes de qualquer verificação.
+    """
+    body = corpo()
+    r = await client.post("/webhook/whatsapp", content=body,
+                          headers={**assinar(body), b"Content-Length": valor.encode("latin-1")})
+
+    assert r.status_code in (200, 400, 403, 413)   # o que não pode é 500
+
+
+async def test_desconexao_no_meio_do_corpo_nao_vira_500():
+    """`request.stream()` levanta ClientDisconnect quando o cliente aborta.
+
+    Nada tratava isso: 500 e traceback por request, na única rota cujo contrato é
+    nunca responder não-2xx — e se for o cliente da própria Meta que expirou, o 500 é
+    o que empurra ela pra desabilitar a inscrição.
+    """
+    from app.main import _corpo_com_teto
+    from starlette.requests import Request
+
+    pedacos = iter([{"type": "http.request", "body": b"parcial", "more_body": True},
+                    {"type": "http.disconnect"}])
+
+    async def receive():
+        return next(pedacos)
+
+    req = Request({"type": "http", "method": "POST", "path": "/webhook/whatsapp",
+                   "headers": []}, receive=receive)
+
+    assert await _corpo_com_teto(req) == b""      # corpo incompleto = corpo vazio
+
+
+async def test_corpo_continua_legivel_depois_da_leitura_com_teto():
+    """Quem vier depois pode chamar `request.body()` — a W2 vai chamar.
+
+    `Request.stream()` marca o stream como consumido sem popular `_body`, então sem o
+    cache um `await request.body()` posterior levantaria `RuntimeError: Stream
+    consumed` — numa rota documentada como sempre-200.
+    """
+    from app.main import _corpo_com_teto
+    from starlette.requests import Request
+
+    pedacos = iter([{"type": "http.request", "body": b"oi", "more_body": False}])
+
+    async def receive():
+        return next(pedacos)
+
+    req = Request({"type": "http", "method": "POST", "path": "/webhook/whatsapp",
+                   "headers": []}, receive=receive)
+
+    assert await _corpo_com_teto(req) == b"oi"
+    assert await req.body() == b"oi"
+
+
+async def test_placeholder_do_env_example_conta_como_ausente(monkeypatch, webhook_client):
+    """`CHANGE_ME` é truthy e passava — um `cp .env.example .env` deixaria de pé um
+    webhook público cujo segredo está impresso no repositório."""
+    monkeypatch.setenv("WHATSAPP_APP_SECRET", "CHANGE_ME")
+
+    async with await webhook_client() as c:
+        r = await c.post("/webhook/whatsapp", content=corpo())
+
+    assert r.status_code == 500
+
+
+async def test_o_500_nao_diz_qual_variavel_falta(monkeypatch, webhook_client):
+    """A rota é pública e sem auth: o corpo da resposta não entrega o schema de
+    configuração do deploy nem avisa que ele está meio provisionado agora.
+
+    O nome da variável fica no log, que é o canal do operador.
+    """
+    monkeypatch.delenv("WHATSAPP_APP_SECRET", raising=False)
+
+    async with await webhook_client() as c:
+        r = await c.post("/webhook/whatsapp", content=corpo())
+
+    assert r.status_code == 500
+    assert "WHATSAPP_APP_SECRET" not in r.text
 
 
 # --- rate limit -------------------------------------------------------------
@@ -476,6 +592,30 @@ async def test_handshake_estourado_nao_derruba_a_entrega_da_meta(monkeypatch, we
         r = await c.post("/webhook/whatsapp", content=body, headers=assinar(body))
 
     assert r.status_code == 200
+
+
+async def test_o_env_do_webhook_so_APERTA(monkeypatch, webhook_client):
+    """A âncora é AVALIADA, não só registrada — e é isso que a documentação promete.
+
+    `.env.example`, README e o docstring de `whatsapp_limit` dizem que
+    `WHATSAPP_RATE_LIMIT` só aperta. Registrar a âncora (o teste abaixo) não prova
+    isso: trocar a ordem dos dois decorators, passar `override_defaults=False`, ou uma
+    mudança do slowapi em como `_route_limits` e `_dynamic_route_limits` se juntam,
+    tiraria a âncora da avaliação com os dois testes vizinhos verdes — e o teto que um
+    typo de env não podia levantar passaria a ser levantável sem limite.
+    """
+    monkeypatch.setenv("WHATSAPP_RATE_LIMIT", "100000/minute")
+    body = corpo()
+    headers = assinar(body)
+
+    async with await webhook_client() as c:
+        for _ in range(600):
+            assert (await c.post("/webhook/whatsapp", content=body,
+                                 headers=headers)).status_code == 200
+
+        r = await c.post("/webhook/whatsapp", content=body, headers=headers)
+
+    assert r.status_code == 429
 
 
 async def test_a_ancora_estatica_esta_registrada():

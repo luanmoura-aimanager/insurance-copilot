@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import PlainTextResponse
+from starlette.requests import ClientDisconnect
 from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import BaseModel, Field
 from slowapi import _rate_limit_exceeded_handler
@@ -20,6 +21,7 @@ from app.whatsapp import (
     ASSINATURA_HEADER,
     MAX_BODY_BYTES,
     extract_messages,
+    id_curto,
     mascarar_telefone,
     verify_challenge,
     verify_signature,
@@ -147,23 +149,54 @@ async def ask(
 async def _corpo_com_teto(request: Request) -> bytes | None:
     """Lê o corpo até `MAX_BODY_BYTES`; devolve None se passar disso.
 
-    `await request.body()` bufferiza o stream inteiro, e aqui isso é feito ANTES de
-    qualquer autenticação (o HMAC precisa dos bytes pra existir). O `Content-Length`
-    sozinho não basta — em `Transfer-Encoding: chunked` ele nem vem —, então o teto é
-    conferido também enquanto se lê.
+    Substitui o `await request.body()` (que bufferiza o stream inteiro) porque aqui a
+    leitura acontece ANTES de qualquer autenticação — o HMAC precisa dos bytes pra
+    existir, então o que dá pra fazer não é verificar antes de ler, é limitar a
+    leitura. O `Content-Length` sozinho não basta: em `Transfer-Encoding: chunked` ele
+    nem vem, e é o cliente que o escolhe — daí contar também enquanto se lê.
+
+    Três detalhes carregam peso, e os três são alcançáveis por qualquer anônimo.
+
+    (1) O `int()` vai dentro de `try`: `"²".isdigit()` é **True** e `int("²")` levanta
+    `ValueError` (`isdecimal` seria False, mas `try` não depende de eu ter escolhido o
+    predicado certo). Um `Content-Length: ²` estourava 500 com traceback, antes da
+    checagem de assinatura, na rota pública.
+
+    (2) `ClientDisconnect` é capturado: `request.stream()` levanta quando o cliente
+    aborta no meio do corpo, e nada tratava isso — 500 e traceback por request, na
+    ÚNICA rota cujo contrato é nunca responder não-2xx. Pior no caso real: se o
+    cliente da própria Meta expirar no meio da entrega, o 500 é o que empurra ela pra
+    desabilitar a inscrição. Corpo incompleto vira corpo vazio, que não passa no HMAC.
+
+    (3) `request._body` é preenchido no fim. `Request.stream()` marca o stream como
+    consumido sem popular `_body`, então um `await request.body()` posterior levantaria
+    `RuntimeError: Stream consumed` — e quem faria isso é justamente quem vier depois
+    (uma dependency do FastAPI que leia o corpo, um middleware de log, a W2). Guardar o
+    resultado deixa o `Request` no mesmo estado em que o `body()` o deixaria.
     """
     declarado = request.headers.get("content-length")
-    if declarado is not None and declarado.isdigit() and int(declarado) > MAX_BODY_BYTES:
-        return None
+    if declarado is not None:
+        try:
+            if int(declarado) > MAX_BODY_BYTES:
+                return None
+        except ValueError:
+            pass
 
     partes: list[bytes] = []
     tamanho = 0
-    async for pedaco in request.stream():
-        tamanho += len(pedaco)
-        if tamanho > MAX_BODY_BYTES:
-            return None
-        partes.append(pedaco)
-    return b"".join(partes)
+    try:
+        async for pedaco in request.stream():
+            tamanho += len(pedaco)
+            if tamanho > MAX_BODY_BYTES:
+                return None
+            partes.append(pedaco)
+    except ClientDisconnect:
+        logger.warning("webhook whatsapp: cliente desconectou no meio do corpo")
+        partes = []
+
+    raw = b"".join(partes)
+    request._body = raw
+    return raw
 
 
 # O handshake de verificação, que a Meta dispara UMA vez ao cadastrar a URL.
@@ -262,14 +295,14 @@ async def whatsapp_webhook(request: Request) -> Response:
         try:
             # O texto NUNCA vai pro log — só o tamanho dele. Telefone mascarado.
             logger.info(
-                "webhook whatsapp: mensagem (wamid=%s, de=%s, tipo=%s, caracteres=%d)",
-                msg.wamid,
+                "webhook whatsapp: mensagem (id=%s, de=%s, tipo=%s, caracteres=%d)",
+                id_curto(msg.wamid),
                 mascarar_telefone(msg.from_phone),
                 msg.tipo,
                 len(msg.text or ""),
             )
         except Exception:
-            logger.exception("webhook whatsapp: falha ao registrar mensagem (wamid=%s)", msg.wamid)
+            logger.exception("webhook whatsapp: falha ao registrar mensagem (id=%s)", id_curto(msg.wamid))
 
     # W2 herda daqui: a Meta pode REENTREGAR o mesmo `wamid` (é o que ela faz quando
     # não recebe 200 a tempo). Hoje isso é inofensivo porque só se loga; quando o

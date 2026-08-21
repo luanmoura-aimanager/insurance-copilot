@@ -59,15 +59,28 @@ def _config(var: str) -> str:
     resposta.
     """
     valor = os.getenv(var, "").strip()
+    # O placeholder do .env.example conta como AUSENTE. Ele é truthy, então passava
+    # pelo `if not valor` — e um `cp .env.example .env` deixava de pé um webhook
+    # público cujo único obstáculo é um segredo impresso no repositório. É diferente
+    # do resto dos CHANGE_ME: `DATABASE_URL_RO` e `VOYAGE_API_KEY` são credenciais de
+    # SAÍDA, e aqui é a barreira de ENTRADA do primeiro endpoint sem auth do projeto.
+    # (O .env.example agora vem com os dois vazios; isto é a segunda camada, pra quem
+    # copiar o valor da documentação em vez do arquivo.)
+    if valor.startswith("CHANGE_ME"):
+        valor = ""
     if not valor:
         # ERROR, não WARNING: no webhook um erro de configuração tem custo COMPOSTO —
         # a Meta reenvia em não-2xx e desabilita a inscrição depois de falhas
         # repetidas, e recadastrar é passo manual no console dela. Sem esta linha o
         # 500 seria mudo, e o operador só descobriria pelo webhook já desligado.
         logger.error("webhook whatsapp: %s ausente — o webhook vai recusar tudo", var)
+        # O detalhe fica SÓ no log. A rota é pública e sem auth, então o corpo da
+        # resposta entregaria a um scanner o nome da variável (o schema de
+        # configuração do deploy) e o aviso de que ele está meio provisionado agora.
+        # O operador é servido pela linha acima, que é estritamente mais completa.
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"{var} não configurado",
+            detail="configuração ausente",
         )
     return valor
 
@@ -157,6 +170,24 @@ def mascarar_telefone(numero: str) -> str:
     return f"***{numero[-4:]}" if len(numero) > 4 else "***"
 
 
+def id_curto(wamid: str) -> str:
+    """Digest curto do wamid, porque o WAMID EMBUTE O TELEFONE.
+
+    Não é paranoia de formato: o id da Cloud API é `wamid.<base64>`, e o base64
+    decodifica pra uma estrutura que contém o número em texto puro — o exemplo usado
+    nos testes, `HBgNNTUxMTk5OTk5ODg4OA==`, vira `b'\x1c\x18\r5511999998888'`. Logar o
+    wamid inteiro ao lado de `de=***8888` seria mascarar o telefone numa coluna e
+    publicá-lo, reversível, na outra — e o teste de PII passava justamente porque o
+    base64 escondia isso de uma busca por substring.
+
+    O digest preserva o que o log precisa (reconhecer a MESMA mensagem entre duas
+    linhas, distinguir reentrega de mensagem nova) e descarta o que ele não precisa
+    (o identificador que a Meta usa). Quando a W2 guardar o wamid pra deduplicar, ele
+    fica no banco, que é onde um identificador com PII dentro deve morar.
+    """
+    return hashlib.sha256(wamid.encode("utf-8")).hexdigest()[:12]
+
+
 @dataclass(frozen=True)
 class IncomingMessage:
     """Uma mensagem recebida, com só o que a borda precisa saber.
@@ -170,6 +201,12 @@ class IncomingMessage:
     from_phone: str
     tipo: str
     text: str | None
+    # De `value.metadata`, não da mensagem: um app secret da Meta cobre TODOS os
+    # números da conta, e o envio da Cloud API é `POST /{phone_number_id}/messages`.
+    # Sem carregar isto aqui, a W2 teria que fixar um número no código (errado em
+    # silêncio no dia do segundo) ou reparsear um payload que já não existe mais.
+    # `None` quando o payload não traz — não é motivo pra descartar a mensagem.
+    phone_number_id: str | None
 
 
 def extract_messages(payload: object) -> list[IncomingMessage]:
@@ -197,8 +234,15 @@ def extract_messages(payload: object) -> list[IncomingMessage]:
             value = change.get("value")
             if not isinstance(value, dict):
                 continue
+            metadata = value.get("metadata")
+            phone_number_id = (
+                metadata.get("phone_number_id") if isinstance(metadata, dict) else None
+            )
+            if not isinstance(phone_number_id, str):
+                phone_number_id = None
+
             for bruta in _lista(value.get("messages")):
-                msg = _mensagem(bruta)
+                msg = _mensagem(bruta, phone_number_id)
                 if msg is not None:
                     mensagens.append(msg)
 
@@ -209,7 +253,7 @@ def _lista(valor: object) -> list:
     return valor if isinstance(valor, list) else []
 
 
-def _mensagem(bruta: object) -> IncomingMessage | None:
+def _mensagem(bruta: object, phone_number_id: str | None) -> IncomingMessage | None:
     """Uma entrada de `value.messages`, ou None se não der pra identificar.
 
     `id` e `from` são obrigatórios: sem os dois não há o que logar nem, na W2, pra
@@ -235,4 +279,10 @@ def _mensagem(bruta: object) -> IncomingMessage | None:
         if isinstance(corpo, dict) and isinstance(corpo.get("body"), str):
             texto = corpo["body"]
 
-    return IncomingMessage(wamid=wamid, from_phone=from_phone, tipo=tipo, text=texto)
+    return IncomingMessage(
+        wamid=wamid,
+        from_phone=from_phone,
+        tipo=tipo,
+        text=texto,
+        phone_number_id=phone_number_id,
+    )
