@@ -25,6 +25,10 @@ logger = logging.getLogger(__name__)
 # num teste rápido, sem sleep).
 DEFAULT_CLIENT_LIMIT = "30/hour"
 DEFAULT_IP_LIMIT = "10/minute"
+DEFAULT_WHATSAPP_LIMIT = "120/minute"
+
+# Teto DURO do webhook, e o número é o menos importante nele — ver whatsapp_limit().
+WEBHOOK_ANCORA = "600/minute"
 
 
 def _limit_from_env(var: str, default: str) -> str:
@@ -71,6 +75,34 @@ def ask_client_limit() -> str:
 
 def ask_ip_limit() -> str:
     return _limit_from_env("ASK_RATE_LIMIT_IP", DEFAULT_IP_LIMIT)
+
+
+def whatsapp_limit() -> str:
+    """Cota do POST /webhook/whatsapp, relida a cada request (env em call time).
+
+    ATENÇÃO — este callable é o ESPELHO do de cima, e a mesma linha do slowapi é usada
+    nos dois no sentido OPOSTO. Verificado na fonte do slowapi 0.1.10:
+
+    - `_should_exempt` (slowapi/middleware.py:98-113) faz o `SlowAPIMiddleware` pular
+      a rota inteira — e portanto o `default_limits` por IP — quando o nome dela está
+      em `limiter._route_limits`;
+    - `__limit_decorator` (slowapi/extension.py:667-710) só põe em `_route_limits`
+      limites ESTÁTICOS; `if callable(limit_value)` manda pra `_dynamic_route_limits`.
+
+    No /ask isso é o que MANTÉM o teto por IP cobrindo os 401 (o callable não isenta).
+    No webhook queremos o contrário: a Meta entrega em rajada, e 10/minute por IP faria
+    a plataforma receber 429, retentar e acabar desabilitando a inscrição. Por isso a
+    rota leva DUAS anotações — a estática `WEBHOOK_ANCORA`, que existe pelo efeito
+    colateral de pôr o nome em `_route_limits`, e este callable, que é o botão do
+    operador. Sem contagem em dobro: o wrapper externo grava
+    `request.state._rate_limiting_complete` (extension.py:729-736) e o interno pula,
+    e `_check_request_limit` avalia numa passada só TODOS os limites registrados sob o
+    nome da rota.
+
+    Consequência de a âncora ser avaliada junto: `WHATSAPP_RATE_LIMIT` só APERTA — um
+    valor acima de 600/minute é engolido pela âncora, não a levanta.
+    """
+    return _limit_from_env("WHATSAPP_RATE_LIMIT", DEFAULT_WHATSAPP_LIMIT)
 
 
 # key_func global = IP porque é a chave que o `default_limits` herda. O limite por IP

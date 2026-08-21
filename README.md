@@ -55,7 +55,7 @@ Building the footer is **best effort** end to end, like cost attribution: a fail
 
 The same split applies one layer down, in the MCP server: `run_query` returns a **query** error as text (the model wrote invalid SQL — that is a result the worker must be able to report) but lets a **connection** error propagate, so it becomes `FALHA_INTERNA` like any other infrastructure failure. That is also what makes the two database calls consistent: `get_schema()` never caught anything, so the same `OperationalError` used to be handled two different ways depending on which call hit it. Still uncovered, and deliberately left for its own slice: the **supervisor** node has no `try`, so an Anthropic outage there still surfaces as a 5xx.
 
-Each LLM call is cost-attributed per agent (one row per call: request id, agent, model, tokens, cost). Surface: WhatsApp (Meta Cloud API), with HMAC-verified webhooks.
+Each LLM call is cost-attributed per agent (one row per call: request id, agent, model, tokens, cost). Surface: WhatsApp (Meta Cloud API), whose HMAC-verified webhook already **receives** — see [The WhatsApp webhook](#the-whatsapp-webhook-inbound-only); replying is the next slice.
 
 ## Data: SUSEP corpus harvester
 
@@ -296,6 +296,9 @@ Anthropic API.
 | `API_TOKENS` | `whatsapp:abc…,dev:def…` | `name:token` pairs. The **name** identifies the caller; the token is the secret. Generate with `openssl rand -hex 32`. |
 | `ASK_RATE_LIMIT_CLIENT` | `30/hour` | Spend quota, keyed by the token's name. Per-route (`/ask`). |
 | `ASK_RATE_LIMIT_IP` | `10/minute` | Burst ceiling, keyed by IP. Applies to every non-exempt route, and counts rejected requests too. |
+| `WHATSAPP_VERIFY_TOKEN` | `openssl rand -hex 32` | Secret echoed back during Meta's one-off webhook verification handshake (`GET /webhook/whatsapp`). |
+| `WHATSAPP_APP_SECRET` | Meta app's App Secret | HMAC-SHA256 key that signs every webhook `POST`. The webhook is public, so this is its only barrier. |
+| `WHATSAPP_RATE_LIMIT` | `120/minute` | Webhook quota, per IP. Only ever *tightens*: a static `600/minute` anchor is evaluated alongside it. |
 
 Tokens carry an **identity** rather than being one shared secret, which is what makes per-client limits (and revoking one caller without touching the others) possible. Comparison uses `secrets.compare_digest` over *all* tokens with no early exit, so neither the token prefix nor its position in the list leaks by timing. An unset or empty `API_TOKENS` returns **500**, not 401 — a broken deploy should not look like a bad client credential.
 
@@ -319,7 +322,27 @@ A limit string that doesn't parse falls back to the default with a logged warnin
 uvicorn app.main:app --proxy-headers --forwarded-allow-ips='*'
 ```
 
-Without it every request arrives with the proxy's IP as `request.client.host`, so the per-IP limit counts the whole internet as a single caller and the first burst locks out everyone. Prefer the proxy's actual address over `'*'` when you know it — `--forwarded-allow-ips` decides who is trusted to set `X-Forwarded-For`, and trusting everyone lets a client forge its own IP (which, here, only lets it *dodge* the IP limit; the per-client limit is unaffected).
+Without it every request arrives with the proxy's IP as `request.client.host`, so the per-IP limit counts the whole internet as a single caller and the first burst locks out everyone. The `Procfile` passes both flags. On Railway the app is only reachable *through* their proxy, so the immediate peer is always the proxy and `*` has no third party to trust by mistake — that assumption is written down rather than implied. Prefer the proxy's actual CIDR when you know it.
+
+The `*` is **unquoted** on purpose. Quoted, a runner that execs the command without a shell hands uvicorn the literal three-character string `'*'`, which matches neither its `always_trust` check nor any IP — proxy headers are then ignored *silently* and the global-ceiling bug is back. Unquoted it cannot glob either: the pattern the shell tries to match is the whole word `--forwarded-allow-ips=*`, and no file starts with that prefix.
+
+**What the per-IP ceiling is and isn't.** Trusting every peer means a client can forge `X-Forwarded-For` and get a fresh bucket per request, so *any* IP-keyed limit is evadable. The ceiling is hygiene against honest bursts and lazy abuse. What actually stops brute force is entropy: the `/ask` tokens and `WHATSAPP_VERIFY_TOKEN` are 32 random bytes compared in constant time, and the webhook body is HMAC-signed. Treating the ceiling as the barrier would be an argument for a weak token, which is why it is spelled out here.
+
+### The WhatsApp webhook (inbound only)
+
+`/webhook/whatsapp` is the **first public endpoint** in the project: Meta sends no `Authorization` header, so the HMAC signature over the request body plays the part the Bearer token plays on `/ask`. Today it only **receives** — it proves an event arrived, came from Meta, and was not tampered with. Calling the graph and replying is the next slice.
+
+**The signature covers the bytes.** The handler reads `await request.body()` before any parsing, because `json.loads` followed by re-serialization would change the very thing being verified. The app secret is read *before* the header is inspected, deliberately: the other way round, an unsigned request against a misconfigured deploy would answer **403** ("Meta sent the wrong thing") and hide a broken deploy — the same disguise the `API_TOKENS` 500 exists to prevent. The hex is decoded with `bytes.fromhex` rather than compared as a string, which closes the same hole the Bearer path closed: `compare_digest` on `str` raises `TypeError` on non-ASCII, and the header is client-controlled.
+
+**Everything past the signature answers 200, on purpose.** Meta retries on non-2xx and disables the subscription after repeated failures, and a payload we cannot read is not something a retry fixes. So the parser is defensive by construction *and* wrapped in a `try` — Meta delivers non-message events on the same endpoint (`statuses`, the delivery/read callbacks) and adds fields without notice.
+
+**The log carries no PII**: message id, type, a masked phone (last 4 digits) and the *length* of the text. The content never reaches the log at any level; the test suite is what proves the parse works.
+
+**The body is read with a cap** (128 KB) before anything else: the HMAC cannot exist until the bytes are read, so this is the one place in the project where an anonymous caller makes the app allocate. Every other write path sits behind a Bearer token. Oversized bodies get a 413 Meta will never see — its payloads are small, since media arrives as an id rather than inline.
+
+**Its rate limit is the mirror of `/ask`'s, using the same slowapi line in the opposite direction.** `_should_exempt` skips the middleware — and therefore the per-IP ceiling — for any route whose name is in `_route_limits`, and only *static* limits land there. On `/ask` that is what keeps the ceiling covering the 401s. Here the ceiling is the problem: Meta delivers in bursts, `10/minute` would return 429, and Meta would retry and eventually switch the webhook off. So the route carries **two** limits — a static anchor whose job is that side effect (and which doubles as a hard cap no env typo can raise), plus the env-driven callable. They are each counted once: the outer wrapper marks the request complete and the inner one skips, while a single pass evaluates every limit registered for the route.
+
+Both carry `per_method=True`, which is not decoration. slowapi buckets by **path**, and the limit's own value is part of the key — so the GET's ceiling bucket and the POST's quota bucket are identical whenever the two configured amounts coincide. Reproduced with both at `5/minute`: five wrong-token handshakes from any anonymous caller pushed the next correctly-signed delivery to **429**, which is precisely the retry-then-disable outcome the anchor exists to prevent. The handshake (`GET`) does keep the per-IP ceiling — nobody legitimate calls it in a loop — but that is hygiene, not the barrier; see above.
 
 ## Project structure
 
@@ -328,8 +351,9 @@ insurance-copilot/
 ├── .github/
 │   └── workflows/ci.yml    # CI: pytest on every PR and push to main
 ├── app/
-│   ├── main.py             # FastAPI app + health endpoints + POST /ask
+│   ├── main.py             # FastAPI app + health endpoints + POST /ask + WhatsApp webhook
 │   ├── auth.py             # Bearer auth with identity (API_TOKENS: name -> token)
+│   ├── whatsapp.py         # WhatsApp edge: verification handshake + HMAC signature + payload parse
 │   ├── limits.py           # slowapi limiter: per-client + per-IP keys
 │   ├── db.py               # lazy async engine + session factory (SQLAlchemy 2.0)
 │   ├── rag/                # chunking + embedding + similarity search over clause_chunk
@@ -393,7 +417,7 @@ PDF footer).
 - [x] `POST /ask` hardening — Bearer auth with identity + per-client and per-IP rate limits; a worker's exception never reaches the caller (marked failure message → `FALHA_INTERNA`, traceback with `request_id`/`client` in the log); every answer declares the base it stands on — the corpus count on the SQL route, the retrieved-clause count on the RAG route, the *searchable* count on "found nothing" — declared by the worker that consulted and assembled in code, never by the model
 - [x] Cost attribution in the agent graph — one `cost_event` per LLM call, tagged with a per-request id and the calling client
 - [~] RAG worker — vector storage ready (pgvector extension, `clause_chunk` with an exclusive-arc origin, HNSW/cosine index, revoked from the SQL worker's role), chunks materialized from the extracted text (one source row = one chunk, idempotent re-indexing that invalidates the vector when the text changes), embeddings filled by a resumable, cost-attributed pass (Voyage `voyage-4-lite`, `input_type="document"`, one `cost_event` per batch), similarity search as a testable function (`search_clauses`, `input_type="query"`, relevance threshold, per-document filter), and a `rag_worker` node wired into the graph behind a three-way supervisor; **pending:** calibrating the threshold against the labelled question set
-- [ ] WhatsApp surface
+- [~] WhatsApp surface — inbound edge done (`/webhook/whatsapp`: verification handshake, HMAC-SHA256 over the raw body, defensive payload parse, PII-free logging, and a rate limit that escapes the per-IP ceiling without going uncapped). Pending: dedup by `wamid`, calling the graph, and replying through the Cloud API
 - [ ] Deploy to Railway
 
 ## License
