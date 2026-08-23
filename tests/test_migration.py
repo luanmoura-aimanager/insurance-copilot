@@ -11,6 +11,7 @@ EXPECTED_TABLES = {
     # migration e este teste continua verde. Por isso o schema cresce aqui junto.
     "cost_event",
     "clause_chunk",
+    "whatsapp_message",
 }
 
 

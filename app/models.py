@@ -264,3 +264,83 @@ class Exclusion(Base):
     coverage_id: Mapped[int | None] = mapped_column(ForeignKey("coverage.id"))
     scope: Mapped[str]                          # general | coverage
     clause_text: Mapped[str]                    # verbatim clause (feeds RAG)
+
+
+class WhatsAppMessage(Base):
+    """Fila de entrada do WhatsApp: uma mensagem recebida, ainda **não** respondida.
+
+    NÃO é domínio. As cinco tabelas de domínio descrevem o produto de seguro; esta é a
+    fronteira operacional de um canal — mesma natureza de `cost_event`, e é por isso que
+    fica fora do alcance do worker SQL (ver o REVOKE, abaixo).
+
+    O grão é a **mensagem entregue**, não a conversa: a Meta entrega em lote e cada item
+    de `value.messages` vira uma linha. Conversa (histórico, turno, contexto) é desenho
+    da W2b, quando existir com o que responder.
+
+    **A tabela existe porque o 200 mudou de significado.** Na W1 o webhook lia o evento,
+    logava e jogava fora — o 200 dizia "li o que deu". Com o inbox ele passa a dizer
+    "aceito com durabilidade", e é essa promessa que autoriza a W2b a processar fora do
+    request: a Meta considera a entrega concluída e nunca mais a reenvia.
+
+    **`wamid` é UNIQUE, e é isso que torna o 500 do webhook seguro.** A Meta REENTREGA o
+    mesmo `wamid` quando não recebe 200 a tempo — e a rota agora provoca isso de
+    propósito quando não consegue gravar (ver `app/main.py`). Sem a unicidade, cada
+    retentativa viraria uma linha nova e a W2b responderia a mesma pergunta N vezes,
+    pagando N rodadas de LLM. É a idempotência que autoriza o retry, não o contrário.
+
+    **`phone_number_id` fecha o handoff que a W1 anunciou.** Um app secret da Meta cobre
+    TODOS os números da conta e o envio da Cloud API é `POST /{phone_number_id}/messages`
+    — o comentário em `app/whatsapp.py` carrega esse campo pela borda justamente pra que
+    a W2b não fixe um número no código (errado em silêncio no dia do segundo número).
+    Como ela varre os pendentes FORA do request, o payload já não existe lá: se o número
+    não viajar na linha, aquela justificativa morre exatamente no handoff. Nullable
+    porque a borda não descarta mensagem por falta dele.
+
+    **PENDÊNCIA — retenção.** `from_phone` e `text` são PII guardada com finalidade
+    (responder), o que é legítimo e é também o que cria a obrigação: sem política de
+    expurgo um inbox acumula conversa de usuário para sempre, e o "por finalidade" deixa
+    de valer no instante em que a finalidade se cumpre. Esta fatia NÃO implementa
+    expurgo. O que falta decidir é a janela (dias após `processed_at`) e quem executa —
+    e `processed_at` existe, entre outras coisas, para ser o marco dessa contagem.
+
+    Duas coisas ficam pendentes JUNTO com ela, e as duas são de propósito. (1) Os dois
+    timestamps são `TIMESTAMP` ingênuo, como os outros quatro do schema
+    (`extracted_at`, os dois `created_at`): uniformidade vale mais do que corrigir um
+    isolado, e o servidor roda em UTC, onde não há ambiguidade. Mas `processed_at` será o
+    único campo do projeto cujo valor é um PRAZO e não um diagnóstico — se a política
+    exigir precisão de fuso, é aí que ele vira `timestamptz`, junto com os outros. (2)
+    Não há índice em `processed_at`: um `DELETE ... WHERE processed_at < now() - N` faria
+    seq scan, mas o índice certo depende do predicado que a política escolher, e indexar
+    para uma query que ninguém escreveu ainda é chutar. Os dois são migration barata numa
+    tabela que, por construção, é a que menos cresce.
+    """
+
+    __tablename__ = "whatsapp_message"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'answered', 'failed')",
+            name="ck_whatsapp_message_status",
+        ),
+        # A chave de idempotência. Ver o parágrafo do `wamid` no docstring: é o que
+        # transforma a reentrega da Meta (e o retry que o nosso 500 provoca) em no-op.
+        UniqueConstraint("wamid", name="uq_whatsapp_message_wamid"),
+        # Pra varredura de pendentes da W2b. Nota honesta: em regime permanente
+        # `answered` domina a tabela e um índice PARCIAL (`WHERE status = 'pending'`)
+        # seria bem mais apertado — como no `clause_chunk`. Fica total porque quem
+        # define a varredura é a W2b (que também pode querer `failed`, pra retentar), e
+        # apertar antes de saber a query é chutar o predicado.
+        Index("ix_whatsapp_message_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    wamid: Mapped[str]                          # id da Meta — a chave de idempotência
+    from_phone: Mapped[str]                     # pra QUEM responder
+    text: Mapped[str]                           # a pergunta; só mensagem de texto vira linha
+    phone_number_id: Mapped[str | None]         # de QUAL número responder (value.metadata)
+    # server_default, e não só default de ORM: o INSERT do webhook é Core e a W2b vai
+    # mexer nesta coluna por SQL — a autoridade do valor inicial é o banco.
+    status: Mapped[str] = mapped_column(server_default="pending")
+    received_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    # NULL até a W2b: nesta fatia nada nunca sai de 'pending'. É também o marco a partir
+    # do qual a política de retenção (pendência, acima) vai contar.
+    processed_at: Mapped[datetime | None]

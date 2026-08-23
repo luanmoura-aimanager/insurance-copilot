@@ -50,8 +50,8 @@
 <p class="sub">Cinco tabelas de <strong>domínio</strong> estruturam as condições gerais de seguro
 residencial (SUSEP). O grão da extração é <strong>(seguradora × cobertura)</strong>, e as coberturas
 são canonizadas <strong>por perigo</strong>, não por nome comercial. Duas outras tabelas ficam
-<strong>fora do domínio</strong> — <code>clause_chunk</code> (recuperação) e <code>cost_event</code>
-(governança); estão no segundo diagrama.</p>
+<strong>fora do domínio</strong> — <code>clause_chunk</code> (recuperação), <code>cost_event</code>
+(governança) e <code>whatsapp_message</code> (fila de entrada do canal); estão no segundo diagrama.</p>
 
 <div class="legend">
   <span class="chip"><span class="dot" style="background:var(--pk)"></span> PK — chave primária</span>
@@ -175,14 +175,16 @@ são canonizadas <strong>por perigo</strong>, não por nome comercial. Duas outr
 </svg>
 </div>
 
-<h2 class="section">Fora do domínio: recuperação e governança</h2>
-<p class="sub tight">Estas duas não descrevem o produto de seguro. <code>clause_chunk</code> é a
-camada de recuperação do worker RAG; <code>cost_event</code> é observabilidade de custo. Ficam num
-diagrama à parte porque ligam ao schema de domínio de fora — ou por FK que aponta pra dentro
-(<code>clause_chunk</code>), ou por nada (<code>cost_event</code>).</p>
+<h2 class="section">Fora do domínio: recuperação, governança e canal</h2>
+<p class="sub tight">Estas três não descrevem o produto de seguro. <code>clause_chunk</code> é a
+camada de recuperação do worker RAG; <code>cost_event</code> é observabilidade de custo;
+<code>whatsapp_message</code> é a fila de entrada do WhatsApp — o que chegou e ainda não foi
+respondido. Ficam num diagrama à parte porque ligam ao schema de domínio de fora — ou por FK que
+aponta pra dentro (<code>clause_chunk</code>), ou por nada (<code>cost_event</code>,
+<code>whatsapp_message</code>).</p>
 
 <div class="wrap">
-<svg viewBox="0 0 980 300" xmlns="http://www.w3.org/2000/svg">
+<svg viewBox="0 0 980 570" xmlns="http://www.w3.org/2000/svg">
 
   <!-- ============ clause_chunk (recuperação) ============ -->
   <g transform="translate(30,20)">
@@ -232,6 +234,27 @@ diagrama à parte porque ligam ao schema de domínio de fora — ou por FK que a
     <text class="col" x="14" y="204">created_at</text><text class="col-type" x="312" y="204">timestamp</text>
     <text class="tbl-note" x="14" y="240">sem FK nenhuma — não é schema de domínio</text>
   </g>
+
+  <!-- ============ whatsapp_message (canal) ============ -->
+  <g transform="translate(30,290)">
+    <rect class="box" x="0" y="0" width="420" height="250" rx="8"/>
+    <rect class="hdr" x="0" y="0" width="420" height="34" rx="8"/>
+    <rect class="hdr" x="0" y="24" width="420" height="10"/>
+    <text class="tbl-title" x="14" y="22">whatsapp_message</text>
+    <text class="tbl-note" x="268" y="22">1 mensagem recebida</text>
+
+    <text class="col" x="14" y="56">id</text><text class="badge" x="46" y="56" fill="#7a5af5">PK</text>
+    <text class="col" x="14" y="78">wamid</text><text class="badge" x="70" y="78" fill="#0f766e">UQ</text>
+    <text class="col-type" x="150" y="78">id da Meta — dedup</text>
+    <text class="col" x="14" y="100">from_phone</text><text class="col-type" x="300" y="100">text · PII</text>
+    <text class="col" x="14" y="118">text</text><text class="col-type" x="286" y="118">a pergunta · PII</text>
+    <text class="col" x="14" y="136">phone_number_id</text><text class="col-type" x="290" y="136">text? · de qual número responder</text>
+    <text class="col" x="14" y="158">status</text><text class="col-type" x="234" y="158">pending | answered | failed</text>
+    <text class="col" x="14" y="176">received_at</text><text class="col-type" x="312" y="176">timestamp</text>
+    <text class="col" x="14" y="194">processed_at</text><text class="col-type" x="306" y="194">timestamp?</text>
+    <text class="tbl-note" x="14" y="222">sem SELECT pra insurance_ro — guarda PII, não apólice</text>
+    <text class="tbl-note" x="14" y="240">pendência: política de retenção (expurgo após processed_at)</text>
+  </g>
 </svg>
 </div>
 
@@ -273,6 +296,11 @@ diagrama à parte porque ligam ao schema de domínio de fora — ou por FK que a
       <td><code>cost_event</code></td>
       <td>Uma chamada de LLM</td>
       <td>Governança, não domínio. O grão é a <em>chamada</em> (não o documento, não o request) — é o que permite responder "quanto custou este <code>/ask</code>?" e "qual agente queima o orçamento?".</td>
+    </tr>
+    <tr>
+      <td><code>whatsapp_message</code></td>
+      <td>Uma mensagem de texto recebida</td>
+      <td>Fila de entrada do canal, não domínio. Existe pra que o <strong>200</strong> do webhook signifique "aceito com durabilidade": <code>wamid</code> é UNIQUE, então a reentrega da Meta é no-op — e é isso que permite ao webhook devolver 500 quando <em>não</em> consegue gravar, pra que ela reenvie. Guarda PII com finalidade (responder), e por isso pede política de retenção.</td>
     </tr>
   </table>
 </details>

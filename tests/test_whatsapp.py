@@ -1,9 +1,17 @@
 """
-Testes da borda do WhatsApp (fatia W1): handshake, assinatura HMAC e rate limit.
+Testes da BORDA do WhatsApp: handshake, assinatura HMAC, leitura do payload e rate
+limit. Quem prova que a mensagem é guardada é `tests/test_whatsapp_inbox.py`, que sobe
+container — aqui a persistência é falsa de propósito.
 
-Sem rede e sem banco — o webhook não toca no Postgres, então este módulo não pede a
-fixture `client` do conftest (aquela sobe container). Nenhum teste gasta dinheiro:
-não há chamada de LLM nem de embedding neste caminho.
+Sem rede e sem banco, e desde a W2a isso exige um passo a mais. A rota passou a pedir
+`session=Depends(get_session)`, e dependência do FastAPI resolve ANTES do corpo do
+handler: sem override, `_sessionmaker()` leria `os.environ["DATABASE_URL"]` e este
+módulo passaria a depender de um container subido por OUTRO módulo antes dele — a
+armadilha de ordem de fixture que este projeto já pagou quatro vezes (ver a seção da
+engine preguiçosa na CLAUDE.md). `webhook_client` sobrescreve `get_session` por uma
+sessão falsa, e ela é também o seam do teste do 500.
+
+Nenhum teste gasta dinheiro: não há chamada de LLM nem de embedding neste caminho.
 """
 import base64
 import hashlib
@@ -61,6 +69,56 @@ def assinar(body: bytes, secret: str = APP_SECRET) -> dict[str, str]:
     return {"X-Hub-Signature-256": f"sha256={digest}"}
 
 
+class SessaoFalsa:
+    """Sessão que aceita o INSERT do webhook sem banco nenhum.
+
+    `execute` devolve um objeto com `.scalars()` vazio, que é o que
+    `_registrar_mensagens` lê — ou seja, todo wamid sai como "duplicada" no log daqui.
+    Não importa: quem afirma "nova vs duplicada" é o módulo do inbox, com Postgres de
+    verdade. O que este falso preserva é que a rota continua exercitando o caminho
+    inteiro (incluindo o commit) sem depender de container.
+
+    `falha_em` faz `execute` levantar e `falha_no_commit` faz `commit` levantar — os
+    dois existem porque são caminhos DIFERENTES: "o statement falhou" e "o statement
+    passou e a conexão morreu no COMMIT" chegam ao mesmo `except` com o estado da sessão
+    diferente, e só o segundo exercita o rollback sobre linhas já enviadas.
+
+    `falha_no_rollback` cobre o terceiro: numa conexão morta o próprio rollback levanta,
+    e é aí que se prova que o log do erro ORIGINAL sai antes da limpeza.
+    """
+
+    def __init__(self, falha_em: Exception | None = None):
+        self.falha_em = falha_em
+        self.falha_no_commit: Exception | None = None
+        self.falha_no_rollback: Exception | None = None
+        self.commits = 0
+        self.rollbacks = 0
+        self.closes = 0
+
+    async def execute(self, *_args, **_kwargs):
+        if self.falha_em is not None:
+            raise self.falha_em
+
+        class _Resultado:
+            def scalars(self):
+                return iter(())
+
+        return _Resultado()
+
+    async def commit(self):
+        if self.falha_no_commit is not None:
+            raise self.falha_no_commit
+        self.commits += 1
+
+    async def rollback(self):
+        self.rollbacks += 1
+        if self.falha_no_rollback is not None:
+            raise self.falha_no_rollback
+
+    async def close(self):
+        self.closes += 1
+
+
 @pytest.fixture
 def webhook_client(monkeypatch):
     """Factory (não client): o teste aperta o env ANTES de abrir a conexão.
@@ -68,6 +126,9 @@ def webhook_client(monkeypatch):
     Mesmo formato do `protected_client` de tests/test_auth.py, e pelo mesmo motivo —
     os limites e os segredos são lidos a cada request, então basta o env estar no
     lugar na hora da chamada. Limites folgados por padrão; quem testa limite aperta.
+
+    A sessão falsa fica pendurada na própria factory (`.sessao`), pra que o teste do
+    500 possa armá-la pra falhar e depois conferir commit/rollback.
     """
     monkeypatch.setenv("WHATSAPP_APP_SECRET", APP_SECRET)
     monkeypatch.setenv("WHATSAPP_VERIFY_TOKEN", VERIFY_TOKEN)
@@ -80,9 +141,17 @@ def webhook_client(monkeypatch):
 
     from app.main import app
 
+    sessao = SessaoFalsa()
+
+    # Sem isto o módulo inteiro passaria a exigir DATABASE_URL — ver o docstring do
+    # módulo. `app.db.SessionLocal` é o seam documentado do projeto (a rota resolve o
+    # nome na CHAMADA, por import tardio), o mesmo que `tests/test_cost_graph.py` usa.
+    monkeypatch.setattr("app.db.SessionLocal", lambda **_kw: sessao)
+
     async def _make():
         return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
 
+    _make.sessao = sessao
     return _make
 
 
@@ -504,6 +573,215 @@ async def test_o_500_nao_diz_qual_variavel_falta(monkeypatch, webhook_client):
 
     assert r.status_code == 500
     assert "WHATSAPP_APP_SECRET" not in r.text
+
+
+# --- persistência (W2a) -----------------------------------------------------
+#
+# Só o caminho de FALHA mora aqui, porque é o único que se prova sem banco. Que a
+# mensagem é gravada, deduplicada e marcada 'pending' está em tests/test_whatsapp_inbox.py.
+
+
+def _erro_transitorio(msg: str = "server closed the connection unexpectedly"):
+    """Um erro de banco que uma REENTREGA tem chance de resolver.
+
+    Tem que ser um tipo de `sqlalchemy.exc` de verdade: a rota classifica por `isinstance`
+    (`_vale_reentregar`), e um `RuntimeError` genérico cairia no ramo PERMANENTE — que
+    devolve 200. Usar o tipo errado aqui faria o teste do 500 medir o caminho oposto.
+    """
+    from sqlalchemy.exc import OperationalError
+
+    return OperationalError("INSERT INTO whatsapp_message", {}, Exception(msg))
+
+
+async def test_falha_ao_gravar_devolve_500_e_nao_200(caplog, webhook_client):
+    """A exceção do contrato de 200 — e a asserção que importa é `!= 200`.
+
+    Todo o resto pós-assinatura devolve 200 de propósito, porque a Meta desabilita a
+    inscrição depois de não-2xx repetido e nada daquilo se conserta retentando. Não
+    conseguir GRAVAR é a única falha aqui que uma retentativa CONSERTA: um 200 diria à
+    Meta que a entrega terminou, ela nunca reenviaria, e a pergunta sumiria sem que
+    ninguém do lado do usuário soubesse. Mentira plausível é a pior saída possível.
+
+    Só é seguro devolver 500 porque `wamid` é UNIQUE: o lote reentregue reentra pelo
+    ON CONFLICT DO NOTHING sem duplicar (tests/test_whatsapp_inbox.py prova esse lado).
+    """
+    fabrica = webhook_client
+    fabrica.sessao.falha_em = _erro_transitorio()
+
+    body = corpo()
+    with caplog.at_level(logging.INFO, logger="app.main"):
+        async with await fabrica() as c:
+            r = await c.post("/webhook/whatsapp", content=body, headers=assinar(body))
+
+    assert r.status_code != 200
+    assert r.status_code == 500
+
+    # A transação é desfeita antes de sair: nada de estado pela metade pra W2b achar.
+    assert fabrica.sessao.rollbacks == 1
+    assert fabrica.sessao.commits == 0
+
+    # O operador é servido pelo log, e precisa do traceback: sem exc_info ele sabe QUE
+    # caiu e não POR QUE — o inverso do que serve pra diagnosticar banco fora do ar.
+    falhas = [r for r in caplog.records if "falha ao GRAVAR" in r.getMessage()]
+    assert len(falhas) == 1
+    assert falhas[0].exc_info is not None
+    assert falhas[0].levelno == logging.ERROR
+
+
+async def test_falha_ao_gravar_nao_vaza_detalhe_de_infra(webhook_client):
+    """O texto da exceção não chega ao corpo da resposta.
+
+    Mesma regra do `_falha_de_worker` do /ask: um OperationalError do Postgres carrega
+    host, porta, usuário e banco. A rota é pública e sem auth — aqui o vazamento é pior
+    que no /ask, porque não há sequer um token separando quem lê.
+    """
+    segredo = "postgres-interno.local:5432 user=insurance_ro"
+    fabrica = webhook_client
+    fabrica.sessao.falha_em = _erro_transitorio(f"connection failed: {segredo}")
+
+    body = corpo()
+    async with await fabrica() as c:
+        r = await c.post("/webhook/whatsapp", content=body, headers=assinar(body))
+
+    assert r.status_code == 500
+    # Palavra por palavra: truncar a mensagem da exceção ainda vazaria host e usuário.
+    for palavra in segredo.replace(":", " ").replace("=", " ").split():
+        assert palavra not in r.text
+
+
+async def test_tipo_nao_texto_nao_chega_a_gravar(webhook_client):
+    """Áudio/imagem não viram linha — e isso se vê sem banco: o INSERT nem roda.
+
+    Se rodasse, `commits` seria 1. O par deste teste (a AUSÊNCIA de linha no Postgres)
+    está no módulo do inbox; este aqui é o que prova que não se paga uma ida ao banco
+    por um evento que não tem pergunta dentro.
+    """
+    payload = {
+        "object": "whatsapp_business_account",
+        "entry": [{"changes": [{"field": "messages", "value": {
+            "metadata": {"phone_number_id": "123"},
+            "messages": [{"id": WAMID, "from": TELEFONE, "type": "image",
+                          "image": {"id": "media-123"}}],
+        }}]}],
+    }
+    fabrica = webhook_client
+    body = corpo(payload)
+    async with await fabrica() as c:
+        r = await c.post("/webhook/whatsapp", content=body, headers=assinar(body))
+
+    assert r.status_code == 200
+    assert fabrica.sessao.commits == 0
+
+
+async def test_falha_PERMANENTE_devolve_200_e_nao_derruba_a_inscricao(caplog, webhook_client):
+    """O contrapeso do teste acima, e o desfecho que ele mede é o pior de todos.
+
+    Um erro que a reentrega NÃO conserta — texto com NUL (JSON válido, o Postgres não
+    guarda), um `DataError`, um bug nosso no statement — sai 200. Com 500, a Meta manda
+    o mesmo lote de novo, falha igual, e depois de falhas repetidas **desabilita a
+    inscrição**: trocaríamos a perda de UMA mensagem pela perda de TODAS as futuras,
+    mais um recadastro manual no console dela.
+
+    O default do desconhecido é este ramo de propósito (`_vale_reentregar` é uma lista
+    fechada): perder uma mensagem com um ERROR no log é recuperável, webhook desligado
+    em silêncio não é. Daí a segunda asserção — o 200 aqui NÃO pode ser silencioso.
+    """
+    fabrica = webhook_client
+    fabrica.sessao.falha_em = ValueError("A string literal cannot contain NUL (0x00) characters")
+
+    body = corpo()
+    with caplog.at_level(logging.INFO, logger="app.main"):
+        async with await fabrica() as c:
+            r = await c.post("/webhook/whatsapp", content=body, headers=assinar(body))
+
+    assert r.status_code == 200
+
+    falhas = [rec for rec in caplog.records if "falha ao GRAVAR" in rec.getMessage()]
+    assert len(falhas) == 1
+    assert falhas[0].levelno == logging.ERROR
+    assert falhas[0].exc_info is not None
+    # A mensagem tem que dizer que a mensagem se PERDEU — um 200 registrado como se
+    # tivesse dado certo é a mentira plausível de novo, agora no log.
+    assert "PERDIDAS" in falhas[0].getMessage()
+
+
+async def test_falha_no_COMMIT_tambem_e_tratada(webhook_client):
+    """O statement passa e a conexão morre no COMMIT — caminho diferente do `execute`.
+
+    Sem isto, o `except` só era exercitado com a sessão em estado limpo, e o rollback
+    sobre linhas já enviadas nunca rodava em teste nenhum.
+    """
+    fabrica = webhook_client
+    fabrica.sessao.falha_no_commit = _erro_transitorio("connection lost at COMMIT")
+
+    body = corpo()
+    async with await fabrica() as c:
+        r = await c.post("/webhook/whatsapp", content=body, headers=assinar(body))
+
+    assert r.status_code == 500
+    assert fabrica.sessao.commits == 0
+    assert fabrica.sessao.rollbacks == 1
+
+
+async def test_rollback_que_falha_nao_engole_o_erro_original(caplog, webhook_client):
+    """Numa conexão morta o `rollback()` também levanta — e é o caso mais provável.
+
+    Com a limpeza ANTES do log, a exceção do rollback escapava levando junto o traceback
+    do erro original e o `detail` genérico: 500 mudo, exatamente no incidente que mais
+    precisa de diagnóstico. Este teste fixa a ordem: log primeiro, limpeza depois.
+    """
+    fabrica = webhook_client
+    fabrica.sessao.falha_em = _erro_transitorio("server closed the connection")
+    fabrica.sessao.falha_no_rollback = RuntimeError("rollback: connection is closed")
+
+    body = corpo()
+    with caplog.at_level(logging.INFO, logger="app.main"):
+        async with await fabrica() as c:
+            r = await c.post("/webhook/whatsapp", content=body, headers=assinar(body))
+
+    assert r.status_code == 500
+    # O corpo continua sanitizado: o erro do rollback não escapou por cima do HTTPException.
+    assert "connection" not in r.text
+
+    mensagens = [rec.getMessage() for rec in caplog.records]
+    assert any("falha ao GRAVAR" in m for m in mensagens)      # o erro ORIGINAL sobreviveu
+    assert any("rollback também falhou" in m for m in mensagens)
+
+
+async def test_banco_nao_configurado_loga_ERROR_e_nao_atrapalha_o_403(caplog, monkeypatch, webhook_client):
+    """Deploy sem banco: 500 na entrega legítima, ERROR no log — e 403 no forjado.
+
+    A segunda metade é a que exigiu a sessão sair do `Depends`. Dependência resolve ANTES
+    do corpo do handler, então antes disso um request sem assinatura nenhuma também saía
+    500 (a leitura de DATABASE_URL acontecia primeiro), escondendo o 403 e transformando
+    "alguém está forjando" em "o deploy quebrou" — ou o contrário, dependendo de quem
+    olha. Agora nada acontece antes de provarmos que o evento é da Meta.
+
+    E o ERROR é obrigatório: no webhook, configuração ausente custa a INTEGRAÇÃO (a Meta
+    desabilita a inscrição), então um 500 mudo só é descoberto pelo webhook já desligado.
+    """
+    fabrica = webhook_client
+
+    def _sem_banco(**_kw):
+        raise KeyError("DATABASE_URL")
+
+    monkeypatch.setattr("app.db.SessionLocal", _sem_banco)
+
+    body = corpo()
+    with caplog.at_level(logging.INFO, logger="app.main"):
+        async with await fabrica() as c:
+            legitima = await c.post("/webhook/whatsapp", content=body, headers=assinar(body))
+            forjada = await c.post("/webhook/whatsapp", content=body)   # sem assinatura
+
+    assert legitima.status_code == 500
+    assert forjada.status_code == 403          # o banco quebrado não engole o 403
+
+    erros = [r for r in caplog.records if "banco indisponível" in r.getMessage()]
+    assert len(erros) == 1
+    assert erros[0].levelno == logging.ERROR
+    assert erros[0].exc_info is not None
+    # E o corpo não nomeia a variável, como no 500 de configuração da W1.
+    assert "DATABASE_URL" not in legitima.text
 
 
 # --- rate limit -------------------------------------------------------------

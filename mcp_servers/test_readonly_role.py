@@ -1,13 +1,14 @@
 """Prova que a role `insurance_ro` é fisicamente read-only.
 
 Conecta COMO insurance_ro (mesmo host/porta/banco do DATABASE_URL, mas
-user=insurance_ro e password=$RO_ROLE_PASSWORD) e checa quatro coisas:
+user=insurance_ro e password=$RO_ROLE_PASSWORD) e checa cinco coisas:
   - SELECT em `peril` devolve linhas            → leitura funciona
   - INSERT em `peril` levanta permission denied → escrita barrada
   - CREATE TABLE levanta permission denied      → DDL barrado
   - SELECT em `clause_chunk` levanta permission denied → o REVOKE da a4c91e5d7f28
+  - SELECT em `whatsapp_message` levanta permission denied → o REVOKE da c5a71b3e9d84
 
-O último é o único lugar que prova o REVOKE pelo mesmo caminho que o worker SQL usa:
+Os dois últimos são o único lugar que prova o REVOKE pelo mesmo caminho que o worker SQL usa:
 uma conexão libpq real autenticada como a role. O `has_table_privilege()` de
 tests/test_vector.py consulta o catálogo de dentro da sessão admin do pytest — ele
 afirma o privilégio da role, não que alguém conecte com ela.
@@ -119,6 +120,25 @@ def main() -> int:
     except psycopg.Error as exc:
         results.append(
             _report("SELECT clause_chunk blocked", False, f"unexpected: {exc}".strip())
+        )
+
+    # 5. SELECT em whatsapp_message barrado (REVOKE da migration c5a71b3e9d84).
+    #    A tabela guarda telefone e texto de terceiro; aqui o dano do vazamento é PII
+    #    caindo no contexto de uma chamada de LLM, não o tamanho do despejo.
+    try:
+        conn.cursor().execute("SELECT id FROM whatsapp_message LIMIT 1")
+        results.append(
+            _report("SELECT whatsapp_message blocked", False, "SELECT succeeded!")
+        )
+    except psycopg.errors.InsufficientPrivilege as exc:
+        results.append(
+            _report(
+                "SELECT whatsapp_message blocked", True, str(exc).strip().splitlines()[0]
+            )
+        )
+    except psycopg.Error as exc:
+        results.append(
+            _report("SELECT whatsapp_message blocked", False, f"unexpected: {exc}".strip())
         )
 
     conn.close()
