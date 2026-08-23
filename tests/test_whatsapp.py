@@ -3,13 +3,13 @@ Testes da BORDA do WhatsApp: handshake, assinatura HMAC, leitura do payload e ra
 limit. Quem prova que a mensagem é guardada é `tests/test_whatsapp_inbox.py`, que sobe
 container — aqui a persistência é falsa de propósito.
 
-Sem rede e sem banco, e desde a W2a isso exige um passo a mais. A rota passou a pedir
-`session=Depends(get_session)`, e dependência do FastAPI resolve ANTES do corpo do
-handler: sem override, `_sessionmaker()` leria `os.environ["DATABASE_URL"]` e este
-módulo passaria a depender de um container subido por OUTRO módulo antes dele — a
-armadilha de ordem de fixture que este projeto já pagou quatro vezes (ver a seção da
-engine preguiçosa na CLAUDE.md). `webhook_client` sobrescreve `get_session` por uma
-sessão falsa, e ela é também o seam do teste do 500.
+Sem rede e sem banco, e desde a W2a isso exige um passo a mais. A rota passou a gravar,
+abrindo a sessão com `SessionLocal()` depois da assinatura (NÃO por `Depends` — ver o
+docstring de `whatsapp_webhook` pro porquê). Sem override, `_sessionmaker()` leria
+`os.environ["DATABASE_URL"]` e este módulo passaria a depender de um container subido por
+OUTRO módulo antes dele — a armadilha de ordem de fixture que este projeto já pagou
+quatro vezes (ver a seção da engine preguiçosa na CLAUDE.md). `webhook_client` troca
+`app.db.SessionLocal` por uma sessão falsa, e ela é também o seam dos testes de falha.
 
 Nenhum teste gasta dinheiro: não há chamada de LLM nem de embedding neste caminho.
 """
@@ -21,6 +21,8 @@ import logging
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+
+from app.whatsapp import id_curto
 
 APP_SECRET = "segredo-de-app-do-teste"
 VERIFY_TOKEN = "token-de-verificacao-do-teste"
@@ -581,16 +583,41 @@ async def test_o_500_nao_diz_qual_variavel_falta(monkeypatch, webhook_client):
 # mensagem é gravada, deduplicada e marcada 'pending' está em tests/test_whatsapp_inbox.py.
 
 
-def _erro_transitorio(msg: str = "server closed the connection unexpectedly"):
-    """Um erro de banco que uma REENTREGA tem chance de resolver.
+def _erro_transitorio(msg: str = "connection refused"):
+    """O erro que o banco fora do ar levanta DE VERDADE — medido, não suposto.
 
-    Tem que ser um tipo de `sqlalchemy.exc` de verdade: a rota classifica por `isinstance`
-    (`_vale_reentregar`), e um `RuntimeError` genérico cairia no ramo PERMANENTE — que
-    devolve 200. Usar o tipo errado aqui faria o teste do 500 medir o caminho oposto.
+    Aqui morava um `sqlalchemy.exc.OperationalError` construído à mão, e ele fazia estes
+    testes medirem o caminho oposto do de produção: com o driver **asyncpg** o
+    `OperationalError` não é emitido nunca (o translator dele não tem entrada pra esse
+    nome), e com o banco fora do ar o que sobe é um `ConnectionRefusedError` CRU, que o
+    SQLAlchemy nem embrulha. Ou seja: o caso mais provável de todos era classificado como
+    PERMANENTE e a mensagem descartada com 200, com os três testes verdes.
+
+    O par deste helper é `_erro_permanente`, e `test_classificacao_bate_com_o_driver`
+    fixa os tipos medidos pra que a lista não volte a descrever um driver imaginário.
     """
-    from sqlalchemy.exc import OperationalError
+    return ConnectionRefusedError(msg)
 
-    return OperationalError("INSERT INTO whatsapp_message", {}, Exception(msg))
+
+def _erro_dbapi(sqlstate: str, msg: str = "falha"):
+    """Um `DBAPIError` com SQLSTATE, que é como o asyncpg entrega erro do servidor.
+
+    Statement timeout (57014) e texto com NUL (22021) chegam os DOIS como `DBAPIError` —
+    é só o SQLSTATE que os separa, e é por isso que `_vale_reentregar` olha pra ele.
+    """
+    from sqlalchemy.exc import DBAPIError
+
+    class _Orig(Exception):
+        pass
+
+    orig = _Orig(msg)
+    orig.sqlstate = sqlstate
+    return DBAPIError("INSERT INTO whatsapp_message", {}, orig)
+
+
+def _erro_permanente():
+    """Texto com NUL: JSON válido, o Postgres recusa, e reentregar não muda nada."""
+    return _erro_dbapi("22021", "invalid byte sequence")
 
 
 async def test_falha_ao_gravar_devolve_500_e_nao_200(caplog, webhook_client):
@@ -620,12 +647,17 @@ async def test_falha_ao_gravar_devolve_500_e_nao_200(caplog, webhook_client):
     assert fabrica.sessao.rollbacks == 1
     assert fabrica.sessao.commits == 0
 
-    # O operador é servido pelo log, e precisa do traceback: sem exc_info ele sabe QUE
-    # caiu e não POR QUE — o inverso do que serve pra diagnosticar banco fora do ar.
+    # O operador continua servido, mas SEM `exc_info`: o texto de uma exceção do
+    # SQLAlchemy carrega `[parameters: ...]` — telefone e mensagem do usuário. O que vai
+    # pro log é montado à mão: classe do erro, SQLSTATE quando existe, os ids curtos e os
+    # frames do stack. Ver `_resumo_do_erro` e test_o_log_de_falha_nao_carrega_PII.
     falhas = [r for r in caplog.records if "falha ao GRAVAR" in r.getMessage()]
     assert len(falhas) == 1
-    assert falhas[0].exc_info is not None
     assert falhas[0].levelno == logging.ERROR
+    assert falhas[0].exc_info is None
+    msg = falhas[0].getMessage()
+    assert "ConnectionRefusedError" in msg          # a classe do erro
+    assert "app/main.py" in msg or "main.py" in msg  # os frames do stack
 
 
 async def test_falha_ao_gravar_nao_vaza_detalhe_de_infra(webhook_client):
@@ -687,7 +719,7 @@ async def test_falha_PERMANENTE_devolve_200_e_nao_derruba_a_inscricao(caplog, we
     em silêncio não é. Daí a segunda asserção — o 200 aqui NÃO pode ser silencioso.
     """
     fabrica = webhook_client
-    fabrica.sessao.falha_em = ValueError("A string literal cannot contain NUL (0x00) characters")
+    fabrica.sessao.falha_em = _erro_permanente()
 
     body = corpo()
     with caplog.at_level(logging.INFO, logger="app.main"):
@@ -699,10 +731,14 @@ async def test_falha_PERMANENTE_devolve_200_e_nao_derruba_a_inscricao(caplog, we
     falhas = [rec for rec in caplog.records if "falha ao GRAVAR" in rec.getMessage()]
     assert len(falhas) == 1
     assert falhas[0].levelno == logging.ERROR
-    assert falhas[0].exc_info is not None
+    msg = falhas[0].getMessage()
     # A mensagem tem que dizer que a mensagem se PERDEU — um 200 registrado como se
     # tivesse dado certo é a mentira plausível de novo, agora no log.
-    assert "PERDIDAS" in falhas[0].getMessage()
+    assert "PERDIDAS" in msg
+    # E tem que dizer QUAIS: este é o ramo que descarta a pergunta, então sem os ids o
+    # registro é um número e ninguém consegue achar quem ficou sem resposta.
+    assert id_curto(WAMID) in msg
+    assert "sqlstate=22021" in msg
 
 
 async def test_falha_no_COMMIT_tambem_e_tratada(webhook_client):
@@ -776,10 +812,12 @@ async def test_banco_nao_configurado_loga_ERROR_e_nao_atrapalha_o_403(caplog, mo
     assert legitima.status_code == 500
     assert forjada.status_code == 403          # o banco quebrado não engole o 403
 
-    erros = [r for r in caplog.records if "banco indisponível" in r.getMessage()]
+    erros = [r for r in caplog.records if "banco não configurado" in r.getMessage()]
     assert len(erros) == 1
     assert erros[0].levelno == logging.ERROR
-    assert erros[0].exc_info is not None
+    # Sem exc_info: a exceção de configuração pode carregar a URL do banco, com senha.
+    assert erros[0].exc_info is None
+    assert id_curto(WAMID) in erros[0].getMessage()
     # E o corpo não nomeia a variável, como no 500 de configuração da W1.
     assert "DATABASE_URL" not in legitima.text
 

@@ -77,6 +77,19 @@ def upgrade() -> None:
     #    o `_conninfo()` cai pro DATABASE_URL admin.
     op.execute(_if_role_exists("REVOKE SELECT ON whatsapp_message FROM insurance_ro;"))
 
+    # 4. E o mesmo pra `cost_event`, que estava legível POR ESQUECIMENTO desde a
+    #    fbb0f178ab3a — descoberto pelo teste de conjunto que esta fatia acrescentou
+    #    (`test_insurance_ro_le_EXATAMENTE_as_tabelas_de_dominio`), não por análise.
+    #    É a prova de que o fail-open do ALTER DEFAULT PRIVILEGES não é hipotético: ele
+    #    já tinha cobrado uma vez, em silêncio, com a suíte verde.
+    #
+    #    `cost_event` não é domínio (é governança) e já estava fora do `TABLES` do MCP
+    #    server e da allowlist do run_query — ou seja, a INTENÇÃO sempre foi essa; só a
+    #    camada de privilégio não tinha acompanhado. Não há PII aqui, mas há o
+    #    livro-caixa: quanto cada cliente gastou, por request. As duas camadas voltam a
+    #    concordar.
+    op.execute(_if_role_exists("REVOKE SELECT ON cost_event FROM insurance_ro;"))
+
 
 def downgrade() -> None:
     """Derruba a tabela — e com ela o inbox inteiro.
@@ -90,5 +103,9 @@ def downgrade() -> None:
     lugar nenhum, e a Meta não reenvia o que já recebeu 200. Um downgrade aqui descarta
     perguntas — inclusive as que ainda não foram respondidas.
     """
+    # Devolve o SELECT em `cost_event`: o estado anterior a esta migration era legível
+    # (por esquecimento, mas era), e downgrade restaura o que havia, não o que devia.
+    op.execute(_if_role_exists("GRANT SELECT ON cost_event TO insurance_ro;"))
+
     op.drop_index('ix_whatsapp_message_status', table_name='whatsapp_message')
     op.drop_table('whatsapp_message')

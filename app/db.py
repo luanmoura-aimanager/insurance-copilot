@@ -26,7 +26,14 @@ def _sessionmaker() -> async_sessionmaker[AsyncSession]:
     # Railway pode entregar `postgres://` ou `postgresql://`; a engine da app precisa
     # de `postgresql+asyncpg://` (ver app/db_url.py).
     url = normalize_url(os.environ["DATABASE_URL"], "asyncpg")
-    engine = create_async_engine(url)                        # pool de conexões async
+    # `hide_parameters=True` porque o texto de uma exceção do SQLAlchemy inclui
+    # `[parameters: (...)]`, e é ele que um `logger.exception` imprime. Esta engine grava
+    # PII — `whatsapp_message.from_phone` e `.text` —, então sem isto qualquer soluço do
+    # banco publicava no log, em claro, o telefone e a mensagem inteira do usuário
+    # (verificado): exatamente o que `mascarar_telefone` e `id_curto` existem pra
+    # impedir, entrando pela porta do traceback. O statement continua no log; ele é nosso
+    # e é estático. Quem precisa dos valores usa `echo` num ambiente de desenvolvimento.
+    engine = create_async_engine(url, hide_parameters=True)  # pool de conexões async
     return async_sessionmaker(engine, expire_on_commit=False)
 
 

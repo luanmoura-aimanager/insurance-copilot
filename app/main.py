@@ -1,5 +1,7 @@
+import asyncio
 import json
 import logging
+import traceback
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
@@ -12,7 +14,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import DisconnectionError, InterfaceError, OperationalError
+from sqlalchemy.exc import DBAPIError, DisconnectionError, InterfaceError
 from sqlalchemy.exc import TimeoutError as SATimeoutError
 
 from app.agents.context import reset_request_context, set_request_context
@@ -240,25 +242,77 @@ def _perguntas(mensagens: list[IncomingMessage]) -> list[IncomingMessage]:
     return saida
 
 
-# Erros de banco que uma REENTREGA tem chance de resolver: conexão morta, banco
-# reiniciando, pool estourado, statement timeout. É a mesma divisão que o `run_query`
-# faz entre `OperationalError` (infra, sobe) e `ProgrammingError` (a query, vira texto)
-# — só que aqui ela decide entre **500 e 200**, e a assimetria é grosseira.
+# Classes de SQLSTATE que uma REENTREGA tem chance de resolver. É por SQLSTATE, e não
+# por classe de exceção do SQLAlchemy, porque **com asyncpg a classe não discrimina**:
+# medido nesta base — `SELECT pg_sleep` estourando statement_timeout e um texto com NUL
+# chegam os DOIS como `sqlalchemy.exc.DBAPIError`, e o primeiro é transitório enquanto o
+# segundo nunca vai entrar. O `sqlalchemy.exc.OperationalError` (o palpite óbvio, e o que
+# esta função checava antes) o driver asyncpg **não emite nunca**: o translator dele não
+# tem entrada pra ele, então todo erro do servidor que não case por nome vira o
+# `DBAPIError` genérico. Só o SQLSTATE separa os dois.
 #
-# Errar pra 500 num erro PERMANENTE é o desfecho ruim: a Meta reentrega o mesmo lote,
-# falha igual, e depois de repetidas falhas **desabilita a inscrição** — trocando a
-# perda de UMA mensagem pela perda de TODAS as futuras, mais um recadastro manual no
-# console dela. Por isso o default do desconhecido é 200 (barulhento, mas vivo), e só o
-# que está nesta lista vira 500. Um `DataError` (texto com NUL, que é JSON válido e o
-# Postgres não guarda) ou um `ValueError` do encoder do asyncpg não voltam daqui.
-_ERROS_QUE_VALE_REENTREGAR = (
-    OperationalError, InterfaceError, DisconnectionError, SATimeoutError,
-)
+#   08 conexão      53 recursos insuficientes (too_many_connections)
+#   57 intervenção do operador (admin_shutdown, cannot_connect_now, query_canceled)
+#   40 rollback de transação (serialization_failure, deadlock_detected)
+#
+# É o mesmo instrumento que o `run_query` usa pra separar os limites da classe 54 do
+# resto — lá pra escolher entre texto e exceção, aqui pra escolher entre 200 e 500.
+_SQLSTATE_TRANSITORIO = ("08", "53", "57", "40")
+
+# Falha de INFRAESTRUTURA que nem chega a virar erro do Postgres: com o banco fora do ar
+# o asyncpg levanta `ConnectionRefusedError` CRU (medido) — o SQLAlchemy não embrulha,
+# porque não é instância do Error do DBAPI. Este era o buraco mais grave da versão
+# anterior: o caso mais provável de todos (banco indisponível) caía no ramo PERMANENTE e
+# a mensagem era descartada com 200.
+_ERROS_DE_INFRA = (OSError, ConnectionError, asyncio.TimeoutError)
 
 
 def _vale_reentregar(exc: BaseException) -> bool:
-    """Se a Meta mandar este lote de novo, tem chance de dar certo?"""
-    return isinstance(exc, _ERROS_QUE_VALE_REENTREGAR)
+    """Se a Meta mandar este lote de novo, tem chance de dar certo?
+
+    Errar pra 500 num erro PERMANENTE faz a Meta reentregar, falhar igual, e depois de
+    repetidas falhas **desabilitar a inscrição** — trocando a perda de UMA mensagem pela
+    de TODAS as futuras. Errar pra 200 num TRANSITÓRIO descarta uma pergunta que teria
+    entrado no próximo try. Nenhum dos dois lados é seguro por default, e é por isso que
+    a classificação olha o SQLSTATE em vez de chutar pela classe.
+    """
+    if isinstance(exc, _ERROS_DE_INFRA):
+        return True
+    # Conexão morta no meio do statement (banco reiniciado) chega como InterfaceError;
+    # SATimeoutError é o checkout do pool estourando, que passa quando o pool desafoga.
+    if isinstance(exc, (InterfaceError, DisconnectionError, SATimeoutError)):
+        return True
+    if isinstance(exc, DBAPIError):
+        # asyncpg põe o SQLSTATE no erro original; o `orig` do SQLAlchemy é ele.
+        sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+        if isinstance(sqlstate, str) and sqlstate[:2] in _SQLSTATE_TRANSITORIO:
+            return True
+        # Uma causa de infra pode vir embrulhada (o asyncpg levanta OSError e o
+        # SQLAlchemy embrulha ao invalidar a conexão).
+        if isinstance(getattr(exc, "orig", None), _ERROS_DE_INFRA):
+            return True
+    return False
+
+
+def _resumo_do_erro(exc: BaseException) -> str:
+    """Identifica o erro SEM nada que o usuário escreveu.
+
+    O texto de uma exceção do SQLAlchemy inclui `[parameters: (...)]` — os valores
+    ligados, que aqui são o telefone e a mensagem inteira —, e é justamente ele que um
+    `logger.exception` imprime. `hide_parameters=True` na engine (app/db.py) tapa isso,
+    mas a rota não pode DEPENDER de um flag de engine pra manter a promessa de PII: quem
+    construir a sessão de outro jeito (os testes, um worker da W2b) perde a garantia sem
+    aviso. Então o que vai pro log é montado aqui: classe + SQLSTATE, e mais nada.
+
+    A mensagem do servidor também fica de fora, e não por excesso de zelo: o Postgres
+    põe os valores da chave no DETAIL de uma violação de unique (`Key (wamid)=(...)`), e
+    o wamid embute o telefone em base64 — era assim que o dado voltava pela última porta.
+    O SQLSTATE identifica a falha com precisão e não carrega dado nenhum.
+    """
+    sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+    if isinstance(sqlstate, str):
+        return f"{type(exc).__name__}(sqlstate={sqlstate})"
+    return type(exc).__name__
 
 
 async def _registrar_mensagens(session, perguntas: list[IncomingMessage]) -> set[str]:
@@ -433,14 +487,24 @@ async def whatsapp_webhook(request: Request) -> Response:
 
         try:
             session = SessionLocal()
-        except Exception:
-            # Banco não configurado é incidente NOSSO, e no webhook ele custa a
-            # integração inteira: sem esta linha o operador só descobre pela inscrição já
-            # desabilitada. Mesma regra (e mesmo nível) do `_config` de app/whatsapp.py.
+        except Exception as exc:
+            # CONFIGURAÇÃO, não indisponibilidade: `SessionLocal()` só monta a fábrica —
+            # o asyncpg conecta preguiçosamente, no `execute`. Então o que cai aqui é
+            # `DATABASE_URL` ausente ou impossível de parsear, e banco fora do ar aparece
+            # lá embaixo (classificado transitório, 500). O rótulo importa: apontar
+            # "indisponível" num erro de config manda o operador olhar o Postgres em vez
+            # do env.
+            #
+            # É incidente NOSSO e no webhook custa a integração inteira — sem esta linha
+            # ele só descobre pela inscrição já desabilitada. Mesma regra (e mesmo nível)
+            # do `_config` de app/whatsapp.py. Sem `exc_info`: a exceção de configuração
+            # pode carregar a URL do banco, com senha.
             logger.error(
-                "webhook whatsapp: banco indisponível para guardar a entrega (%d mensagens)",
+                "webhook whatsapp: banco não configurado, a entrega não pode ser guardada "
+                "(%d mensagens, ids=%s) — %s",
                 len(perguntas),
-                exc_info=True,
+                ",".join(id_curto(m.wamid) for m in perguntas),
+                _resumo_do_erro(exc),
             )
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -457,17 +521,32 @@ async def whatsapp_webhook(request: Request) -> Response:
             # levanta. Com a ordem invertida, a exceção do rollback escapava e levava
             # junto o traceback do erro ORIGINAL e o `detail` genérico: 500 mudo, no
             # incidente que mais precisa de diagnóstico.
-            logger.exception(
-                "webhook whatsapp: falha ao GRAVAR a entrega (%d mensagens) — %s",
+            # `logger.error` + stack montado à mão, e NÃO `logger.exception`: este é o
+            # único ponto do sistema que segura uma exceção nascida de um INSERT com PII
+            # nos parâmetros, e `exc_info` imprimiria o texto da exceção inteiro. Ver
+            # `_resumo_do_erro`. O stack (só os frames) fica, porque é o que diz ONDE.
+            #
+            # Os ids entram porque sem eles o ramo PERMANENTE — que devolve 200 e perde a
+            # mensagem — deixaria como registro só um número: "3 mensagens perdidas", sem
+            # nada que permita achar quem ficou sem resposta. `id_curto` casa com a linha
+            # de INFO da W1 e não carrega telefone.
+            logger.error(
+                "webhook whatsapp: falha ao GRAVAR a entrega (%d mensagens, ids=%s) — %s [%s]\n%s",
                 len(perguntas),
+                ",".join(id_curto(m.wamid) for m in perguntas),
                 "500, pra que a Meta reentregue"
                 if reentregar
                 else "200, e estas mensagens estão PERDIDAS: reentregar não conserta",
+                _resumo_do_erro(exc),
+                "".join(traceback.format_tb(exc.__traceback__)).rstrip(),
             )
             try:
                 await session.rollback()
-            except Exception:
-                logger.warning("webhook whatsapp: o rollback também falhou", exc_info=True)
+            except Exception as rollback_exc:
+                logger.warning(
+                    "webhook whatsapp: o rollback também falhou — %s",
+                    _resumo_do_erro(rollback_exc),
+                )
 
             if reentregar:
                 # `detail` genérico: a rota é pública e sem auth, e nomear o que quebrou
@@ -491,14 +570,11 @@ async def whatsapp_webhook(request: Request) -> Response:
             # forte: estamos DEPOIS do commit, então uma exceção daqui trocaria uma
             # gravação bem-sucedida por um 500 — e a reentrega que esse 500 provoca cairia
             # no mesmo ponto, de novo, pra sempre.
-            try:
-                logger.info(
-                    "webhook whatsapp: entrega guardada (%d nova(s) de %d)",
-                    len(novos),
-                    len(perguntas),
-                )
-            except Exception:
-                logger.exception("webhook whatsapp: falha ao registrar o resumo da entrega")
+            logger.info(
+                "webhook whatsapp: entrega guardada (%d nova(s) de %d)",
+                len(novos),
+                len(perguntas),
+            )
         finally:
             # O `Depends` fechava a sessão por nós; agora é nosso. Best effort: chegamos
             # aqui com a resposta já decidida, e um erro de fechamento não pode trocá-la.
