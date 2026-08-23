@@ -1,5 +1,7 @@
+import asyncio
 import json
 import logging
+import traceback
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
@@ -11,15 +13,20 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy import text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import DBAPIError, DisconnectionError, InterfaceError
+from sqlalchemy.exc import TimeoutError as SATimeoutError
 
 from app.agents.context import reset_request_context, set_request_context
 from app.agents.graph import NO_ANSWER, graph
 from app.auth import require_client
 from app.db import get_session
 from app.limits import WEBHOOK_ANCORA, ask_client_limit, client_key, limiter, whatsapp_limit
+from app.models import WhatsAppMessage
 from app.whatsapp import (
     ASSINATURA_HEADER,
     MAX_BODY_BYTES,
+    IncomingMessage,
     extract_messages,
     id_curto,
     mascarar_telefone,
@@ -136,10 +143,12 @@ async def ask(
 
 
 # ---------------------------------------------------------------------------
-# Superfície do WhatsApp (Meta Cloud API) — FATIA W1: só RECEBER.
+# Superfície do WhatsApp (Meta Cloud API) — FATIA W2a: RECEBER E GUARDAR.
 #
-# Estas duas rotas não chamam o grafo e não respondem no WhatsApp; elas provam que um
-# evento chegou, que veio mesmo da Meta e que não foi adulterado. Responder é a W2.
+# Estas duas rotas ainda não chamam o grafo e não respondem no WhatsApp — isso é a W2b.
+# O que a W2a acrescentou à W1 é DURABILIDADE: a mensagem de texto vira linha em
+# `whatsapp_message`, deduplicada por `wamid`, e o 200 passa a significar "aceito com
+# durabilidade" em vez de "li o que deu".
 #
 # É o primeiro endpoint público do projeto: a Meta não manda `Authorization`, então
 # quem faz o papel do Bearer aqui é a assinatura HMAC do corpo (`app/whatsapp.py`).
@@ -199,6 +208,144 @@ async def _corpo_com_teto(request: Request) -> bytes | None:
     return raw
 
 
+def _perguntas(mensagens: list[IncomingMessage]) -> list[IncomingMessage]:
+    """As mensagens que viram linha: texto, com texto de verdade, sem wamid repetido.
+
+    Só mensagem de TEXTO é persistida porque é ela que carrega a pergunta — áudio,
+    imagem e botão ficam só no log, já que a W2b não teria o que perguntar ao grafo a
+    partir deles.
+
+    O teste é `m.text` e não `m.text is not None`: `tipo == "text"` com `text.body`
+    ausente ou `""` sai da borda como texto vazio (ver `_mensagem` em app/whatsapp.py),
+    e string vazia não tem conteúdo nenhum pra responder. Mesma truthiness do guard de
+    `id`/`from` lá.
+
+    O filtro para AÍ de propósito: o que tem conteúdo é gravado como veio, inclusive um
+    "ok" de dois caracteres e um texto de 4.000 (o WhatsApp permite 4.096). Seria
+    tentador espelhar os limites do `AskRequest` (3..500), mas eles são do `/ask`, não do
+    canal — descartar na borda uma mensagem que o usuário de fato mandou é pior do que
+    guardá-la: o remetente fica sem resposta E sem registro de que falou. Quem decide o
+    que consegue responder, e como (recusar, pedir pra encurtar), é a W2b, com a linha
+    na mão.
+
+    A deduplicação por `wamid` DENTRO do lote é cinto: o `ON CONFLICT DO NOTHING`
+    aguenta duplicata no mesmo statement, mas com o wamid repetido o `RETURNING` traria
+    só uma das duas linhas, e a contagem de "novas" do log sairia menor do que foi.
+    """
+    vistos: set[str] = set()
+    saida: list[IncomingMessage] = []
+    for m in mensagens:
+        if m.tipo != "text" or not m.text or m.wamid in vistos:
+            continue
+        vistos.add(m.wamid)
+        saida.append(m)
+    return saida
+
+
+# Classes de SQLSTATE que uma REENTREGA tem chance de resolver. É por SQLSTATE, e não
+# por classe de exceção do SQLAlchemy, porque **com asyncpg a classe não discrimina**:
+# medido nesta base — `SELECT pg_sleep` estourando statement_timeout e um texto com NUL
+# chegam os DOIS como `sqlalchemy.exc.DBAPIError`, e o primeiro é transitório enquanto o
+# segundo nunca vai entrar. O `sqlalchemy.exc.OperationalError` (o palpite óbvio, e o que
+# esta função checava antes) o driver asyncpg **não emite nunca**: o translator dele não
+# tem entrada pra ele, então todo erro do servidor que não case por nome vira o
+# `DBAPIError` genérico. Só o SQLSTATE separa os dois.
+#
+#   08 conexão      53 recursos insuficientes (too_many_connections)
+#   57 intervenção do operador (admin_shutdown, cannot_connect_now, query_canceled)
+#   40 rollback de transação (serialization_failure, deadlock_detected)
+#
+# É o mesmo instrumento que o `run_query` usa pra separar os limites da classe 54 do
+# resto — lá pra escolher entre texto e exceção, aqui pra escolher entre 200 e 500.
+_SQLSTATE_TRANSITORIO = ("08", "53", "57", "40")
+
+# Falha de INFRAESTRUTURA que nem chega a virar erro do Postgres: com o banco fora do ar
+# o asyncpg levanta `ConnectionRefusedError` CRU (medido) — o SQLAlchemy não embrulha,
+# porque não é instância do Error do DBAPI. Este era o buraco mais grave da versão
+# anterior: o caso mais provável de todos (banco indisponível) caía no ramo PERMANENTE e
+# a mensagem era descartada com 200.
+_ERROS_DE_INFRA = (OSError, ConnectionError, asyncio.TimeoutError)
+
+
+def _vale_reentregar(exc: BaseException) -> bool:
+    """Se a Meta mandar este lote de novo, tem chance de dar certo?
+
+    Errar pra 500 num erro PERMANENTE faz a Meta reentregar, falhar igual, e depois de
+    repetidas falhas **desabilitar a inscrição** — trocando a perda de UMA mensagem pela
+    de TODAS as futuras. Errar pra 200 num TRANSITÓRIO descarta uma pergunta que teria
+    entrado no próximo try. Nenhum dos dois lados é seguro por default, e é por isso que
+    a classificação olha o SQLSTATE em vez de chutar pela classe.
+    """
+    if isinstance(exc, _ERROS_DE_INFRA):
+        return True
+    # Conexão morta no meio do statement (banco reiniciado) chega como InterfaceError;
+    # SATimeoutError é o checkout do pool estourando, que passa quando o pool desafoga.
+    if isinstance(exc, (InterfaceError, DisconnectionError, SATimeoutError)):
+        return True
+    if isinstance(exc, DBAPIError):
+        # asyncpg põe o SQLSTATE no erro original; o `orig` do SQLAlchemy é ele.
+        sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+        if isinstance(sqlstate, str) and sqlstate[:2] in _SQLSTATE_TRANSITORIO:
+            return True
+        # Uma causa de infra pode vir embrulhada (o asyncpg levanta OSError e o
+        # SQLAlchemy embrulha ao invalidar a conexão).
+        if isinstance(getattr(exc, "orig", None), _ERROS_DE_INFRA):
+            return True
+    return False
+
+
+def _resumo_do_erro(exc: BaseException) -> str:
+    """Identifica o erro SEM nada que o usuário escreveu.
+
+    O texto de uma exceção do SQLAlchemy inclui `[parameters: (...)]` — os valores
+    ligados, que aqui são o telefone e a mensagem inteira —, e é justamente ele que um
+    `logger.exception` imprime. `hide_parameters=True` na engine (app/db.py) tapa isso,
+    mas a rota não pode DEPENDER de um flag de engine pra manter a promessa de PII: quem
+    construir a sessão de outro jeito (os testes, um worker da W2b) perde a garantia sem
+    aviso. Então o que vai pro log é montado aqui: classe + SQLSTATE, e mais nada.
+
+    A mensagem do servidor também fica de fora, e não por excesso de zelo: o Postgres
+    põe os valores da chave no DETAIL de uma violação de unique (`Key (wamid)=(...)`), e
+    o wamid embute o telefone em base64 — era assim que o dado voltava pela última porta.
+    O SQLSTATE identifica a falha com precisão e não carrega dado nenhum.
+    """
+    sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+    if isinstance(sqlstate, str):
+        return f"{type(exc).__name__}(sqlstate={sqlstate})"
+    return type(exc).__name__
+
+
+async def _registrar_mensagens(session, perguntas: list[IncomingMessage]) -> set[str]:
+    """INSERT idempotente do lote; devolve os `wamid` que entraram AGORA.
+
+    `ON CONFLICT DO NOTHING` sobre o unique de `wamid` é o que torna a reentrega da Meta
+    inofensiva — e o `RETURNING` só devolve linha de fato inserida, então o que não
+    voltou é reentrega. É daí que sai o "nova" vs "duplicada" do log, sem uma segunda
+    consulta.
+
+    Um statement por entrega, de propósito: ou o lote inteiro entra, ou nada entra e a
+    Meta reentrega tudo. Não existe estado pela metade pra W2b encontrar.
+
+    NÃO commita — quem é dono da transação é a rota, que precisa distinguir "gravou" de
+    "falhou" pra escolher entre 200 e 500.
+    """
+    stmt = (
+        pg_insert(WhatsAppMessage)
+        .values([
+            {
+                "wamid": m.wamid,
+                "from_phone": m.from_phone,
+                "text": m.text,
+                "phone_number_id": m.phone_number_id,
+            }
+            for m in perguntas
+        ])
+        .on_conflict_do_nothing(index_elements=["wamid"])
+        .returning(WhatsAppMessage.wamid)
+    )
+    return set((await session.execute(stmt)).scalars())
+
+
 # O handshake de verificação, que a Meta dispara UMA vez ao cadastrar a URL.
 #
 # Fica de propósito SEM decorator de limite, ou seja, coberto pelo teto por IP do
@@ -250,13 +397,34 @@ async def whatsapp_verify(
 @limiter.limit(WEBHOOK_ANCORA, per_method=True)
 @limiter.limit(whatsapp_limit, per_method=True)
 async def whatsapp_webhook(request: Request) -> Response:
-    """Recebe um evento da Meta, confere a assinatura e registra o que dá pra ler.
+    """Recebe um evento da Meta, confere a assinatura e GUARDA o que dá pra responder.
 
-    **Devolve 200 em todo caminho pós-assinatura, e isso é escolha.** A Meta reenvia
-    em não-2xx e desabilita a inscrição depois de falhas repetidas — e um payload que
-    não sabemos ler não é coisa que retentativa conserte, então responder não-2xx não
-    compra nada e arrisca desligar o webhook. O canal do operador aqui é o log, como
-    na falha de worker do /ask.
+    **O 200 daqui significa "aceito com durabilidade".** Na W1 significava só "li o que
+    deu": o evento era logado e descartado. Agora ele é a promessa que autoriza a W2b a
+    processar fora do request — a Meta considera a entrega concluída e nunca mais a
+    reenvia.
+
+    **Segue 200 em quase todo caminho pós-assinatura, e isso continua sendo escolha.** A
+    Meta reenvia em não-2xx e desabilita a inscrição depois de falhas repetidas, e nada
+    disso é coisa que retentativa conserte: payload ilegível, tipo sem texto, evento que
+    nem é mensagem (`value.statuses`). O canal do operador aqui é o log, como na falha de
+    worker do /ask.
+
+    **A exceção é o INSERT, e ela é o oposto de tudo acima: 500 de propósito.** Se não
+    conseguimos GUARDAR, um 200 seria mentira — a Meta não reenviaria e a pergunta
+    sumiria sem que ninguém do lado do usuário soubesse. É a única falha aqui que uma
+    retentativa de fato conserta, então é a única que vale devolver não-2xx. Isso só é
+    seguro porque `wamid` é UNIQUE: o lote reentregue reentra pelo ON CONFLICT DO
+    NOTHING sem duplicar. É a idempotência que autoriza o retry.
+
+    A sessão é aberta **depois** da assinatura, com `SessionLocal()` em vez de
+    `Depends(get_session)`, e a ordem é a decisão. Dependência do FastAPI resolve ANTES
+    do corpo do handler, então com `Depends` um request forjado — que deve morrer no 403
+    — já teria feito a app ler `DATABASE_URL` e construir a engine; num deploy sem banco
+    configurado, todo POST saía **500 mudo**, inclusive os forjados, escondendo o 403 e
+    quebrando a regra do módulo de que erro de configuração no webhook loga ERROR antes
+    (o custo aqui é composto: a Meta desabilita a inscrição). Nada acontece antes de
+    provarmos que o evento é da Meta.
     """
     # O corpo CRU, antes de qualquer parse: a assinatura cobre estes bytes exatos, e
     # um json.loads seguido de re-serialização mudaria o que está sendo verificado.
@@ -304,8 +472,118 @@ async def whatsapp_webhook(request: Request) -> Response:
         except Exception:
             logger.exception("webhook whatsapp: falha ao registrar mensagem (id=%s)", id_curto(msg.wamid))
 
-    # W2 herda daqui: a Meta pode REENTREGAR o mesmo `wamid` (é o que ela faz quando
-    # não recebe 200 a tempo). Hoje isso é inofensivo porque só se loga; quando o
-    # webhook chamar o grafo, cada reentrega vira uma rodada paga a mais — a
-    # deduplicação por `wamid` é obrigatória lá, não aqui.
+    # A persistência fica FORA do `try` por mensagem acima, e é esse o ponto. Aquele
+    # `try` existe pra que uma falha de OBSERVABILIDADE na mensagem N não engula as
+    # N+1.. — ele cobre o log, e só. Durabilidade é a regra oposta: se ela falha, o
+    # request inteiro tem que falhar. Um `except` largo em volta do INSERT reproduziria
+    # exatamente o 200-mentiroso que esta fatia existe pra matar.
+    perguntas = _perguntas(mensagens)
+
+    if perguntas:
+        # Import tardio e `SessionLocal` (não `Depends`): resolve a fábrica no momento da
+        # CHAMADA, que é o que faz o `monkeypatch.setattr("app.db.SessionLocal", ...)`
+        # dos testes pegar — o mesmo seam de `record_call_cost` e dos nós do grafo.
+        from app.db import SessionLocal
+
+        try:
+            session = SessionLocal()
+        except Exception as exc:
+            # CONFIGURAÇÃO, não indisponibilidade: `SessionLocal()` só monta a fábrica —
+            # o asyncpg conecta preguiçosamente, no `execute`. Então o que cai aqui é
+            # `DATABASE_URL` ausente ou impossível de parsear, e banco fora do ar aparece
+            # lá embaixo (classificado transitório, 500). O rótulo importa: apontar
+            # "indisponível" num erro de config manda o operador olhar o Postgres em vez
+            # do env.
+            #
+            # É incidente NOSSO e no webhook custa a integração inteira — sem esta linha
+            # ele só descobre pela inscrição já desabilitada. Mesma regra (e mesmo nível)
+            # do `_config` de app/whatsapp.py. Sem `exc_info`: a exceção de configuração
+            # pode carregar a URL do banco, com senha.
+            logger.error(
+                "webhook whatsapp: banco não configurado, a entrega não pode ser guardada "
+                "(%d mensagens, ids=%s) — %s",
+                len(perguntas),
+                ",".join(id_curto(m.wamid) for m in perguntas),
+                _resumo_do_erro(exc),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="falha ao registrar a entrega",
+            )
+
+        try:
+            novos = await _registrar_mensagens(session, perguntas)
+            await session.commit()
+        except Exception as exc:
+            reentregar = _vale_reentregar(exc)
+            # LOG PRIMEIRO, limpeza depois. A causa mais provável de uma falha aqui é a
+            # conexão morta — que é exatamente o caso em que o `rollback()` também
+            # levanta. Com a ordem invertida, a exceção do rollback escapava e levava
+            # junto o traceback do erro ORIGINAL e o `detail` genérico: 500 mudo, no
+            # incidente que mais precisa de diagnóstico.
+            # `logger.error` + stack montado à mão, e NÃO `logger.exception`: este é o
+            # único ponto do sistema que segura uma exceção nascida de um INSERT com PII
+            # nos parâmetros, e `exc_info` imprimiria o texto da exceção inteiro. Ver
+            # `_resumo_do_erro`. O stack (só os frames) fica, porque é o que diz ONDE.
+            #
+            # Os ids entram porque sem eles o ramo PERMANENTE — que devolve 200 e perde a
+            # mensagem — deixaria como registro só um número: "3 mensagens perdidas", sem
+            # nada que permita achar quem ficou sem resposta. `id_curto` casa com a linha
+            # de INFO da W1 e não carrega telefone.
+            logger.error(
+                "webhook whatsapp: falha ao GRAVAR a entrega (%d mensagens, ids=%s) — %s [%s]\n%s",
+                len(perguntas),
+                ",".join(id_curto(m.wamid) for m in perguntas),
+                "500, pra que a Meta reentregue"
+                if reentregar
+                else "200, e estas mensagens estão PERDIDAS: reentregar não conserta",
+                _resumo_do_erro(exc),
+                "".join(traceback.format_tb(exc.__traceback__)).rstrip(),
+            )
+            try:
+                await session.rollback()
+            except Exception as rollback_exc:
+                logger.warning(
+                    "webhook whatsapp: o rollback também falhou — %s",
+                    _resumo_do_erro(rollback_exc),
+                )
+
+            if reentregar:
+                # `detail` genérico: a rota é pública e sem auth, e nomear o que quebrou
+                # entregaria a um scanner o estado interno do deploy. Mesma regra do 500
+                # de configuração em app/whatsapp.py — o operador é servido pelo log
+                # acima, que carrega o traceback.
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="falha ao registrar a entrega",
+                )
+            # Permanente: cai fora do `if` e a rota devolve 200. Ver o comentário de
+            # `_ERROS_QUE_VALE_REENTREGAR` — insistir aqui desliga o webhook inteiro.
+        else:
+            # UMA linha por entrega, não uma por mensagem: a identificação por mensagem
+            # já saiu no laço acima, e o que esta acrescenta é um bit por LOTE — quantas
+            # eram reentrega. É esse número que distingue tráfego normal de uma tempestade
+            # de retentativa da Meta, e ele vem do RETURNING (linha de fato inserida), não
+            # de uma segunda consulta.
+            #
+            # Dentro de um `try` pelo mesmo motivo do laço acima, e aqui o motivo é mais
+            # forte: estamos DEPOIS do commit, então uma exceção daqui trocaria uma
+            # gravação bem-sucedida por um 500 — e a reentrega que esse 500 provoca cairia
+            # no mesmo ponto, de novo, pra sempre.
+            logger.info(
+                "webhook whatsapp: entrega guardada (%d nova(s) de %d)",
+                len(novos),
+                len(perguntas),
+            )
+        finally:
+            # O `Depends` fechava a sessão por nós; agora é nosso. Best effort: chegamos
+            # aqui com a resposta já decidida, e um erro de fechamento não pode trocá-la.
+            try:
+                await session.close()
+            except Exception:
+                logger.warning("webhook whatsapp: falha ao fechar a sessão", exc_info=True)
+
+    # O que a W2b herda daqui: chamar o grafo e responder pela Cloud API. A dedup por
+    # `wamid` que esta nota pedia deixou de ser herança — ela existe, é o unique de
+    # `whatsapp_message`, e é o que torna a reentrega da Meta inofensiva.
     return Response(status_code=status.HTTP_200_OK)

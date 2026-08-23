@@ -23,6 +23,9 @@ from mcp_servers.postgres_mcp_server import TABLES, run_query
         ("select id, embedding from clause_chunk order by id", "clause_chunk"),
         # cost_event é governança, não domínio — também está fora.
         ("SELECT sum(cost_usd) FROM cost_event", "cost_event"),
+        # whatsapp_message é a fila de entrada do canal: telefone e texto de terceiro.
+        # Aqui o dano do vazamento é PII no contexto de uma chamada de LLM, não custo.
+        ("SELECT from_phone, text FROM whatsapp_message", "whatsapp_message"),
         # Tabela de domínio no SELECT, proibida escondida numa subquery.
         ("SELECT (SELECT count(*) FROM clause_chunk) FROM peril", "clause_chunk"),
         # JOIN, não FROM.
