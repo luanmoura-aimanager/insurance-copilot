@@ -1,14 +1,13 @@
 import asyncio
 import json
 import logging
-import traceback
 from uuid import uuid4
 
 # Configurado ANTES dos outros imports pra que o `basicConfig` que o FastMCP dispara (via
 # `app.agents.graph` -> `mcp_servers.postgres_mcp_server`, algumas linhas abaixo) vire no-op,
 # e pra que o que for logado DURANTE os imports restantes já saia formatado. O porquê
 # completo — e por que a ordem NÃO é o que decide quem vence — está em app/logging_config.py.
-from app.logging_config import configure_logging
+from app.logging_config import configure_logging, traceback_da_cadeia
 
 configure_logging()
 
@@ -106,6 +105,11 @@ class RequestIdMiddleware:
 
         async def send_com_id(message):
             if message["type"] == "http.response.start":
+                # `headers` é OPCIONAL no http.response.start (default `[]`), e
+                # `MutableHeaders` indexa a chave sem guarda — um app ASGI montado aqui
+                # dentro que a omitisse viraria KeyError DEPOIS de a resposta ter começado,
+                # que é o pior ponto possível pra falhar.
+                message.setdefault("headers", [])
                 MutableHeaders(scope=message)[HEADER_REQUEST_ID] = request_id
             await send(message)
 
@@ -620,7 +624,7 @@ async def whatsapp_webhook(request: Request) -> Response:
                 if reentregar
                 else "200, e estas mensagens estão PERDIDAS: reentregar não conserta",
                 _resumo_do_erro(exc),
-                "".join(traceback.format_tb(exc.__traceback__)).rstrip(),
+                traceback_da_cadeia(exc),
             )
             try:
                 await session.rollback()

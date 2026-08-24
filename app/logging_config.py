@@ -24,11 +24,20 @@ import re
 import traceback
 from datetime import datetime, timezone
 
+from dotenv import load_dotenv
+
 from app.agents.context import get_client_name, get_request_id
 
 # O que o operador lê pra achar uma linha, e o que ele digita pra mudar o volume.
 NIVEL_PADRAO = "INFO"
 VAR_NIVEL = "LOG_LEVEL"
+
+# Allowlist EXPLÍCITA, e não `logging.getLevelNamesMapping()`: aquele mapa aceita `NOTSET`
+# (que vira "herda", ou seja, INFO — indistinguível de configuração certa, sem aviso), os
+# apelidos `WARN`/`FATAL`, e qualquer nível que uma lib tenha registrado com
+# `addLevelName` antes do import (o uvicorn registra `TRACE`). O fallback só significa
+# alguma coisa se recusar o que não dá pra usar.
+NIVEIS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
 # O uvicorn instala handlers PRÓPRIOS nestes três (com propagate=False) quando o servidor
 # sobe, e a configuração dele roda ANTES do import da app. Sem reconfigurá-los aqui,
@@ -74,7 +83,7 @@ class JsonFormatter(logging.Formatter):
             ),
             "level": record.levelname,
             "logger": record.name,
-            "message": _redigir(record.getMessage()),
+            "message": record.getMessage(),
         }
 
         # Postos pelo ContextFilter. OMITIDOS quando não há request: a chave ausente diz
@@ -95,7 +104,16 @@ class JsonFormatter(logging.Formatter):
         if exc_info and exc_info[1] is not None:
             linha.update(_campos_da_excecao(exc_info[1]))
 
-        return json.dumps(linha, ensure_ascii=False)
+        # A redação cobre TODO campo de texto, não só o `message`: `format_tb` inclui a
+        # linha de FONTE de cada frame, então um alvo da lista pode chegar pelo
+        # `exc_traceback` com o `message` limpo.
+        #
+        # E é feita ANTES do `dumps`, não sobre a linha serializada — ali o texto já está
+        # escapado, e a classe de caracteres do padrão engoliria a contrabarra de um `\"`,
+        # produzindo uma aspa solta dentro da string e JSON inválido. (Aconteceu; é o que
+        # `test_a_redacao_cobre_o_traceback_e_nao_so_a_mensagem` pegou.)
+        redigida = {c: _redigir(v) if isinstance(v, str) else v for c, v in linha.items()}
+        return json.dumps(redigida, ensure_ascii=False)
 
 
 def _nome_do_tipo(exc: BaseException) -> str:
@@ -150,13 +168,25 @@ def _campos_da_excecao(exc: BaseException) -> dict:
     O que se descartou por ser PII foi a MENSAGEM; o tipo e os frames de quem causou não
     carregam nada disso, então deixá-los de fora seria perda colateral, não escolha.
     """
-    elos = _cadeia(exc)
+    return {
+        "exc_type": _nome_do_tipo(exc),
+        "exc_traceback": traceback_da_cadeia(exc),
+    }
+
+
+def traceback_da_cadeia(exc: BaseException) -> str:
+    """Tipos e frames da exceção e de quem a causou, SEM nenhuma mensagem.
+
+    Público porque `app/main.py` monta o traceback do webhook à mão (ele não pode passar
+    `exc_info`, ver o comentário lá) e precisa exatamente disto — sem esta função ele
+    reportaria só o traceback mais externo, perdendo qual erro do driver aconteceu.
+    """
     partes = []
-    for i, elo in enumerate(elos):
+    for i, elo in enumerate(_cadeia(exc)):
         cabecalho = _nome_do_tipo(elo) if i == 0 else f"causado por {_nome_do_tipo(elo)}"
         frames = "".join(traceback.format_tb(elo.__traceback__)).rstrip()
         partes.append(f"{cabecalho}\n{frames}" if frames else cabecalho)
-    return {"exc_type": _nome_do_tipo(elos[0]), "exc_traceback": "\n".join(partes)}
+    return "\n".join(partes)
 
 
 class ContextFilter(logging.Filter):
@@ -196,7 +226,7 @@ def _nivel_do_env() -> tuple[str, str | None]:
     if not bruto:
         return NIVEL_PADRAO, None
     nivel = bruto.strip().upper()
-    if nivel not in logging.getLevelNamesMapping():
+    if nivel not in NIVEIS:
         return NIVEL_PADRAO, f"{VAR_NIVEL} inválido ({bruto!r}); usando {NIVEL_PADRAO}"
     return nivel, None
 
@@ -214,8 +244,10 @@ def _config(nivel: str) -> dict:
     # Então a raiz nunca desce abaixo de INFO, e quem desce é o logger `app`. Apertar
     # continua valendo pra todo mundo (`LOG_LEVEL=WARNING` cala a raiz também), porque
     # calar não vaza nada.
-    piso = logging.getLevelNamesMapping()[nivel]
-    nivel_da_raiz = nivel if piso >= logging.INFO else "INFO"
+    # O piso vale pra raiz E pros loggers do uvicorn: o uvicorn é biblioteca de terceiro
+    # como qualquer outra, e ele é o ÚNICO que este config toca pelo nome — deixá-lo de
+    # fora tornaria falsa, justo nele, a frase "DEBUG vale só pro nosso código".
+    nivel_de_terceiro = nivel if logging.getLevelName(nivel) >= logging.INFO else "INFO"
 
     return {
         "version": 1,
@@ -235,13 +267,17 @@ def _config(nivel: str) -> dict:
                 "filters": ["contexto"],
             }
         },
-        "root": {"handlers": ["stdout"], "level": nivel_da_raiz},
+        "root": {"handlers": ["stdout"], "level": nivel_de_terceiro},
         "loggers": {
             # Sem handler próprio e sem mexer no `propagate`: o registro sobe pro handler
             # da raiz, e o que este nó define é só até onde o NOSSO código fala.
             LOGGER_DO_APP: {"level": nivel},
             **{
-                nome: {"handlers": ["stdout"], "level": nivel, "propagate": False}
+                nome: {
+                    "handlers": ["stdout"],
+                    "level": nivel_de_terceiro,
+                    "propagate": False,
+                }
                 for nome in LOGGERS_DO_UVICORN
             },
         },
@@ -249,20 +285,52 @@ def _config(nivel: str) -> dict:
 
 
 def configure_logging() -> None:
-    """Instala o handler único de stdout. Idempotente.
+    """Instala o handler único de stdout. Idempotente, e não pisa em handler alheio.
 
-    A idempotência sai do próprio `dictConfig`: ele REMOVE os handlers existentes de cada
-    logger que configura antes de instalar os novos, então chamar duas vezes deixa um
-    handler, não dois. É também o que faz esta função vencer o acidente mesmo quando ela
-    perde a corrida — no pytest, `mcp_servers.postgres_mcp_server` às vezes é importado
-    antes de `app.main`, e o `StreamHandler` de stderr que o `basicConfig` deixou na raiz é
-    simplesmente substituído.
+    **`load_dotenv()` primeiro, senão `LOG_LEVEL` no `.env` não vale nada.** Esta função
+    roda no import de `app/main.py`, que é ANTES do `load_dotenv()` do `app/db.py` (ele só
+    acontece algumas linhas abaixo, quando `app.db` é importado). Sem a chamada aqui, o
+    setup local documentado — `cp .env.example .env` e editar — deixava a variável
+    invisível, e nem o aviso de valor inválido disparava, porque não havia valor nenhum.
+    Verificado. `load_dotenv` não sobrescreve env já existente, então chamar cedo não muda
+    nada pra quem configura pelo ambiente (Railway, CI), e é no-op sem arquivo.
+
+    **Handlers que não são nossos são PRESERVADOS.** `dictConfig` remove todos os handlers
+    de cada logger que configura, e na raiz é onde vivem os handlers de captura do pytest
+    (`caplog`, mas também `--log-file` e `--log-cli-level`, que não se reinstalam por fase).
+    Como esta função roda no import de `app.main` — que várias fixtures fazem no MEIO da
+    sessão —, sem esta reinstalação um `pytest --log-file` sairia vazio a partir dali: é o
+    mesmo estrago que `tests/conftest.py` (`configure_logger=False`) e
+    `tests/test_migration.py` já pagam pra impedir do lado do Alembic.
+
+    Isso NÃO ressuscita o acidente do FastMCP: o `basicConfig` só instala handler quando a
+    raiz está vazia (verificado), e raiz vazia é exatamente o caso em que não há nada a
+    preservar. Os dois casos são mutuamente exclusivos.
+
+    A idempotência continua vindo do `dictConfig`: o nosso handler é recriado, não somado.
     """
+    load_dotenv()
+
+    raiz = logging.getLogger()
+    alheios = [h for h in raiz.handlers if not isinstance(h.formatter, JsonFormatter)]
+
     nivel, aviso = _nivel_do_env()
     logging.config.dictConfig(_config(nivel))
+
+    for handler in alheios:
+        raiz.addHandler(handler)
+
     if aviso:
         # Depois do dictConfig de propósito: antes dele o aviso não teria pra onde ir.
         logging.getLogger(__name__).warning(aviso)
 
 
-__all__ = ["ContextFilter", "JsonFormatter", "configure_logging", "NIVEL_PADRAO", "VAR_NIVEL"]
+__all__ = [
+    "ContextFilter",
+    "JsonFormatter",
+    "configure_logging",
+    "traceback_da_cadeia",
+    "NIVEIS",
+    "NIVEL_PADRAO",
+    "VAR_NIVEL",
+]

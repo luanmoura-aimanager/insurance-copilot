@@ -365,12 +365,17 @@ what. An unhandled 500 answers without the header (Starlette's `ServerErrorMiddl
 every user middleware) but is still logged with its `request_id`, deliberately, since that is the one
 response class the operator most needs to trace.
 
-Set the volume with `LOG_LEVEL` (default `INFO`), read when the app is imported so it can be changed
-with a restart rather than a rebuild; an invalid value falls back to the default and says so, rather
-than failing the boot or silencing the output. **`DEBUG` only ever applies to this project's own
-loggers** — the root logger never drops below `INFO`, because third-party debug logging is where the
-PII is: `anthropic` emits the full `messages` array at `DEBUG`, which is the user's verbatim question
-and every retrieved clause. Tightening still applies to everyone, since silence leaks nothing.
+Set the volume with `LOG_LEVEL` (default `INFO`, and read from `.env` too), applied when the app is
+imported — so changing it needs a restart, not a rebuild. An invalid value falls back to the default
+and says so, rather than failing the boot or silencing the output; the accepted values are an explicit
+allowlist, because `logging`'s own table would let `NOTSET` through and quietly behave like `INFO`.
+
+**`DEBUG` only ever applies to this project's own loggers.** The root logger — and uvicorn's, the one
+third-party library this config names — never drops below `INFO`, because third-party debug logging is
+where the PII is: `anthropic` emits the full `messages` array at `DEBUG`, which is the user's verbatim
+question and every retrieved clause. Tightening still applies to everyone, since silence leaks nothing
+(at `WARNING` the access log goes quiet too, so what a reported id resolves against is whatever went
+wrong — which is the case you'd be looking at).
 
 Until this slice the app configured no logging at all, and INFO only appeared **by accident**: the MCP
 SQL server builds a `FastMCP` at module level, whose constructor calls `logging.basicConfig`, and the

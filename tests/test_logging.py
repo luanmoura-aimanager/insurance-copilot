@@ -426,7 +426,8 @@ def test_debug_e_so_do_nosso_codigo(tmp_path):
     proc = _run_child(
         _PREAMBULO + """
 import app.main, json
-nomes = ["app.main", "app.agents.graph", "anthropic", "httpx", "httpcore", "voyageai"]
+nomes = ["app.main", "app.agents.graph", "anthropic", "httpx", "httpcore",
+         "voyageai", "uvicorn", "uvicorn.error", "uvicorn.access"]
 print(json.dumps({n: logging.getLevelName(logging.getLogger(n).getEffectiveLevel())
                   for n in nomes}))
 """,
@@ -437,7 +438,11 @@ print(json.dumps({n: logging.getLevelName(logging.getLogger(n).getEffectiveLevel
     assert proc.returncode == 0, f"stderr:\n{proc.stderr}"
     niveis = json.loads(proc.stdout.splitlines()[-1])
     assert niveis["app.main"] == "DEBUG" and niveis["app.agents.graph"] == "DEBUG"
-    for terceiro in ("anthropic", "httpx", "httpcore", "voyageai"):
+    # O uvicorn entra na lista: é biblioteca de terceiro como qualquer outra, e é a ÚNICA
+    # que o config toca pelo nome — deixá-lo de fora tornava a asserção cega justo onde a
+    # invariante era falsa.
+    for terceiro in ("anthropic", "httpx", "httpcore", "voyageai",
+                     "uvicorn", "uvicorn.error", "uvicorn.access"):
         assert niveis[terceiro] == "INFO", (terceiro, niveis)
 
 
@@ -592,3 +597,102 @@ def test_as_anomalias_do_route_sao_WARNING(linhas_json):
     niveis = {l["message"]: l["level"] for l in linhas_json()}
     assert len(niveis) == 2, niveis
     assert set(niveis.values()) == {"WARNING"}, niveis
+
+
+def test_log_level_do_dotenv_e_respeitado(tmp_path):
+    """`LOG_LEVEL` no `.env` tem que valer — é o setup local que o README documenta.
+
+    `configure_logging()` roda no import de `app/main.py`, que é ANTES do `load_dotenv()`
+    do `app/db.py`. Sem carregar o `.env` aqui, um dev que seguisse `cp .env.example .env`
+    e editasse o nível não mudava nada — e nem o aviso de valor inválido disparava, porque
+    não havia valor nenhum pra validar.
+
+    Note que este filho NÃO usa `_PREAMBULO`: é justamente o `load_dotenv` que está sob
+    teste, então neutralizá-lo mataria o caso.
+    """
+    (tmp_path / ".env").write_text("LOG_LEVEL=WARNING\n")
+
+    proc = _run_child(
+        """
+import logging
+logging.basicConfig = lambda *a, **k: None
+import app.main
+log = logging.getLogger("app.main")
+log.info("nao deveria aparecer")
+log.warning("deveria aparecer")
+""",
+        tmp_path,
+    )
+
+    assert proc.returncode == 0, f"stderr:\n{proc.stderr}"
+    assert [l["message"] for l in _linhas(proc.stdout)] == ["deveria aparecer"]
+
+
+def test_niveis_sem_sentido_caem_no_default(tmp_path):
+    """`NOTSET` passaria por `getLevelNamesMapping()` e viraria INFO em silêncio.
+
+    O mapa do `logging` também aceita `WARN`/`FATAL` e qualquer nível registrado com
+    `addLevelName` (o uvicorn registra `TRACE`). O fallback só significa alguma coisa se
+    recusar o que não dá pra usar — senão configuração inutilizável fica indistinguível de
+    configuração certa.
+    """
+    proc = _run_child(
+        _PREAMBULO + """
+import app.main
+logging.getLogger("app.main").info("o INFO continua saindo")
+""",
+        tmp_path,
+        LOG_LEVEL="NOTSET",
+    )
+
+    assert proc.returncode == 0, f"stderr:\n{proc.stderr}"
+    mensagens = [l["message"] for l in _linhas(proc.stdout)]
+    assert any("NOTSET" in m for m in mensagens), mensagens
+    assert "o INFO continua saindo" in mensagens
+
+
+def test_configure_logging_nao_pisa_em_handler_alheio(tmp_path):
+    """Handler que não é nosso sobrevive — é onde vive a captura do pytest.
+
+    `dictConfig` remove TODOS os handlers da raiz, e esta função roda no import de
+    `app.main`, que várias fixtures fazem no MEIO da sessão: sem a reinstalação, um
+    `pytest --log-file` sairia vazio a partir dali. Mesmo estrago que `configure_logger=False`
+    no conftest impede do lado do Alembic.
+    """
+    proc = _run_child(
+        _PREAMBULO + """
+raiz = logging.getLogger()
+sentinela = logging.NullHandler()
+raiz.addHandler(sentinela)
+import app.main
+from app.logging_config import JsonFormatter, configure_logging
+configure_logging()                       # duas vezes: nem duplica o nosso, nem perde o alheio
+nossos = [h for h in raiz.handlers if isinstance(h.formatter, JsonFormatter)]
+assert sentinela in raiz.handlers, "o handler alheio foi arrancado"
+assert len(nossos) == 1, f"handlers nossos: {nossos}"
+logging.getLogger("app.main").info("uma vez só")
+""",
+        tmp_path,
+    )
+
+    assert proc.returncode == 0, f"stderr:\n{proc.stderr}"
+    assert [l["message"] for l in _linhas(proc.stdout)] == ["uma vez só"]
+
+
+def test_a_redacao_cobre_o_traceback_e_nao_so_a_mensagem(linhas_json):
+    """`format_tb` inclui a LINHA DE FONTE de cada frame — a redação é da linha, não do campo.
+
+    Um alvo da lista fechada pode chegar pelo `exc_traceback` com o `message` limpo, e a
+    promessa do módulo é sobre a saída.
+    """
+    def _explode():
+        raise RuntimeError("hub.verify_token=segredo-no-fonte")
+
+    try:
+        _explode()
+    except RuntimeError:
+        logging.getLogger("app.main").exception("falhou")
+
+    (linha,) = linhas_json()
+    assert "segredo-no-fonte" not in json.dumps(linha)
+    assert "hub.verify_token=<redigido>" in linha["exc_traceback"]
