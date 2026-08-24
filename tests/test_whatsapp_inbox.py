@@ -269,6 +269,11 @@ async def test_lote_com_uma_nova_e_uma_reentrega_conta_certo(caplog, webhook, se
     await entregar(webhook, payload_com([msg_texto()]))
 
     with caplog.at_level(logging.INFO, logger="app.main"):
+        # `clear()` porque a asserção é sobre ESTA entrega. A primeira também loga, e desde
+        # que o app configura logging de verdade (raiz em INFO) ela é capturada mesmo tendo
+        # acontecido fora do bloco — antes o INFO só existia dentro do `at_level`, porque a
+        # raiz ficava em WARNING dentro do pytest. Mesmo `clear()` do teste vizinho.
+        caplog.clear()
         await entregar(webhook, payload_com([msg_texto(), msg_texto(wamid=outro)]))
         linhas_log = [r.getMessage() for r in caplog.records if "entrega guardada" in r.getMessage()]
 

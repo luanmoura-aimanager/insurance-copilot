@@ -19,6 +19,8 @@ import re
 from types import SimpleNamespace
 
 import pytest
+
+from app.logging_config import JsonFormatter
 from httpx import ASGITransport, AsyncClient
 from langchain_core.messages import AIMessage, HumanMessage
 
@@ -283,8 +285,15 @@ async def test_o_log_leva_traceback_request_id_e_client(
     # `logger.exception`, não `logger.error`: sem o exc_info o operador sabe QUE caiu e não
     # POR QUE, que é o inverso do que esta fatia trocou de lugar.
     assert registro.exc_info is not None
-    # E o detalhe que saiu da resposta está aqui, formatado junto do traceback.
-    assert segredo in caplog.text
+    # O detalhe está no REGISTRO — mas NÃO na saída de produção, e a distinção é o ponto.
+    #
+    # `caplog.text` usa o formatter do pytest, que anexa `str(exc)`; asserir o segredo ali
+    # descreveria o pytest, não o serviço. O `JsonFormatter` (app/logging_config.py) emite
+    # tipo e frames e nunca a mensagem, porque é ela que carrega `[parameters: (...)]` num
+    # erro do SQLAlchemy — o telefone e o texto do usuário. Então o que o operador tem é o
+    # tipo, os frames e a cadeia; o texto da exceção é o preço, e está pago de propósito.
+    assert segredo in caplog.text                      # no registro, via formatter do pytest
+    assert segredo not in JsonFormatter().format(registro)   # e NÃO no que produção emite
 
 
 # --- As outras três frases: nada mudou pra elas ---

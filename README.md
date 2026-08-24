@@ -332,6 +332,58 @@ It is still the right trade, because the alternative is worse. Without the flag 
 
 So the ceiling is hygiene, not a barrier. What actually stops brute force is entropy: the `/ask` tokens and `WHATSAPP_VERIFY_TOKEN` are 32 random bytes compared in constant time, and the webhook body is HMAC-signed. Treating the ceiling as the barrier would be an argument for a weak token, which is why it is spelled out here. Two accepted costs: slowapi's `memory://` key space grows per forged key, and an unsupported method on a routed path (`PUT /webhook/whatsapp`) is counted by no limit at all, since slowapi's middleware only matches `Match.FULL` and the 405 comes out of routing before any decorator. Both go away when `*` becomes the proxy's real CIDR.
 
+### Logs
+
+Every log record is **one line of JSON on stdout**, correlated by request:
+
+```json
+{"ts":"2026-08-24T15:27:53.630+00:00","level":"INFO","logger":"uvicorn.access",
+ "message":"127.0.0.1:50294 - \"POST /ask HTTP/1.1\" 401",
+ "request_id":"14c27b8e-7f62-4f49-99b3-d42887a1b61a"}
+```
+
+That `request_id` is the same value in three places: the **`X-Request-Id`** header on the response,
+every log line of that request, and the `cost_event` rows the request billed. So a user who reports
+"my question failed" hands over one id, and it answers both "what happened?" and "what did it cost?".
+It is minted by a middleware that sits outside the rate limiter, so a **429** and a **401** carry it
+too — the two responses where the caller has no other clue to offer. An inbound `X-Request-Id` is
+ignored: the id would land in a database column and in the logs, and behind `--forwarded-allow-ips=*`
+a client-supplied header is chosen by the client, not the proxy.
+
+The field list is **closed** — `ts` (ISO, UTC), `level`, `logger`, `message`, plus `request_id`/`client`
+when there is a request and `exc_type`/`exc_traceback` when there is an exception. Nothing dumps
+`record.__dict__`, because a generic dump is how PII gets into a log without anyone deciding it should.
+For the same reason **the exception's message is never emitted**: `traceback.format_tb` formats the
+frames only, while `str(exc)` is where SQLAlchemy puts `[parameters: ...]` (the sender's phone number
+and their entire message), psycopg puts host/port/user/database, and Postgres puts the key values of a
+unique violation. A call site that needs a detail from the exception names that detail itself — which
+is what `_resumo_do_erro` already does with the SQLSTATE.
+
+The exception **chain** is walked too — a `DBAPIError` wrapping an asyncpg error reports both types
+and both sets of frames, because only the *message* was ever the PII, not the identity of what caused
+what. An unhandled 500 answers without the header (Starlette's `ServerErrorMiddleware` sits outside
+every user middleware) but is still logged with its `request_id`, deliberately, since that is the one
+response class the operator most needs to trace.
+
+Set the volume with `LOG_LEVEL` (default `INFO`, and read from `.env` too), applied when the app is
+imported — so changing it needs a restart, not a rebuild. An invalid value falls back to the default
+and says so, rather than failing the boot or silencing the output; the accepted values are an explicit
+allowlist, because `logging`'s own table would let `NOTSET` through and quietly behave like `INFO`.
+
+**`DEBUG` only ever applies to this project's own loggers.** The root logger — and uvicorn's, the one
+third-party library this config names — never drops below `INFO`, because third-party debug logging is
+where the PII is: `anthropic` emits the full `messages` array at `DEBUG`, which is the user's verbatim
+question and every retrieved clause. Tightening still applies to everyone, since silence leaks nothing
+(at `WARNING` the access log goes quiet too, so what a reported id resolves against is whatever went
+wrong — which is the case you'd be looking at).
+
+Until this slice the app configured no logging at all, and INFO only appeared **by accident**: the MCP
+SQL server builds a `FastMCP` at module level, whose constructor calls `logging.basicConfig`, and the
+agent graph imports from that module — so `import app.main` configured the root logger as a side effect
+of a server the web process never serves. Measured: without that import the root logger is `[]` at
+WARNING. `tests/test_logging.py::test_emissao_sem_o_acidente` is the guard — it kills the accident in a
+subprocess and requires the line on stdout anyway.
+
 ### The WhatsApp webhook (receive and store)
 
 `/webhook/whatsapp` is the **first public endpoint** in the project: Meta sends no `Authorization` header, so the HMAC signature over the request body plays the part the Bearer token plays on `/ask`. It proves an event arrived, came from Meta, and was not tampered with — and then **stores** the text messages in `whatsapp_message`, an inbox deduplicated by `wamid`. Calling the graph and replying is the next slice.
@@ -375,6 +427,7 @@ insurance-copilot/
 │   ├── auth.py             # Bearer auth with identity (API_TOKENS: name -> token)
 │   ├── whatsapp.py         # WhatsApp edge: verification handshake + HMAC signature + payload parse
 │   ├── limits.py           # slowapi limiter: per-client + per-IP keys
+│   ├── logging_config.py   # structured logging: one JSON line per record, request-correlated
 │   ├── db.py               # lazy async engine + session factory (SQLAlchemy 2.0)
 │   ├── rag/                # chunking + embedding + similarity search over clause_chunk
 │   └── models.py           # ORM models: PolicyDocument, Coverage, Peril, CoveragePeril, Exclusion, ClauseChunk, CostEvent, WhatsAppMessage
@@ -438,6 +491,7 @@ PDF footer).
 - [x] Cost attribution in the agent graph — one `cost_event` per LLM call, tagged with a per-request id and the calling client
 - [~] RAG worker — vector storage ready (pgvector extension, `clause_chunk` with an exclusive-arc origin, HNSW/cosine index, revoked from the SQL worker's role), chunks materialized from the extracted text (one source row = one chunk, idempotent re-indexing that invalidates the vector when the text changes), embeddings filled by a resumable, cost-attributed pass (Voyage `voyage-4-lite`, `input_type="document"`, one `cost_event` per batch), similarity search as a testable function (`search_clauses`, `input_type="query"`, relevance threshold, per-document filter), and a `rag_worker` node wired into the graph behind a three-way supervisor; **pending:** calibrating the threshold against the labelled question set
 - [~] WhatsApp surface — inbound edge done (`/webhook/whatsapp`: verification handshake, HMAC-SHA256 over the raw body, defensive payload parse, PII-free logging, and a rate limit that escapes the per-IP ceiling without going uncapped), and **durable acceptance** on top of it (`whatsapp_message`: an inbox deduplicated by `wamid`, revoked from the SQL worker's role, where the 200 now means "accepted durably" and a failed insert deliberately answers 500 so Meta redelivers). Pending: scanning the pending rows, calling the graph, replying through the Cloud API — and a **PII retention policy**, which the inbox creates the need for
+- [x] Structured logging — one JSON line per record on stdout, `request_id`/`client` injected from the request ContextVars (the same key as `cost_event`), returned to the caller as `X-Request-Id`; the exception's message is deliberately never emitted, only its type and frames
 - [ ] Deploy to Railway
 
 ## License
