@@ -4,8 +4,17 @@ import logging
 import traceback
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+# Configurado ANTES dos outros imports pra que o `basicConfig` que o FastMCP dispara (via
+# `app.agents.graph` -> `mcp_servers.postgres_mcp_server`, algumas linhas abaixo) vire no-op,
+# e pra que o que for logado DURANTE os imports restantes já saia formatado. O porquê
+# completo — e por que a ordem NÃO é o que decide quem vence — está em app/logging_config.py.
+from app.logging_config import configure_logging
+
+configure_logging()
+
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status  # noqa: E402
 from fastapi.responses import PlainTextResponse
+from starlette.datastructures import MutableHeaders
 from starlette.requests import ClientDisconnect
 from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import BaseModel, Field
@@ -17,7 +26,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import DBAPIError, DisconnectionError, InterfaceError
 from sqlalchemy.exc import TimeoutError as SATimeoutError
 
-from app.agents.context import reset_request_context, set_request_context
+from app.agents.context import get_request_id, reset_request_context, set_request_context
 from app.agents.graph import NO_ANSWER, graph
 from app.auth import require_client
 from app.db import get_session
@@ -48,6 +57,73 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # requests que morrem no 401 da auth. Como decorator ele nunca seria alcançado —
 # require_client levanta antes — e dava pra martelar /ask com token inválido de graça.
 app.add_middleware(SlowAPIMiddleware)
+
+
+HEADER_REQUEST_ID = "x-request-id"
+
+
+class RequestIdMiddleware:
+    """Cunha um id por request, fixa nos ContextVars e devolve no `X-Request-Id`.
+
+    **Middleware ASGI puro, e não `BaseHTTPMiddleware`.** O `BaseHTTPMiddleware` roda o app
+    de baixo numa task filha, então o ContextVar que ele fixa vira uma CÓPIA: a leitura
+    funciona, mas o `reset` do `finally` acontece num contexto diferente do endpoint — o
+    tipo de semântica que quebra em silêncio. ASGI puro fixa a var no mesmo contexto que o
+    resto do stack herda, e de quebra não acrescenta um task group + par de memory streams
+    por request.
+
+    Registrado DEPOIS do `SlowAPIMiddleware`, então fica por FORA dele (o Starlette roda o
+    último adicionado como o mais externo): o id cobre também o 429 do teto por IP e o 401
+    da auth, que são justamente as respostas em que quem reclama não tem outra pista.
+
+    O id é sempre NOSSO — um `X-Request-Id` de entrada é texto escolhido pelo cliente, e ele
+    iria parar em `cost_event.request_id` e no log. Com `--forwarded-allow-ips=*` no
+    Procfile o header já é escolhido pelo cliente e não pelo proxy, então não haveria o que
+    validar.
+
+    Numa exceção NÃO tratada quem responde é o `ServerErrorMiddleware`, que é mais externo
+    que qualquer user middleware — então **o 500 sai sem o header**, e não há como mudar isso
+    daqui. O que dá pra garantir é o outro lado: o `except` abaixo registra a exceção AINDA
+    DENTRO do contexto, antes do `reset` do `finally`. Sem ele, o único log daquele crash
+    seria o `"Exception in ASGI application"` do uvicorn, emitido depois do reset e portanto
+    **sem `request_id`** (verificado) — ou seja, a resposta que mais precisa ser rastreável
+    seria a única sem header E sem correlação. O preço é uma linha a mais por crash, e ela é
+    a que tem o id.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request_id = str(uuid4())
+        # `client` entra como None: quem autentica é a dependency da rota, que roda bem
+        # depois daqui. O `/ask` refixa o par assim que sabe quem perguntou.
+        ctx = set_request_context(request_id, None)
+
+        async def send_com_id(message):
+            if message["type"] == "http.response.start":
+                MutableHeaders(scope=message)[HEADER_REQUEST_ID] = request_id
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_com_id)
+        except Exception:
+            # Dentro do contexto de propósito — ver o docstring. Re-levanta: quem transforma
+            # isso em 500 é o ServerErrorMiddleware, e engolir aqui devolveria uma resposta
+            # vazia no lugar do erro.
+            logger.exception(
+                "exceção não tratada em %s %s", scope.get("method"), scope.get("path")
+            )
+            raise
+        finally:
+            reset_request_context(ctx)
+
+
+app.add_middleware(RequestIdMiddleware)
 
 
 class AskRequest(BaseModel):
@@ -126,11 +202,17 @@ async def ask(
     # repetimos aqui só pra deixar o vínculo explícito na leitura da rota.
     request.state.client_name = client
 
-    # Contexto que os nós do grafo leem pra atribuir o custo: um id novo por request
+    # Contexto que os nós do grafo leem pra atribuir o custo: o id do request
     # (correlaciona as N chamadas de LLM de um mesmo /ask) e QUEM pediu. O reset no
     # finally é obrigatório — sem ele o valor sobreviveria ao request nesta task e
     # vazaria pro próximo que a reaproveitasse.
-    ctx = set_request_context(str(uuid4()), client)
+    #
+    # O id vem do RequestIdMiddleware, não é cunhado aqui: ele já correlacionou o request
+    # inteiro (o log de acesso, um 401, um 429) e é o mesmo que volta no `X-Request-Id`.
+    # Cunhar outro neste ponto partiria em dois o que o `cost_event` e o traceback de
+    # `_falha_de_worker` usam pra se encontrar. O `or` é cinto pra quem chame o endpoint
+    # direto, fora do stack ASGI.
+    ctx = set_request_context(get_request_id() or str(uuid4()), client)
     try:
         state = await graph.ainvoke({
             "iterations": 0,

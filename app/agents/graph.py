@@ -459,7 +459,9 @@ async def supervisor(state: State) -> dict:
             decision.reasoning,
         )
 
-    print(f"[supervisor] iteration {i} -> decided: {decision.next} ({decision.reasoning})")
+    logger.info(
+        "[supervisor] iteration %d -> decided: %s (%s)", i, decision.next, decision.reasoning
+    )
     return {
         "iterations": i,
         "next": decision.next,
@@ -545,7 +547,7 @@ async def sql_worker(state: State) -> dict:
             get_request_id(),
             get_client_name(),
         )
-    print(f"[sql_worker] SQL: {sql}")
+    logger.info("[sql_worker] SQL: %s", sql)
     return {
         "messages": [
             AIMessage(
@@ -625,9 +627,9 @@ async def rag_worker(state: State) -> dict:
             hits = await search_clauses(session, question, k=RAG_K)
 
         relevantes = [h for h in hits if h.distance <= MAX_DISTANCE_PADRAO]
-        print(
-            f"[rag_worker] {len(relevantes)}/{len(hits)} cláusula(s) dentro do limiar "
-            f"{MAX_DISTANCE_PADRAO}"
+        logger.info(
+            "[rag_worker] %d/%d cláusula(s) dentro do limiar %s",
+            len(relevantes), len(hits), MAX_DISTANCE_PADRAO,
         )
         if not relevantes:
             if hits:
@@ -783,19 +785,19 @@ async def synthesizer(state: State) -> dict:
     #    a base PESQUISÁVEL, não a do corpus — ver `_sufixo_pesquisado`.
     if not substantivos:
         if falhou:
-            print("[synthesizer] falha de worker -> frase fixa, sem LLM")
+            logger.info("[synthesizer] falha de worker -> frase fixa, sem LLM")
             return {"messages": [AIMessage(content=FALHA_INTERNA, name="final")]}
         if resultados:
-            print("[synthesizer] busca sem hits -> frase do worker, sem LLM")
+            logger.info("[synthesizer] busca sem hits -> frase do worker, sem LLM")
             # A base sai da MENSAGEM (a mais recente), pelo mesmo caminho de toda outra
             # saída — nunca de uma chamada direta a `_sufixo_pesquisado` aqui, que voltaria
             # a fixar uma base global independente do que o worker varreu.
             frase = _com_base(NADA_RELEVANTE, await _sufixo_da_resposta(resultados[0]))
             return {"messages": [AIMessage(content=frase, name="final")]}
         if state.get("next") == "unsupported":
-            print("[synthesizer] fora de escopo -> frase fixa, sem LLM")
+            logger.info("[synthesizer] fora de escopo -> frase fixa, sem LLM")
             return {"messages": [AIMessage(content=FORA_DE_ESCOPO, name="final")]}
-        print("[synthesizer] sem resultado de worker -> fallback estático")
+        logger.info("[synthesizer] sem resultado de worker -> fallback estático")
         return {"messages": [AIMessage(content=NO_ANSWER, name="final")]}
     msg_resultado = substantivos[0]
     resultado = msg_resultado.content
@@ -842,7 +844,9 @@ async def synthesizer(state: State) -> dict:
     # que worker nenhum rodou. A saída é o rodapé viajar fora do `content` (em
     # `additional_kwargs`, com a junção na borda HTTP), e ela é da fatia do multi-turno
     # porque é lá que se decide o que o supervisor enxerga do histórico.
-    print(f"[synthesizer] resposta final {'sintetizada' if frase else 'CRUA (degradou)'}")
+    logger.info(
+        "[synthesizer] resposta final %s", "sintetizada" if frase else "CRUA (degradou)"
+    )
     final = _com_base(frase or resultado, await _sufixo_da_resposta(msg_resultado))
     return {"messages": [AIMessage(content=final, name="final")]}
 
@@ -856,7 +860,11 @@ def route(state: State) -> str:
     # possível numa linha), e guarda que nunca dispara continua sendo guarda. O teste
     # dele força `iterations` direto no State justamente por isso.
     if state["iterations"] >= MAX_ITERATIONS:  # mechanical guard: does not ask the LLM
-        print("[route] circuit breaker -> END")
+        # WARNING, não INFO: isto é ANOMALIA, e o irmão dela (o supervisor devolvendo
+        # "END") já loga em WARNING pelo mesmo motivo. Em INFO, um deploy com
+        # LOG_LEVEL=WARNING calaria as duas — e de fora o NO_ANSWER resultante é
+        # indistinguível de falha de infra, sem nada no log pra desempatar.
+        logger.warning("[route] circuit breaker -> END")
         return END
     nxt = state["next"]
     if nxt in WORKERS:
@@ -865,7 +873,7 @@ def route(state: State) -> str:
     # synthesizer. A diferença entre eles é só a FRASE, e quem a escolhe é o synthesizer
     # lendo `state["next"]` — route() decide o CAMINHO, não o texto.
     if nxt not in ("END", "unsupported"):  # suspenders: o enum deveria impedir, mas se escapar → END
-        print(f"[route] invalid next '{nxt}' -> END (fail closed)")
+        logger.warning("[route] invalid next %r -> END (fail closed)", nxt)
     return END
 
 
@@ -908,9 +916,19 @@ graph = builder.compile()
 
 # --- 7. Run (só quando executado direto; importar o módulo não roda o grafo) ---
 if __name__ == "__main__":
+    # A demo não passa por `app/main.py`, então ninguém configurou logging por ela — e sem
+    # esta chamada as linhas dos nós só apareceriam de carona no `basicConfig` que o FastMCP
+    # dispara, que é exatamente o acidente que `app/logging_config.py` existe pra matar (e
+    # que some no dia em que aquela construção virar preguiçosa).
+    from app.logging_config import configure_logging
+
+    configure_logging()
+
     final = asyncio.run(graph.ainvoke({
         "iterations": 0,
         "next": "",
         "messages": [HumanMessage(content="How many perils are there?")],
     }))
+    # `print` e não `logger`: isto é saída de PROGRAMA da demo, não evento de servidor —
+    # quem roda `python -m app.agents.graph` quer o State no terminal, não uma linha JSON.
     print("FINAL STATE:", final)
