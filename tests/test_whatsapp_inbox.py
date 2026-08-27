@@ -225,15 +225,104 @@ async def test_sem_metadata_grava_com_phone_number_id_nulo(webhook, sessions):
     assert todas[0].phone_number_id is None
 
 
-async def test_status_so_aceita_os_tres_valores(sessions):
-    """O check é o que impede a W2b de inventar um quarto estado em silêncio."""
+@pytest.mark.parametrize("valido", ["pending", "computed", "answered", "failed"])
+async def test_status_aceita_os_quatro_valores_e_so_eles(sessions, valido):
+    """O check é o que impede um estado inventado em silêncio.
+
+    Eram três até a W2b; `computed` entrou porque a resposta passou a existir no banco ANTES
+    de sair (ver `app/inbox.py`). Os dois lados são necessários: só a rejeição passaria verde
+    contra um check que recusasse TUDO, derrubando a varredura inteira.
+    """
     from sqlalchemy.exc import IntegrityError
+
+    async with sessions() as s:
+        s.add(WhatsAppMessage(wamid=f"wamid.ok.{valido}", from_phone=TELEFONE,
+                              text=TEXTO, status=valido))
+        await s.flush()
 
     async with sessions() as s:
         s.add(WhatsAppMessage(wamid="wamid.check", from_phone=TELEFONE,
                               text=TEXTO, status="processando"))
         with pytest.raises(IntegrityError, match="ck_whatsapp_message_status"):
             await s.flush()
+
+
+async def test_a_varredura_e_agendada_DEPOIS_do_commit(webhook, sessions, monkeypatch):
+    """A rota agenda a varredura, e quando ela roda a linha JÁ ESTÁ commitada.
+
+    As duas metades são load-bearing. Sem a primeira, a W2b inteira nunca é disparada pelo
+    caminho normal e só o script a alcança. Sem a segunda, agendar ANTES do commit passaria
+    verde — e em produção a varredura abriria outra sessão, não veria nada, e a mensagem
+    ficaria parada até a próxima entrega.
+
+    O seam é o mesmo que o conftest desliga por default (`app.inbox.varrer_em_background`);
+    aqui ele vira ESPIÃO, não o original — nenhum teste chama o grafo.
+    """
+    visto = {"chamadas": 0, "linhas": None}
+
+    async def espiao(*_args, **_kwargs):
+        visto["chamadas"] += 1
+        # Lê por uma sessão SEPARADA, que é o que só enxerga o que foi commitado.
+        visto["linhas"] = await linhas(sessions)
+
+    monkeypatch.setattr("app.inbox.varrer_em_background", espiao)
+
+    r = await entregar(webhook, payload_com([msg_texto()]))
+    assert r.status_code == 200
+
+    assert visto["chamadas"] == 1
+    assert [linha.wamid for linha in visto["linhas"]] == [WAMID]
+    assert visto["linhas"][0].status == "pending"
+
+
+async def test_a_suite_nao_deixa_a_varredura_chamar_o_grafo(webhook, sessions, monkeypatch):
+    """A trava de DINHEIRO, e ela é sobre este módulo em particular.
+
+    Aqui a sessão é real e a linha existe, então sem o no-op autouse do `conftest.py` o POST
+    faria a varredura rodar de verdade DENTRO do `await client.post(...)` — a BackgroundTask
+    é executada dentro da chamada ASGI, e o `ASGITransport` só devolve a resposta quando ela
+    termina. Com um `WHATSAPP_ACCESS_TOKEN` no `.env` (o caso normal de qualquer máquina de
+    dev) isso vira grafo real -> Anthropic real -> fatura.
+
+    O espião é em `processar_pendentes`, que o conftest NÃO patcheia: é o primeiro degrau
+    depois do seam, então ele mede se o seam de fato barrou. Verificado por mutação —
+    trocando o `monkeypatch.setattr` do conftest por um `pass`, este teste fica vermelho e
+    era o único.
+    """
+    chamadas = []
+
+    async def _espiao(*_args, **_kwargs):
+        chamadas.append(1)
+        return {}
+
+    monkeypatch.setattr("app.inbox.processar_pendentes", _espiao)
+
+    r = await entregar(webhook, payload_com([msg_texto()]))
+    assert r.status_code == 200
+    assert chamadas == [], "a varredura rodou de verdade — a trava do conftest caiu"
+
+
+async def test_entrega_sem_mensagem_de_texto_nao_agenda_varredura(webhook, monkeypatch):
+    """Sem linha nova E sem linha nenhuma tocada, não há transação e não há o que varrer.
+
+    O agendamento mora DENTRO do `if perguntas:`, no `else` do commit — um evento que não
+    produz pergunta (um `value.statuses`, um áudio) não abre sessão nem agenda nada.
+    """
+    chamadas = []
+    monkeypatch.setattr(
+        "app.inbox.varrer_em_background",
+        lambda *_a, **_kw: chamadas.append(1) or _nada(),
+    )
+
+    r = await entregar(webhook, payload_com([
+        {"from": TELEFONE, "id": "wamid.AUDIO", "timestamp": "1771000000", "type": "audio"}
+    ]))
+    assert r.status_code == 200
+    assert chamadas == []
+
+
+async def _nada():
+    return None
 
 
 async def test_o_log_distingue_entrega_NOVA_de_REENTREGA(caplog, webhook, sessions):

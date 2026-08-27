@@ -174,6 +174,31 @@ def _campos_da_excecao(exc: BaseException) -> dict:
     }
 
 
+def resumo_do_erro(exc: BaseException) -> str:
+    """Identifica um erro de banco SEM nada que o usuário escreveu.
+
+    O texto de uma exceção do SQLAlchemy inclui `[parameters: (...)]` — os valores ligados,
+    que nas superfícies deste projeto são o telefone e a mensagem inteira —, e é justamente
+    ele que um `logger.exception` imprime. `hide_parameters=True` na engine (app/db.py) tapa
+    isso, mas nenhum call site pode DEPENDER de um flag de engine pra manter a promessa de
+    PII: quem construir a sessão de outro jeito (um teste, um worker) a perde sem aviso.
+
+    A mensagem do servidor também fica de fora, e não por zelo: o Postgres põe os valores da
+    chave no DETAIL de uma violação de unique (`Key (wamid)=(...)`), e o wamid embute o
+    telefone em base64. O SQLSTATE identifica a falha com precisão e não carrega dado nenhum.
+
+    Mora aqui, e não em `app/main.py` (onde nasceu), porque tem DOIS chamadores — o webhook e
+    a varredura do WhatsApp — e os dois obedecem à mesma regra. Duas cópias divergiriam no
+    dia em que uma fosse endurecida (um `pgcode`, um driver que reporte o estado em outro
+    lugar), e as duas metades da mesma superfície passariam a descrever a mesma falha de
+    jeitos diferentes. É a regra que tirou o `final_answer` de `app/main.py`.
+    """
+    sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+    if isinstance(sqlstate, str):
+        return f"{type(exc).__name__}(sqlstate={sqlstate})"
+    return type(exc).__name__
+
+
 def traceback_da_cadeia(exc: BaseException) -> str:
     """Tipos e frames da exceção e de quem a causou, SEM nenhuma mensagem.
 
