@@ -7,15 +7,24 @@ from uuid import uuid4
 # `app.agents.graph` -> `mcp_servers.postgres_mcp_server`, algumas linhas abaixo) vire no-op,
 # e pra que o que for logado DURANTE os imports restantes já saia formatado. O porquê
 # completo — e por que a ordem NÃO é o que decide quem vence — está em app/logging_config.py.
-from app.logging_config import configure_logging, traceback_da_cadeia
+from app.logging_config import configure_logging, resumo_do_erro, traceback_da_cadeia
 
 configure_logging()
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status  # noqa: E402
+from fastapi import (  # noqa: E402
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from fastapi.responses import PlainTextResponse
 from starlette.datastructures import MutableHeaders
 from starlette.requests import ClientDisconnect
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -25,8 +34,10 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import DBAPIError, DisconnectionError, InterfaceError
 from sqlalchemy.exc import TimeoutError as SATimeoutError
 
+from app import inbox
+from app.agents.answer import final_answer
 from app.agents.context import get_request_id, reset_request_context, set_request_context
-from app.agents.graph import NO_ANSWER, graph
+from app.agents.graph import graph
 from app.auth import require_client
 from app.db import get_session
 from app.limits import WEBHOOK_ANCORA, ask_client_limit, client_key, limiter, whatsapp_limit
@@ -139,29 +150,11 @@ class AskResponse(BaseModel):
     iterations: int
 
 
-def _final_answer(state: dict) -> str:
-    """A frase do synthesizer, que é sempre o último nó do grafo.
-
-    Não há mais o que varrer: todo caminho de saída passa pelo synthesizer (inclusive
-    o que não roda worker nenhum), então a resposta é literalmente a última mensagem.
-    O NO_ANSWER aqui é só cinto: se o histórico vier com outra coisa no fim, não
-    devolvemos o raciocínio interno de um agente como se fosse resposta.
-
-    **Falha de worker também sai 200, com a frase `FALHA_INTERNA`.** A superfície deste
-    sistema é conversa (hoje `/ask`, amanhã WhatsApp): um 5xx entrega ao usuário uma tela
-    de erro do framework ou um balão vazio — ele fica sem resposta E sem saber se vale
-    tentar de novo. Uma frase que diz "falhei do meu lado, tente em instantes" é a
-    informação que ele pode usar. O que o STATUS resolveria — alarme, dashboard,
-    investigação — é necessidade do operador, e o operador é servido pelo LOG: cada uma
-    dessas respostas tem um `logger.exception` com traceback, `request_id` e `client`
-    (ver `_falha_de_worker` em `app/agents/graph.py`), que é estritamente mais do que um
-    500 opaco carregaria. Trocar o diagnóstico do operador pela resposta do usuário seria
-    piorar os dois lados.
-    """
-    last = state["messages"][-1]
-    if isinstance(last, AIMessage) and last.name == "final":
-        return last.content
-    return NO_ANSWER
+# `_final_answer` MUDOU DE CASA: agora é `app.agents.answer.final_answer`. Ela passou a ter
+# DOIS leitores — o /ask e a varredura do WhatsApp — e uma cópia divergiria no dia em que o
+# nome da mensagem terminal do grafo mudasse. Mesmo argumento do `ERRO_PREFIXO` exportado pelo
+# produtor e do `_filtro_pesquisavel` compartilhado. Ver o docstring lá, que explica também
+# por que falha de worker sai 200 (aqui) e não vira silêncio (no WhatsApp).
 
 
 # /health e /health/db ficam ABERTOS de propósito: é o healthcheck do Railway, que
@@ -225,16 +218,20 @@ async def ask(
         })
     finally:
         reset_request_context(ctx)
-    return AskResponse(answer=_final_answer(state), iterations=state["iterations"])
+    return AskResponse(answer=final_answer(state), iterations=state["iterations"])
 
 
 # ---------------------------------------------------------------------------
-# Superfície do WhatsApp (Meta Cloud API) — FATIA W2a: RECEBER E GUARDAR.
+# Superfície do WhatsApp (Meta Cloud API) — RECEBER, GUARDAR e RESPONDER.
 #
-# Estas duas rotas ainda não chamam o grafo e não respondem no WhatsApp — isso é a W2b.
-# O que a W2a acrescentou à W1 é DURABILIDADE: a mensagem de texto vira linha em
-# `whatsapp_message`, deduplicada por `wamid`, e o 200 passa a significar "aceito com
-# durabilidade" em vez de "li o que deu".
+# W1: a rota prova que o evento veio da Meta (HMAC sobre o corpo cru). W2a: a mensagem de
+# texto vira linha em `whatsapp_message`, deduplicada por `wamid`, e o 200 passa a significar
+# "aceito com durabilidade" em vez de "li o que deu". W2b: depois do commit, a rota AGENDA a
+# varredura (`app/inbox.py`) que chama o grafo e responde pela Cloud API.
+#
+# A rota em si continua não chamando o grafo nem enviando nada — ela só agenda. Quem faz o
+# trabalho roda depois do 200, numa sessão própria, e pode ser disparado também pelo
+# `scripts/process_pending.py`. Ver o docstring de `app/inbox.py`.
 #
 # É o primeiro endpoint público do projeto: a Meta não manda `Authorization`, então
 # quem faz o papel do Bearer aqui é a assinatura HMAC do corpo (`app/whatsapp.py`).
@@ -380,25 +377,11 @@ def _vale_reentregar(exc: BaseException) -> bool:
     return False
 
 
-def _resumo_do_erro(exc: BaseException) -> str:
-    """Identifica o erro SEM nada que o usuário escreveu.
-
-    O texto de uma exceção do SQLAlchemy inclui `[parameters: (...)]` — os valores
-    ligados, que aqui são o telefone e a mensagem inteira —, e é justamente ele que um
-    `logger.exception` imprime. `hide_parameters=True` na engine (app/db.py) tapa isso,
-    mas a rota não pode DEPENDER de um flag de engine pra manter a promessa de PII: quem
-    construir a sessão de outro jeito (os testes, um worker da W2b) perde a garantia sem
-    aviso. Então o que vai pro log é montado aqui: classe + SQLSTATE, e mais nada.
-
-    A mensagem do servidor também fica de fora, e não por excesso de zelo: o Postgres
-    põe os valores da chave no DETAIL de uma violação de unique (`Key (wamid)=(...)`), e
-    o wamid embute o telefone em base64 — era assim que o dado voltava pela última porta.
-    O SQLSTATE identifica a falha com precisão e não carrega dado nenhum.
-    """
-    sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
-    if isinstance(sqlstate, str):
-        return f"{type(exc).__name__}(sqlstate={sqlstate})"
-    return type(exc).__name__
+# `_resumo_do_erro` MUDOU DE CASA: agora é `app.logging_config.resumo_do_erro`, importado no
+# topo, ao lado do `traceback_da_cadeia` que a mesma regra produziu. Ela passou a ter dois
+# chamadores (esta rota e a varredura do inbox) e a duplicação divergiria no dia em que uma
+# delas endurecesse. Sem alias local: dar dois nomes à mesma função no mesmo arquivo é a
+# duplicação que a mudança de casa foi feita pra remover.
 
 
 async def _registrar_mensagens(session, perguntas: list[IncomingMessage]) -> set[str]:
@@ -482,13 +465,19 @@ async def whatsapp_verify(
 # "/webhook/whatsapp:POST" (`__evaluate_limits`) e os dois deixam de se tocar.
 @limiter.limit(WEBHOOK_ANCORA, per_method=True)
 @limiter.limit(whatsapp_limit, per_method=True)
-async def whatsapp_webhook(request: Request) -> Response:
-    """Recebe um evento da Meta, confere a assinatura e GUARDA o que dá pra responder.
+async def whatsapp_webhook(request: Request, background: BackgroundTasks) -> Response:
+    """Recebe um evento da Meta, confere a assinatura, GUARDA, e agenda a resposta.
 
     **O 200 daqui significa "aceito com durabilidade".** Na W1 significava só "li o que
-    deu": o evento era logado e descartado. Agora ele é a promessa que autoriza a W2b a
-    processar fora do request — a Meta considera a entrega concluída e nunca mais a
+    deu": o evento era logado e descartado. Agora ele é a promessa que autoriza a varredura
+    a processar fora do request — a Meta considera a entrega concluída e nunca mais a
     reenvia.
+
+    **A resposta NÃO sai daqui.** Depois do commit, a rota agenda `varrer_em_background`
+    (`app/inbox.py`), que roda depois do 200, abre a própria sessão, chama o grafo e envia
+    pela Cloud API. O 200 é independente do que a varredura fizer, e é assim que tem que
+    ser: a promessa feita à Meta é durabilidade, não entrega — a entrega é retomável, e o
+    `scripts/process_pending.py` é o backstop de quem morrer no meio.
 
     **Segue 200 em quase todo caminho pós-assinatura, e isso continua sendo escolha.** A
     Meta reenvia em não-2xx e desabilita a inscrição depois de falhas repetidas, e nada
@@ -590,7 +579,7 @@ async def whatsapp_webhook(request: Request) -> Response:
                 "(%d mensagens, ids=%s) — %s",
                 len(perguntas),
                 ",".join(id_curto(m.wamid) for m in perguntas),
-                _resumo_do_erro(exc),
+                resumo_do_erro(exc),
             )
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -623,7 +612,7 @@ async def whatsapp_webhook(request: Request) -> Response:
                 "500, pra que a Meta reentregue"
                 if reentregar
                 else "200, e estas mensagens estão PERDIDAS: reentregar não conserta",
-                _resumo_do_erro(exc),
+                resumo_do_erro(exc),
                 traceback_da_cadeia(exc),
             )
             try:
@@ -631,7 +620,7 @@ async def whatsapp_webhook(request: Request) -> Response:
             except Exception as rollback_exc:
                 logger.warning(
                     "webhook whatsapp: o rollback também falhou — %s",
-                    _resumo_do_erro(rollback_exc),
+                    resumo_do_erro(rollback_exc),
                 )
 
             if reentregar:
@@ -644,7 +633,7 @@ async def whatsapp_webhook(request: Request) -> Response:
                     detail="falha ao registrar a entrega",
                 )
             # Permanente: cai fora do `if` e a rota devolve 200. Ver o comentário de
-            # `_ERROS_QUE_VALE_REENTREGAR` — insistir aqui desliga o webhook inteiro.
+            # `_vale_reentregar` — insistir aqui desliga o webhook inteiro.
         else:
             # UMA linha por entrega, não uma por mensagem: a identificação por mensagem
             # já saiu no laço acima, e o que esta acrescenta é um bit por LOTE — quantas
@@ -661,6 +650,28 @@ async def whatsapp_webhook(request: Request) -> Response:
                 len(novos),
                 len(perguntas),
             )
+
+            # W2b: agenda a varredura que responde. TRÊS coisas decidem este lugar exato.
+            #
+            # (1) **Depois do commit bem-sucedido**, e só aqui: a varredura abre OUTRA
+            #     sessão, então não enxergaria o que não foi commitado — é o mesmo fato que
+            #     faz os testes do inbox lerem por uma conexão separada. No ramo de exceção
+            #     não há o que varrer.
+            # (2) **A task não pode capturar `session`**: quando ela roda, o `finally` abaixo
+            #     já fechou a sessão e devolveu a conexão ao pool. Por isso ela não recebe
+            #     nada — abre a sua.
+            # (3) **Incondicional, não `if novos:`**. Uma REENTREGA (zero linhas novas) vira
+            #     gatilho gratuito de recuperação: se a varredura anterior morreu no meio, a
+            #     órfã `computed` sai agora. Se dependesse de linha nova, recuperar exigiria
+            #     o `scripts/process_pending.py`, e ele é o backstop, não o caminho normal.
+            #     Varredura sem nada a fazer custa um SELECT.
+            #
+            # A resposta já foi escrita quando a task roda (`Response.__call__` manda
+            # `http.response.start`/`body` e só DEPOIS faz `await self.background()`), então
+            # a Meta recebe o 200 na hora; o que fica pendurado é a chamada ASGI. Isso
+            # também significa que, sob o `ASGITransport` dos testes, `await client.post(...)`
+            # roda a varredura inteira — daí o no-op autouse em `tests/conftest.py`.
+            background.add_task(inbox.varrer_em_background)
         finally:
             # O `Depends` fechava a sessão por nós; agora é nosso. Best effort: chegamos
             # aqui com a resposta já decidida, e um erro de fechamento não pode trocá-la.
@@ -669,7 +680,7 @@ async def whatsapp_webhook(request: Request) -> Response:
             except Exception:
                 logger.warning("webhook whatsapp: falha ao fechar a sessão", exc_info=True)
 
-    # O que a W2b herda daqui: chamar o grafo e responder pela Cloud API. A dedup por
-    # `wamid` que esta nota pedia deixou de ser herança — ela existe, é o unique de
-    # `whatsapp_message`, e é o que torna a reentrega da Meta inofensiva.
+    # O 200 sai aqui; a varredura agendada acima roda logo depois dele, fora do caminho da
+    # resposta. Nada do que ela fizer pode mudar este status — a promessa que a Meta recebe é
+    # "aceito com durabilidade", e ela já foi cumprida pelo commit.
     return Response(status_code=status.HTTP_200_OK)

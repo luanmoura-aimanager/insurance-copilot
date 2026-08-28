@@ -949,3 +949,75 @@ async def test_a_ancora_estatica_esta_registrada():
 
     assert nome in limiter._route_limits
     assert nome in limiter._dynamic_route_limits      # o callable do env, em paralelo
+
+
+# ---------------------------------------------------------------------------
+# W2b: o agendamento da varredura (o seam, não o grafo — nada aqui gasta)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def espiao_da_varredura(monkeypatch):
+    """Troca o no-op autouse do conftest por um ESPIÃO. Continua sem chamar o grafo."""
+    chamadas = []
+
+    async def _espiao(*_args, **_kwargs):
+        chamadas.append(1)
+
+    monkeypatch.setattr("app.inbox.varrer_em_background", _espiao)
+    return chamadas
+
+
+async def test_entrega_bem_sucedida_agenda_a_varredura(webhook_client, espiao_da_varredura):
+    """O controle POSITIVO, e ele é obrigatório: sem esta metade, um espião que nunca
+    dispara (porque o seam mudou de nome, porque o agendamento sumiu) faria o teste do
+    caminho de falha, abaixo, passar verde sem provar nada.
+    """
+    body = corpo()
+    async with await webhook_client() as c:
+        r = await c.post("/webhook/whatsapp", content=body, headers=assinar(body))
+
+    assert r.status_code == 200
+    assert espiao_da_varredura == [1]
+
+
+async def test_falha_ao_gravar_NAO_agenda_a_varredura(webhook_client, espiao_da_varredura):
+    """Gravação que falhou não tem o que varrer — e o agendamento fica no `else` do commit.
+
+    Este é o caso PERMANENTE, que devolve 200 (reentregar não conserta): a rota sai como
+    sucesso para a Meta, mas nada entrou no banco. Agendar aqui poria uma varredura pra rodar
+    em cima de um INSERT que não aconteceu. Movido pra antes do `try`, ou pro `except`, este
+    teste fica vermelho — e é o único que pega isso, porque a BackgroundTask roda DEPOIS do
+    corpo inteiro do handler: a posição dela dentro da rota é invisível pelo relógio.
+    """
+    fabrica = webhook_client
+    fabrica.sessao.falha_em = _erro_permanente()
+
+    body = corpo()
+    async with await fabrica() as c:
+        r = await c.post("/webhook/whatsapp", content=body, headers=assinar(body))
+
+    assert r.status_code == 200          # permanente: não insistir com a Meta
+    assert espiao_da_varredura == []     # mas também não varrer o que não entrou
+
+
+async def test_evento_sem_mensagem_de_texto_nao_agenda_a_varredura(
+    webhook_client, espiao_da_varredura
+):
+    """Nem sessão nem varredura: o agendamento mora DENTRO do `if perguntas:`.
+
+    A Meta manda no MESMO endpoint eventos que não são mensagem (`value.statuses`, os
+    callbacks de entrega/leitura — que vão chegar a cada resposta que a varredura mandar).
+    Agendar em cima deles seria uma varredura por callback, num laço que se realimenta.
+    """
+    payload = json.loads(json.dumps(PAYLOAD))
+    payload["entry"][0]["changes"][0]["value"] = {
+        "messaging_product": "whatsapp",
+        "statuses": [{"id": WAMID, "status": "delivered"}],
+    }
+    body = json.dumps(payload).encode("utf-8")
+    async with await webhook_client() as c:
+        r = await c.post("/webhook/whatsapp", content=body, headers=assinar(body))
+
+    assert r.status_code == 200
+    assert espiao_da_varredura == []

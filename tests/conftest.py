@@ -48,6 +48,29 @@ def reset_limiter():
     limiter.reset()
 
 
+@pytest.fixture(autouse=True)
+def sem_varredura_automatica(monkeypatch):
+    """Nenhum teste chama o grafo por acidente: a varredura do webhook vira NO-OP.
+
+    Sem isto, qualquer teste que POSTe em /webhook/whatsapp passa a rodar a varredura da W2b
+    DENTRO do `await client.post(...)`. O mecanismo é exato: `Response.__call__` faz
+    `await self.background()` depois de mandar `http.response.start`/`body`, mas ainda dentro
+    do `await self.app(...)` do `RequestIdMiddleware` — e o `ASGITransport` do httpx só
+    devolve a resposta quando a chamada ASGI termina. Com a sessão real de
+    `tests/test_whatsapp_inbox.py` a linha existe, então seria grafo real -> Anthropic real
+    -> DINHEIRO, em dev e no CI, num módulo que não é sobre isso.
+
+    Fail-CLOSED de propósito, e autouse pelo mesmo motivo do `reset_limiter`: a invariante
+    "nenhum teste gasta dinheiro" passa a ser estrutural em vez de depender de cada fixture
+    lembrar. Quem QUER exercitar a varredura chama `processar_pendentes` direto (com grafo e
+    sender falsos) ou troca este seam por um espião — sempre explicitamente.
+    """
+    async def _nao_roda(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr("app.inbox.varrer_em_background", _nao_roda)
+
+
 @pytest.fixture(scope="session")
 def db_url():
     """Boot one throwaway Postgres for the whole suite and apply migrations to it."""

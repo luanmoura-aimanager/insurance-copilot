@@ -8,6 +8,7 @@ from sqlalchemy import (
     ForeignKeyConstraint,
     Index,
     Numeric,
+    Text,
     UniqueConstraint,
     func,
     text,
@@ -296,6 +297,22 @@ class WhatsAppMessage(Base):
     não viajar na linha, aquela justificativa morre exatamente no handoff. Nullable
     porque a borda não descarta mensagem por falta dele.
 
+    **Duas fases, e a coluna `answer` é o que as separa (W2b).** O ciclo é
+    `pending` -> `computed` -> `answered` | `failed`, e a resposta é GRAVADA antes de ser
+    ENVIADA. O motivo é dinheiro: se o envio falha depois do grafo, um retry ingênuo
+    re-pergunta e paga outra rodada de LLM. Com a resposta em `answer`, a retentativa só
+    reenvia. `answer` é nullable porque em `pending` ela ainda não existe — `NOT NULL`
+    seria mentira sobre a metade da tabela.
+
+    **`attempts` é UMA contagem por mensagem, compartilhada pelas duas fases.** O orçamento
+    que ela guarda é "quantas vezes tentamos responder esta pessoa", não "por fase" — e ela
+    sobe também quando o GRAFO falha, não só o envio. Sem isso a varredura passa fome: ela
+    reivindica `ORDER BY received_at LIMIT 1`, então uma linha cujo `ainvoke` sempre levanta
+    (o supervisor não tem `try` — ver CLAUDE.md) seria a primeira escolhida em TODA varredura,
+    para sempre, e nenhuma mensagem nova seria respondida. Não há coluna de ERRO de propósito:
+    o texto de uma exceção do SQLAlchemy carrega `[parameters: (...)]`, ou seja o telefone e a
+    mensagem inteira (achado da W2a). O erro vai pro log; a linha guarda só a contagem.
+
     **PENDÊNCIA — retenção.** `from_phone` e `text` são PII guardada com finalidade
     (responder), o que é legítimo e é também o que cria a obrigação: sem política de
     expurgo um inbox acumula conversa de usuário para sempre, e o "por finalidade" deixa
@@ -318,17 +335,18 @@ class WhatsAppMessage(Base):
     __tablename__ = "whatsapp_message"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('pending', 'answered', 'failed')",
+            "status IN ('pending', 'computed', 'answered', 'failed')",
             name="ck_whatsapp_message_status",
         ),
         # A chave de idempotência. Ver o parágrafo do `wamid` no docstring: é o que
         # transforma a reentrega da Meta (e o retry que o nosso 500 provoca) em no-op.
         UniqueConstraint("wamid", name="uq_whatsapp_message_wamid"),
-        # Pra varredura de pendentes da W2b. Nota honesta: em regime permanente
-        # `answered` domina a tabela e um índice PARCIAL (`WHERE status = 'pending'`)
-        # seria bem mais apertado — como no `clause_chunk`. Fica total porque quem
-        # define a varredura é a W2b (que também pode querer `failed`, pra retentar), e
-        # apertar antes de saber a query é chutar o predicado.
+        # Pra varredura de pendentes. A W2b existe e a query agora é conhecida:
+        # `WHERE status IN ('pending','computed') ORDER BY received_at LIMIT 1`. O índice
+        # que a serviria inteira é PARCIAL e por `received_at` — e continua não sendo este,
+        # de propósito: apertá-lo é migration própria, e em regime permanente (`answered`
+        # dominando a tabela) é ela que paga. Fica registrado que a promessa da W2a segue
+        # aberta, agora sem o chute: o predicado está escrito acima.
         Index("ix_whatsapp_message_status", "status"),
     )
 
@@ -340,7 +358,15 @@ class WhatsAppMessage(Base):
     # server_default, e não só default de ORM: o INSERT do webhook é Core e a W2b vai
     # mexer nesta coluna por SQL — a autoridade do valor inicial é o banco.
     status: Mapped[str] = mapped_column(server_default="pending")
+    # A resposta, gravada ANTES de sair — ver o parágrafo das duas fases no docstring.
+    answer: Mapped[str | None] = mapped_column(Text)
+    # `server_default`, e não default de ORM, pelo mesmo motivo do `status`: o INSERT do
+    # webhook é Core e não lista esta coluna, então a autoridade do valor inicial é o banco.
+    attempts: Mapped[int] = mapped_column(server_default="0")
     received_at: Mapped[datetime] = mapped_column(server_default=func.now())
-    # NULL até a W2b: nesta fatia nada nunca sai de 'pending'. É também o marco a partir
-    # do qual a política de retenção (pendência, acima) vai contar.
+    # Marca estado TERMINAL, e não "foi respondida": preenchido em `answered` E em `failed`,
+    # nunca em `computed` (que não é terminal). A W2a dizia "NULL até a W2b"; a W2b afina o
+    # significado, e a razão é a retenção — ela conta dias A PARTIR DAQUI, então uma linha
+    # `failed` com `processed_at` NULL seria PII que a política nunca conseguiria expirar.
+    # O caminho de falha viraria o vazamento permanente.
     processed_at: Mapped[datetime | None]
