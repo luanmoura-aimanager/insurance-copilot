@@ -159,7 +159,7 @@ def _campos_da_excecao(exc: BaseException) -> dict:
     O custo é real e consciente: o traceback que o `basicConfig` imprimia trazia, por
     exemplo, o status que a Anthropic devolveu, e isso agora fica de fora. Quem precisa de
     um detalhe da exceção NOMEIA esse detalhe no call site, que é o que
-    `app/main.py::_resumo_do_erro` já faz com o SQLSTATE.
+    `resumo_do_erro` (logo abaixo, neste mesmo módulo) já faz com o SQLSTATE.
 
     **A CADEIA entra, e isso não é exceção à regra — é a mesma regra.** `format_tb` sozinho
     anda só no traceback mais externo, então um `DBAPIError` do SQLAlchemy embrulhando um

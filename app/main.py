@@ -377,10 +377,11 @@ def _vale_reentregar(exc: BaseException) -> bool:
     return False
 
 
-# `_resumo_do_erro` MUDOU DE CASA: agora é `app.logging_config.resumo_do_erro`, ao lado do
-# `traceback_da_cadeia` que a mesma regra produziu. Ela passou a ter dois chamadores (esta
-# rota e a varredura da W2b) e a duplicação divergiria no dia em que uma delas endurecesse.
-_resumo_do_erro = resumo_do_erro
+# `_resumo_do_erro` MUDOU DE CASA: agora é `app.logging_config.resumo_do_erro`, importado no
+# topo, ao lado do `traceback_da_cadeia` que a mesma regra produziu. Ela passou a ter dois
+# chamadores (esta rota e a varredura do inbox) e a duplicação divergiria no dia em que uma
+# delas endurecesse. Sem alias local: dar dois nomes à mesma função no mesmo arquivo é a
+# duplicação que a mudança de casa foi feita pra remover.
 
 
 async def _registrar_mensagens(session, perguntas: list[IncomingMessage]) -> set[str]:
@@ -578,7 +579,7 @@ async def whatsapp_webhook(request: Request, background: BackgroundTasks) -> Res
                 "(%d mensagens, ids=%s) — %s",
                 len(perguntas),
                 ",".join(id_curto(m.wamid) for m in perguntas),
-                _resumo_do_erro(exc),
+                resumo_do_erro(exc),
             )
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -611,7 +612,7 @@ async def whatsapp_webhook(request: Request, background: BackgroundTasks) -> Res
                 "500, pra que a Meta reentregue"
                 if reentregar
                 else "200, e estas mensagens estão PERDIDAS: reentregar não conserta",
-                _resumo_do_erro(exc),
+                resumo_do_erro(exc),
                 traceback_da_cadeia(exc),
             )
             try:
@@ -619,7 +620,7 @@ async def whatsapp_webhook(request: Request, background: BackgroundTasks) -> Res
             except Exception as rollback_exc:
                 logger.warning(
                     "webhook whatsapp: o rollback também falhou — %s",
-                    _resumo_do_erro(rollback_exc),
+                    resumo_do_erro(rollback_exc),
                 )
 
             if reentregar:

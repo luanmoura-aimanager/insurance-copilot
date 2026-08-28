@@ -104,6 +104,24 @@ class SenderFalso:
 
 
 @pytest.fixture(autouse=True)
+def estado_global_limpo():
+    """`_varrendo`/`_pedida_de_novo` são globais de MÓDULO, e vazam entre testes.
+
+    Uma varredura que morre no meio (um assert de teste, um `wait_for` estourado) deixa
+    `_varrendo = True`, e daí em diante todo teste que chame `varrer_em_background` sai pela
+    saída antecipada e passa **vacuamente** — verde sem exercitar nada. Zerar antes e depois
+    é o mesmo cuidado do `reset_limiter` do conftest com o limiter global do slowapi.
+    """
+    import app.inbox as inbox_mod
+
+    inbox_mod._varrendo = False
+    inbox_mod._pedida_de_novo = False
+    yield
+    inbox_mod._varrendo = False
+    inbox_mod._pedida_de_novo = False
+
+
+@pytest.fixture(autouse=True)
 def env_do_canal(monkeypatch):
     """Token presente (senão a varredura se recusa a rodar) e limites previsíveis."""
     monkeypatch.setenv("WHATSAPP_ACCESS_TOKEN", TOKEN_FALSO)
@@ -965,11 +983,12 @@ async def test_falha_de_banco_no_meio_para_a_varredura_e_nao_loga_PII(db_session
 
 
 async def test_falha_de_envio_nao_loga_a_resposta(db_session, caplog):
-    """Mesmo que a exceção do envio carregue a resposta, o WARNING não a publica.
+    """Exceção GENÉRICA do sender: o WARNING leva só a classe, nunca o texto.
 
-    A `EnvioRecusado` de `app/whatsapp_api.py` já nasce estéril, mas o log daqui não pode
-    DEPENDER disso: `sender` é injetável, e um envio futuro (ou um erro do httpx que escape)
-    traria o corpo junto. Por isso o WARNING leva só `type(exc).__name__` e o `.status`.
+    `sender` é injetável e o log não pode DEPENDER de a exceção ser estéril — um envio
+    futuro, ou um erro do httpx que escape, traria o corpo junto. Este é o ramo conservador;
+    o de baixo é o outro, onde `str(exc)` PODE sair porque a `EnvioRecusado` é estéril por
+    construção.
     """
     await planta(db_session, wamid="wamid.ENV", text=PERGUNTA_MARCADA)
     await db_session.commit()
@@ -984,7 +1003,7 @@ async def test_falha_de_envio_nao_loga_a_resposta(db_session, caplog):
     formatter = logging.Formatter()
     tudo = "\n".join(formatter.format(rec) for rec in caplog.records)
 
-    assert "envio recusado" in tudo and id_curto("wamid.ENV") in tudo   # controle
+    assert "envio falhou" in tudo and id_curto("wamid.ENV") in tudo    # controle
     for palavra in RESPOSTA_MARCADA.split() + PERGUNTA_MARCADA.split():
         assert palavra not in tudo, f"{palavra!r} vazou no log"
 
@@ -1218,6 +1237,8 @@ async def test_varredura_concorrente_no_mesmo_processo_desiste(engine, monkeypat
         finally:
             libera.set()
 
+
+
     await asyncio.gather(varredura_real(), segunda())
     assert pico[0] == 1, f"{pico[0]} passadas em paralelo — cada uma trava uma conexão do pool"
 
@@ -1450,14 +1471,20 @@ async def test_pedido_durante_a_varredura_nao_e_perdido(engine, monkeypatch):
 
     async def segunda_entrega():
         await entrou.wait()
-        await asyncio.wait_for(varredura_real(), 5)   # engolida — mas marcada
-        # A saída antecipada NÃO pode ter soltado a trava: quem a segura é a varredura que
-        # continua rodando, e soltá-la deixaria a próxima entrega abrir uma passada em
-        # paralelo — o esgotamento de pool que a trava existe pra impedir. Foi o que um
-        # `try/finally` único fazia, e é invisível pelo resultado: as duas rodadas saem certas
-        # de qualquer jeito. Por isso a asserção é sobre o estado, no instante certo.
-        assert inbox_mod._varrendo is True, "a saída antecipada soltou a trava de outra varredura"
-        libera.set()
+        try:
+            await asyncio.wait_for(varredura_real(), 5)   # engolida — mas marcada
+            # A saída antecipada NÃO pode ter soltado a trava: quem a segura é a varredura
+            # que continua rodando, e soltá-la deixaria a próxima entrega abrir uma passada
+            # em paralelo — o esgotamento de pool que a trava existe pra impedir. É invisível
+            # pelo resultado (as duas rodadas saem certas de qualquer jeito), então a
+            # asserção é sobre o ESTADO, no instante certo.
+            assert inbox_mod._varrendo is True, "a saída antecipada soltou a trava alheia"
+        finally:
+            # `finally`, e não a linha seguinte: se o assert acima falhar, a outra corotina
+            # fica presa em `await libera.wait()` PARA SEMPRE e a suíte PENDURA em vez de
+            # ficar vermelha — e não há `pytest-timeout` neste projeto. É a mesma armadilha
+            # que os `asyncio.wait_for` deste módulo evitam, e ela escapou aqui uma vez.
+            libera.set()
 
     await asyncio.gather(varredura_real(), segunda_entrega())
     assert len(rodadas) == 2, "o disparo perdido não foi atendido"
@@ -1484,3 +1511,119 @@ async def test_varredura_em_background_nunca_levanta_nem_no_import(monkeypatch, 
         assert await varredura_real() is None      # não levantou
 
     assert "ImportError" in "\n".join(rec.getMessage() for rec in caplog.records)
+
+
+async def test_envio_recusado_leva_o_diagnostico_da_meta_pro_log(db_session, caplog):
+    """O outro ramo: a `EnvioRecusado` é estéril, então o resumo dela SAI no log.
+
+    Sem isso o operador via só `EnvioRecusado http=401` e não distinguia token expirado
+    (code=190) de janela de 24h (131047) de erro de template — e toda falha de rede saía
+    idêntica, sem status nenhum. O `_resumo_da_falha` de `app/whatsapp_api.py` virava código
+    morto: montado com cuidado e jogado fora no call site.
+    """
+    from app.whatsapp_api import EnvioRecusado
+
+    await planta(db_session, wamid="wamid.DIAG", text=PERGUNTA_MARCADA)
+    await db_session.commit()
+
+    recusa = SenderFalso(erro=EnvioRecusado("HTTPStatusError http=401 code=190", 401))
+    with caplog.at_level(logging.DEBUG, logger="app.inbox"):
+        await processar_pendentes(
+            db_session, limite=5,
+            graph=GrafoFalso(resposta=RESPOSTA_MARCADA), sender=recusa,
+        )
+
+    tudo = "\n".join(rec.getMessage() for rec in caplog.records)
+    assert "code=190" in tudo and "http=401" in tudo
+    # E continua sem PII: a EnvioRecusado é estéril por construção, e é ISSO que autoriza
+    # o `str(exc)` aqui — ver `test_erro_de_envio_nao_carrega_o_corpo`.
+    for palavra in RESPOSTA_MARCADA.split() + PERGUNTA_MARCADA.split():
+        assert palavra not in tudo
+
+
+async def test_o_pedido_extra_NAO_repega_a_linha_que_acabou_de_falhar(sessions, monkeypatch):
+    """O `_pedida_de_novo` não pode furar a guarda do encadeamento.
+
+    Ele existe pra atender a entrega que chegou durante a varredura — mas a rodada extra
+    começa com `_reivindicar` de novo, e sem um `vistas` compartilhado ela repegaria a linha
+    que ACABOU de falhar: as três tentativas queimadas em milissegundos, e no caminho em que
+    o POST deu certo e só o registro falhou, a MESMA mensagem reenviada três vezes seguidas.
+    """
+    import app.inbox as inbox_mod
+
+    monkeypatch.setattr("app.db.SessionLocal", lambda **kw: sessions(**kw))
+    monkeypatch.setenv("WHATSAPP_MAX_ATTEMPTS", "3")
+
+    async with sessions() as s:
+        await planta(s, wamid="wamid.EXTRA")
+        await s.commit()
+
+    grafo = GrafoFalso()
+    sender = SenderFalso(erro=RuntimeError("502"))
+    real = inbox_mod.processar_pendentes
+    rodadas = [0]
+
+    async def com_falsos(session, limite=1, vistas=None, **_kw):
+        rodadas[0] += 1
+        if rodadas[0] == 1:
+            # Simula a entrega que chega no meio: o disparo dela é engolido pelo `_varrendo`.
+            inbox_mod._pedida_de_novo = True
+        return await real(session, limite=limite, graph=grafo, sender=sender, vistas=vistas)
+
+    monkeypatch.setattr(inbox_mod, "processar_pendentes", com_falsos)
+    await varredura_real(limite=1)
+
+    async with sessions() as s:
+        linha = (await s.execute(select(WhatsAppMessage))).scalar_one()
+    assert rodadas[0] >= 2, "o pedido extra não foi atendido"
+    assert linha.attempts == 1, (
+        f"a rodada extra repegou a linha e gastou {linha.attempts} tentativas de uma vez"
+    )
+    assert linha.status == COMPUTADA
+    assert len(sender.chamadas) == 1, "a mesma mensagem foi enviada mais de uma vez"
+
+
+async def test_falha_ao_REIVINDICAR_e_reportada_como_as_outras(db_session, caplog):
+    """A reivindicação era a única chamada de banco da passada sem tratamento.
+
+    Sem o `try`, um Postgres reiniciado ali escapava de `processar_pendentes` inteiro: sem
+    `interrompidas`, sem a linha com classe + SQLSTATE, e saindo do
+    `scripts/process_pending.py` como traceback cru — os dois desfechos que os comentários
+    deste módulo dizem impedir. Todas as outras chamadas já tinham o seu.
+    """
+    erro = await _erro_de_update_com_pii(RESPOSTA_MARCADA)
+
+    class SessaoQueQuebraNaReivindicacao:
+        def __init__(self, real):
+            self._real = real
+
+        async def execute(self, stmt, *a, **kw):
+            if getattr(stmt, "__visit_name__", "") == "select":
+                raise erro
+            return await self._real.execute(stmt, *a, **kw)
+
+        async def commit(self):
+            await self._real.commit()
+
+        async def rollback(self):
+            await self._real.rollback()
+
+        def in_transaction(self):
+            return self._real.in_transaction()
+
+    await planta(db_session, wamid="wamid.CLAIM", text=PERGUNTA_MARCADA)
+    await db_session.commit()
+
+    with caplog.at_level(logging.DEBUG, logger="app.inbox"):
+        r = await processar_pendentes(          # não levanta
+            SessaoQueQuebraNaReivindicacao(db_session), limite=5,
+            graph=GrafoFalso(), sender=SenderFalso(),
+        )
+
+    assert r["interrompidas"] == 1
+    tudo = "\n".join(rec.getMessage() for rec in caplog.records)
+    assert "reivindicar a próxima linha" in tudo
+    assert "sqlstate=" in tudo                   # o operador continua servido
+    # E sem PII, como todo o resto dos caminhos de erro deste módulo.
+    for palavra in PERGUNTA_MARCADA.split() + RESPOSTA_MARCADA.split():
+        assert palavra not in tudo

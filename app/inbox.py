@@ -46,6 +46,7 @@ from app.whatsapp import id_curto, mascarar_telefone
 from app.whatsapp_api import (
     MAX_BODY_CHARS,
     ConfiguracaoAusente,
+    EnvioRecusado,
     enviar_texto,
     get_access_token,
 )
@@ -322,11 +323,13 @@ def _contagens_zeradas() -> dict:
         "falhas": 0,          # tentativas que terminaram sem entregar nesta passada
         "desistidas": 0,      # subconjunto de falhas: bateram no teto e viraram 'failed'
         "cedidas": 0,         # reivindicadas e perdidas pra outra varredura no meio
-        "interrompidas": 0,   # a passada PAROU por erro de banco (0 ou 1)
+        "interrompidas": 0,   # a passada PAROU por erro de banco (0 ou 1 por passada)
     }
 
 
-async def processar_pendentes(session, limite=LIMITE_PADRAO, graph=None, sender=None) -> dict:
+async def processar_pendentes(
+    session, limite=LIMITE_PADRAO, graph=None, sender=None, vistas=None
+) -> dict:
     """Responde até `limite` mensagens. COMMITA (ver o docstring do módulo).
 
     `limite` é o teto do LAÇO — quantas linhas DISTINTAS esta passada reivindica —, não um
@@ -393,9 +396,33 @@ async def processar_pendentes(session, limite=LIMITE_PADRAO, graph=None, sender=
     teto = _max_attempts()
     max_chars = _max_chars()
 
-    vistas: set[int] = set()
+    # `vistas` pode vir DE FORA (de `varrer_em_background`) pra atravessar as rodadas de um
+    # mesmo disparo: uma linha que falhou na rodada 1 não pode ser repegada na 2, senão o
+    # orçamento inteiro some em milissegundos — o mesmo bug que o `excluir` mata dentro de uma
+    # passada, entrando pela porta do encadeamento.
+    vistas = set() if vistas is None else vistas
     for _ in range(limite):
-        linha = (await session.execute(_reivindicar(frozenset(vistas)))).mappings().first()
+        try:
+            linha = (await session.execute(_reivindicar(frozenset(vistas)))).mappings().first()
+        except Exception as exc:
+            # Era a ÚNICA chamada de banco da passada sem tratamento, e por isso a única que
+            # escapava de `processar_pendentes`: sem contar `interrompidas`, sem a linha com
+            # classe + SQLSTATE, e saindo do `scripts/process_pending.py` como traceback cru —
+            # os dois desfechos que os comentários deste módulo dizem impedir.
+            contagens["interrompidas"] += 1
+            logger.error(
+                "inbox: falha de banco ao reivindicar a próxima linha — a varredura PARA — "
+                "%s\n%s",
+                resumo_do_erro(exc),
+                traceback_da_cadeia(exc),
+            )
+            try:
+                await session.rollback()
+            except Exception as rollback_exc:
+                logger.warning(
+                    "inbox: o rollback também falhou — %s", resumo_do_erro(rollback_exc)
+                )
+            return contagens
         if linha is None:
             break
         vistas.add(linha["id"])
@@ -424,8 +451,10 @@ async def processar_pendentes(session, limite=LIMITE_PADRAO, graph=None, sender=
     try:
         if session.in_transaction():
             await session.rollback()
-    except Exception:
-        logger.warning("inbox: falha ao soltar a transação no fim da passada")
+    except Exception as exc:
+        logger.warning(
+            "inbox: falha ao soltar a transação no fim da passada — %s", resumo_do_erro(exc)
+        )
 
     return contagens
 
@@ -543,20 +572,39 @@ async def _uma_linha(session, linha, graph, sender, teto, max_chars, contagens) 
         )
         try:
             await session.rollback()
-        except Exception:
-            pass
+        except Exception as rollback_exc:
+            logger.warning(
+                "inbox: o rollback também falhou — %s", resumo_do_erro(rollback_exc)
+            )
         return False
-    except Exception as exc:
-        # WARNING e não ERROR: falha de envio é esperada e retentável, e o `attempts` é o
-        # que a transforma em incidente quando insiste. Sem `str(exc)` e sem `exc_info` — a
-        # exceção do httpx segura a request, cujo corpo tem o telefone e a resposta inteira.
+    except EnvioRecusado as exc:
+        # WARNING e não ERROR: falha de envio é esperada e retentável, e o `attempts` é o que
+        # a transforma em incidente quando insiste.
+        #
+        # Aqui `str(exc)` PODE ser logado, e é o único lugar onde pode: a `EnvioRecusado` nasce
+        # estéril por construção (classe + status + os códigos ESTRUTURADOS da Meta, nunca o
+        # corpo, o telefone ou o token — `test_erro_de_envio_nao_carrega_o_corpo` trava isso).
+        # Sem ela o log dizia só `EnvioRecusado http=401`, e o operador não distinguia token
+        # expirado (code=190) de janela de 24h (131047) de erro de template — e toda falha de
+        # rede saía idêntica, sem status nenhum. Era o `_resumo_da_falha` inteiro virando
+        # código morto.
         logger.warning(
-            "inbox: envio recusado (id=%s, tentativa=%d/%d) — %s%s",
+            "inbox: envio recusado (id=%s, tentativa=%d/%d) — %s",
+            id_curto(wamid),
+            alvo["attempts"] + 1,
+            teto,
+            exc,
+        )
+        return await _falhar(session, id_, contagens, alvo, inicio, teto=teto)
+    except Exception as exc:
+        # Qualquer outra coisa vinda de um `sender` (ele é injetável): conservador, só a
+        # classe. Não se pode assumir que a mensagem dele seja estéril.
+        logger.warning(
+            "inbox: envio falhou (id=%s, tentativa=%d/%d) — %s",
             id_curto(wamid),
             alvo["attempts"] + 1,
             teto,
             type(exc).__name__,
-            f" http={exc.status}" if getattr(exc, "status", None) else "",
         )
         return await _falhar(session, id_, contagens, alvo, inicio, teto=teto)
 
@@ -581,7 +629,8 @@ async def _uma_linha(session, linha, graph, sender, teto, max_chars, contagens) 
 
 
 async def _falhar(
-    session, id_, contagens, linha, inicio, *, teto=None, aposentar=False, entregue=False
+    session, id_, contagens, linha, inicio, *,
+    teto=None, aposentar=False, entregue=False, ja_contado=False,
 ) -> bool:
     """**O ÚNICO lugar que gasta orçamento e aposenta.** Devolve False se a varredura deve parar.
 
@@ -610,11 +659,15 @@ async def _falhar(
         # A própria contabilidade da falha falhou — transação abortada, ou seja banco doente.
         # `teto` fica de fora de propósito: `_erro_de_banco` chamaria `_falhar` de volta e a
         # recursão seria mútua. Aqui só se registra e para.
-        return await _erro_de_banco(session, "registrar a tentativa", linha, exc, contagens)
+        return await _erro_de_banco(
+            session, "registrar a tentativa", linha, exc, contagens, ja_contado=ja_contado
+        )
 
     if resultado is None:
         # A guarda de status barrou: outra varredura já levou a linha a um estado terminal
-        # entre o rollback e esta cobrança. Não há o que corrigir — ela cuidou.
+        # entre o rollback e esta cobrança. Não há o que corrigir — ela cuidou. E desconta a
+        # falha: nada foi cobrado, então contá-la inflaria o relatório que o operador lê.
+        contagens["falhas"] -= 1
         logger.info(
             "inbox: a tentativa não foi cobrada (id=%s) — outra varredura já concluiu a linha",
             id_curto(linha["wamid"]),
@@ -648,7 +701,7 @@ async def _falhar(
 
 async def _erro_de_banco(
     session, o_que: str, linha, exc: BaseException, contagens, *,
-    teto=None, inicio=None, entregue=False,
+    teto=None, inicio=None, entregue=False, ja_contado=False,
 ) -> bool:
     """Loga um erro de banco SEM PII, COBRA a tentativa quando havia trabalho pago, e para.
 
@@ -670,7 +723,11 @@ async def _erro_de_banco(
     A cobrança roda numa transação NOVA, depois do rollback (a que estourou está abortada e
     não aceita mais statement) e portanto SEM a trava — daí a guarda de status nos statements.
     """
-    contagens["interrompidas"] += 1
+    # `ja_contado` vem do `_falhar` que falhou DEPOIS de este erro já ter sido contado: é o
+    # mesmo incidente entrando duas vezes, e o número vai pro log de fecho que o operador lê
+    # justamente no incidente em que ele precisa estar certo.
+    if not ja_contado:
+        contagens["interrompidas"] += 1
     logger.error(
         "inbox: falha de banco ao %s (id=%s) — a varredura PARA — %s\n%s",
         o_que,
@@ -681,15 +738,18 @@ async def _erro_de_banco(
 
     try:
         await session.rollback()
-    except Exception:
-        logger.warning("inbox: o rollback também falhou — %s", type(exc).__name__)
+    except Exception as rollback_exc:
+        # A exceção do ROLLBACK, não a original — essa já tem a própria linha de ERROR logo
+        # acima. Nomear a errada aqui apagava a única pista que distingue conexão morta de
+        # transação envenenada. Mesmo formato do `app/main.py`.
+        logger.warning("inbox: o rollback também falhou — %s", resumo_do_erro(rollback_exc))
         return False
 
     if teto is not None:
         try:
             await _falhar(
                 session, linha["id"], contagens, linha, inicio or time.monotonic(),
-                teto=teto, entregue=entregue,
+                teto=teto, entregue=entregue, ja_contado=True,
             )
         except Exception as cobranca_exc:
             # Fica registrado que o teto NÃO foi aplicado nesta volta: é o que explica uma
@@ -830,34 +890,43 @@ async def varrer_em_background(limite: int = LIMITE_PADRAO) -> None:
 
     try:
         totais = _contagens_zeradas()
-        async with SessionLocal() as session:
-            for _ in range(MAX_RODADAS):
-                r = await processar_pendentes(session, limite=limite)
-                for chave, valor in r.items():
-                    totais[chave] += valor
-                # Encadeia SÓ enquanto a rodada foi cheia E inteiramente bem-sucedida. O teto
-                # `limite` sozinho deixaria um lote grande da Meta (ela entrega em lote, e a
-                # W2a grava o lote todo) parado até a PRÓXIMA entrega, porque o agendamento só
-                # dispara de uma entrega com pergunta. E a segunda condição é o que impede o
-                # encadeamento de virar retentativa imediata: as linhas que falharam não estão
-                # mais no `vistas` de uma passada nova, então uma rodada seguinte as pegaria de
-                # volta e queimaria o orçamento em milissegundos — o mesmo bug que o `excluir`
-                # de `_reivindicar` mata dentro de uma passada.
-                if r["enviadas"] < limite:
-                    # Rodada nao-cheia ou com falha: nao encadeia por conta propria. Mas se
-                    # CHEGOU PEDIDO enquanto rodavamos, a linha nova pode estar depois do
-                    # ponto onde esta rodada parou — e o disparo dela foi engolido pelo
-                    # `_varrendo`. Uma volta a mais, e so uma por pedido, senao duas entregas
-                    # concorrentes viravam um laco que se realimenta.
-                    if _pedida_de_novo:
-                        _pedida_de_novo = False
-                        continue
-                    break
+        # UM `vistas` pro disparo inteiro: nenhuma rodada repega o que já foi tentado aqui.
+        # Sem isso o encadeamento por pedido (abaixo) fura a guarda de "só encadeia rodada
+        # bem-sucedida" e queima as três tentativas de uma linha em milissegundos — e, no
+        # caminho em que o POST deu certo e só o registro falhou, REENVIA a mesma mensagem à
+        # mesma pessoa três vezes seguidas.
+        vistas: set[int] = set()
+
+        while True:
+            async with SessionLocal() as session:
+                for _ in range(MAX_RODADAS):
+                    r = await processar_pendentes(session, limite=limite, vistas=vistas)
+                    for chave, valor in r.items():
+                        totais[chave] += valor
+                    # Encadeia enquanto a rodada vem CHEIA e inteiramente bem-sucedida: a Meta
+                    # entrega em LOTE e o agendamento só dispara de uma entrega com pergunta,
+                    # então um lote maior que `limite` esperaria a próxima entrega — que pode
+                    # não vir.
+                    if r["enviadas"] < limite:
+                        break
+
+            # A sessão está FECHADA e daqui até o `while`/`finally` não há mais nenhum
+            # `await`. É isso que fecha a corrida: nenhuma outra corotina roda entre esta
+            # leitura e a decisão, então ou o pedido está aqui e é atendido, ou ele chega
+            # depois e encontra `_varrendo` já False e abre a própria varredura. Com a
+            # checagem antes do `async with` fechar (que tem await na saída), um pedido caído
+            # nessa fresta era apagado pelo `finally` e a mensagem dele ficava esperando a
+            # PRÓXIMA entrega — num número de baixo tráfego, para sempre.
+            if not _pedida_de_novo:
+                break
+            _pedida_de_novo = False
+            logger.debug("inbox: pedido chegou durante a varredura; mais uma volta")
+
         logger.info(
             "inbox: varredura concluída (%d reivindicada(s), %d enviada(s), %d falha(s), "
-            "%d desistida(s), %d cedida(s))",
+            "%d desistida(s), %d cedida(s), %d interrompida(s))",
             totais["reivindicadas"], totais["enviadas"], totais["falhas"],
-            totais["desistidas"], totais["cedidas"],
+            totais["desistidas"], totais["cedidas"], totais["interrompidas"],
         )
     except Exception as exc:
         logger.error(

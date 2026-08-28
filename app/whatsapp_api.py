@@ -14,7 +14,6 @@ Três decisões moram aqui, e as três são sobre o que NÃO pode escapar:
    exceção do httpx guarda.
 3. **O fail-closed levanta `RuntimeError`, não `HTTPException`** — ver `get_access_token`.
 """
-import json
 import os
 
 import httpx
@@ -121,9 +120,12 @@ def _resumo_da_falha(exc: BaseException, resposta: httpx.Response | None) -> str
                 valor = erro.get(campo)
                 if isinstance(valor, int):
                     partes.append(f"{campo}={valor}")
-        except (json.JSONDecodeError, ValueError, AttributeError):
-            # Corpo de erro não-JSON (um HTML de gateway, por exemplo). O status já basta,
-            # e despejar o corpo aqui é justamente o que esta função existe pra impedir.
+        except (ValueError, AttributeError):
+            # Corpo de erro não-JSON (um HTML de gateway, por exemplo). O status já basta, e
+            # despejar o corpo aqui é justamente o que esta função existe pra impedir.
+            # `json.JSONDecodeError` NÃO entra na tupla: ela É uma `ValueError`, e listar as
+            # duas sugeriria dois casos distintos — convidando o próximo leitor a "limpar" a
+            # tupla tirando a base, o que aí sim mudaria o comportamento.
             pass
     return " ".join(partes)
 
@@ -223,5 +225,5 @@ def _json_ou_none(resposta: httpx.Response) -> object:
     """
     try:
         return resposta.json()
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         return None
