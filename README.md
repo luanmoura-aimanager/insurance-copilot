@@ -532,6 +532,10 @@ PDF footer).
 - [x] Structured logging — one JSON line per record on stdout, `request_id`/`client` injected from the request ContextVars (the same key as `cost_event`), returned to the caller as `X-Request-Id`; the exception's message is deliberately never emitted, only its type and frames
 - [ ] Deploy to Railway
 
+## Privacy
+
+The WhatsApp surface receives personal data — the sender's phone number and the text of the message — so the project carries a privacy policy: [PRIVACY.md](PRIVACY.md) (pt-BR), which is also the URL Meta requires to publish the app. It states what is stored, which providers the question passes through (Meta, Anthropic, Voyage AI, Railway), and what the logs deliberately leave out. It does **not** promise a retention window, because there is no automatic purge yet — deletion is on request. That pendency is the open item on the WhatsApp line of the roadmap.
+
 ## License
 
 MIT
