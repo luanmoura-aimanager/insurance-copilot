@@ -17,6 +17,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -37,6 +38,7 @@ from tests.test_cost_graph import (  # noqa: F401 — as fixtures entram pelo na
     cost_rows,
     fake_graph,
 )
+from app.logging_config import _SUFIXOS_SENSIVEIS, _redigir
 from tests.test_whatsapp import TELEFONE, TEXTO, WAMID
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -484,6 +486,124 @@ def test_o_verify_token_do_whatsapp_e_redigido(linhas_json):
     # O resto da linha continua servindo o operador.
     assert "hub.challenge=9" in linha["message"]
 
+
+def test_a_redacao_cobre_as_duas_grafias_do_verify_token(linhas_json):
+    """A Meta manda o MESMO segredo em duas grafias na mesma query: com ponto e com underscore.
+
+    O padrão antigo era o nome exato `hub\\.verify_token=` — com o ponto ESCAPADO, então casava
+    o literal e mais nada. A segunda grafia passava direto e o único segredo do sistema
+    adivinhável por tentativa saía em claro no access log do uvicorn, que monta a mensagem com
+    a query string CRUA. A lista fechada era de NOMES, e quem escolhe as grafias não é quem
+    escreve a lista: é por isso que a regra virou sufixo.
+
+    Os dois valores entram por `%s` e não como literal no fonte — um literal apareceria no log
+    pela linha de fonte do frame e "provaria" um vazamento que não é este.
+    """
+    logging.getLogger("uvicorn.access").info(
+        '127.0.0.1:1 - "GET /webhook/whatsapp?hub.mode=subscribe'
+        "&hub.verify_token=%s&hub_verify_token=%s"
+        '&hub.challenge=9 HTTP/1.1" 200',
+        "segredo-com-ponto",
+        "segredo-com-underscore",
+    )
+
+    (linha,) = linhas_json()
+    despejo = json.dumps(linha)
+    assert "segredo-com-ponto" not in despejo
+    assert "segredo-com-underscore" not in despejo
+    assert "hub.verify_token=<redigido>" in linha["message"]
+    assert "hub_verify_token=<redigido>" in linha["message"]
+    # O resto da linha continua servindo o operador.
+    assert "hub.challenge=9" in linha["message"]
+
+
+def test_um_parametro_nao_sensivel_continua_visivel(linhas_json):
+    """Redigir por sufixo não pode virar redigir tudo — e sufixo não é substring.
+
+    As duas metades são o teste. Sem a primeira, um `sub` incondicional passaria; sem a
+    segunda, trocar o sufixo por SUBSTRING passaria, e aí `token_id` — que é um id, não um
+    segredo — sumiria do log junto. A âncora que separa os dois casos é o `=` logo depois do
+    sufixo: em `token_id` vem `_`, então não casa.
+    """
+    logging.getLogger("uvicorn.access").info(
+        '127.0.0.1:1 - "GET /webhook/whatsapp?hub.mode=subscribe'
+        '&token_id=42&hub.challenge=9 HTTP/1.1" 200'
+    )
+
+    (linha,) = linhas_json()
+    assert "hub.mode=subscribe" in linha["message"]
+    assert "hub.challenge=9" in linha["message"]
+    assert "token_id=42" in linha["message"]
+    assert "<redigido>" not in linha["message"]
+
+
+@pytest.mark.parametrize("sufixo", _SUFIXOS_SENSIVEIS)
+def test_todo_sufixo_sensivel_e_redigido(linhas_json, sufixo):
+    """Um caso por sufixo da lista fechada, gerado A PARTIR dela.
+
+    Sem isto, quatro dos cinco sufixos poderiam sair de `_SUFIXOS_SENSIVEIS` com a suíte
+    verde — e a lista voltaria a cobrir só o nome que alguém lembrou de escrever. A
+    parametrização LÊ a tupla em vez de copiá-la porque a lista existe pra crescer: uma cópia
+    cobriria só o que havia no dia em que foi escrita, e o sufixo novo — justamente o que
+    ninguém revisou ainda — entraria sem caso nenhum.
+    """
+    parametro = f"x_{sufixo}"
+    logging.getLogger("uvicorn.access").info(
+        '127.0.0.1:1 - "GET /x?%s=%s&hub.mode=subscribe HTTP/1.1" 200',
+        parametro,
+        "valor-que-nao-pode-vazar",
+    )
+
+    (linha,) = linhas_json()
+    assert "valor-que-nao-pode-vazar" not in json.dumps(linha)
+    assert f"{parametro}=<redigido>" in linha["message"]
+    # O que não é segredo continua legível.
+    assert "hub.mode=subscribe" in linha["message"]
+
+
+def test_a_redacao_nao_e_quadratica_num_path_gigante():
+    """Um path de 16 KB não pode custar segundos de CPU na thread do event loop.
+
+    O `uvicorn.access` monta a mensagem com o path CRU
+    (`get_path_with_query_string`), e o teto de uma request line é 16 KB — o default do `h11`,
+    que é o parser em uso porque `httptools` não está instalado. Sem o lookbehind, o
+    `[^&\\s"=]*` do padrão recomeça em cada posição de um corridão sem separador e o casamento
+    vira O(n²): medido, 4 SEGUNDOS por request, num GET anônimo pra rota pública do webhook.
+
+    O limiar é folgado nos dois sentidos de propósito — com o lookbehind a redação leva
+    ~1 ms, sem ele ~4000 ms —, então isto pega a regressão sem virar teste de relógio.
+    """
+    mensagem = '127.0.0.1:1 - "GET /%s HTTP/1.1" 404' % ("a" * 16384)
+
+    # Cronometra `_redigir` e NÃO a chamada de log: medir o `logging.info` inteiro somaria a
+    # construção do registro, o `json.dumps` de 16 KB e a escrita no StringIO — ruído alheio à
+    # propriedade sob teste, num assert que já é de relógio. A folga continua enorme nos dois
+    # sentidos (~1 ms passando, ~4000 ms falhando), então isto pega a regressão sem virar
+    # teste de máquina ocupada.
+    inicio = time.perf_counter()
+    _redigir(mensagem)
+    decorrido = time.perf_counter() - inicio
+
+    assert decorrido < 0.25, f"redação levou {decorrido:.3f}s — o padrão voltou a ser quadrático"
+
+
+def test_um_segredo_num_path_gigante_continua_sendo_redigido(linhas_json):
+    """O irmão obrigatório do teste de tempo: cortar caminho por TAMANHO não pode passar.
+
+    Sozinho, o teste de cima é satisfeito por um `if len(mensagem) > 8192: return mensagem` —
+    que é rápido, não redige nada (não há segredo lá) e desliga a redação exatamente onde a
+    mensagem é grande. Um `?padding=<8 KB>&hub.verify_token=<SEGREDO>` sairia em claro, e
+    nenhum outro teste veria: todos os demais usam mensagens curtas.
+    """
+    logging.getLogger("uvicorn.access").info(
+        '127.0.0.1:1 - "GET /w?padding=%s&hub.verify_token=%s HTTP/1.1" 200',
+        "a" * 16384,
+        "segredo-atras-do-enchimento",
+    )
+
+    (linha,) = linhas_json()
+    assert "segredo-atras-do-enchimento" not in json.dumps(linha)
+    assert "hub.verify_token=<redigido>" in linha["message"]
 
 def test_a_cadeia_da_excecao_entra_sem_a_mensagem(linhas_json):
     """Quem CAUSOU o erro tem tipo e frames no log — e continua sem texto de exceção.

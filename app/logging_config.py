@@ -52,11 +52,59 @@ LOGGER_DO_APP = "app"
 # O handshake da Meta chega como
 # `GET /webhook/whatsapp?hub.mode=subscribe&hub.verify_token=<SEGREDO>&hub.challenge=...`,
 # e o log de acesso do uvicorn monta a mensagem com a query string CRUA. Adotar o
-# `uvicorn.access` neste handler (o que esta fatia fez) traria o token pra dentro de um
-# fluxo que se anuncia como revisado — enquanto `app/main.py` tira esse mesmo token do log
-# dele de propósito, porque é o único segredo do sistema adivinhável por tentativa. Lista
-# fechada: um nome de parâmetro por vez, nunca uma heurística sobre "parece segredo".
-_SEGREDOS_NA_URL = re.compile(r"(hub\.verify_token=)[^&\s\"]+")
+# `uvicorn.access` neste handler traria o token pra dentro de um fluxo que se anuncia como
+# revisado — enquanto `app/main.py` tira esse mesmo token do log dele de propósito, porque é
+# o único segredo do sistema adivinhável por tentativa.
+#
+# A regra é por SUFIXO do nome do parâmetro, e substituiu uma lista de nomes EXATOS. A versão
+# anterior casava o literal `hub.verify_token=` e mais nada — com o ponto escapado, então nem
+# a grafia vizinha `hub_verify_token=` entrava. Só que a Meta manda as DUAS na mesma query
+# string, e a que escapava saía em claro. O modo de falhar é o que condena aquele desenho: a
+# lista continuava "cobrindo" o parâmetro, e a metade descoberta passava sem erro, sem aviso e
+# sem teste vermelho. Uma lista de nomes precisa de uma entrada por grafia, e quem escreve a
+# lista não controla quem escolhe as grafias.
+#
+# O que torna o sufixo seguro não é a precisão, é a DIREÇÃO do erro: ele redige a mais, nunca
+# a menos. O custo conhecido é cosmético e chega pelo `exc_traceback`, porque `format_tb`
+# inclui a linha de FONTE de cada frame: `app/rag/embedding.py` sai com
+# `voyageai.Client(api_key=<redigido> timeout=...)` — o nome da VARIÁVEL, não um segredo — e é
+# o único que de fato aparece, porque aquele frame está no caminho vivo do `rag_worker`; um
+# `mapped_column(primary_key=True)` de `app/models.py` faria o mesmo. Tipo, arquivo, linha e
+# cadeia de causas ficam intactos. `input_tokens=`/`max_tokens=` escapam só pelo `s` do plural,
+# e é a única coisa que os separa do mesmo destino.
+_SUFIXOS_SENSIVEIS = ("token", "secret", "signature", "password", "key")
+
+# Sufixo e NÃO substring: o `=` logo depois da alternância é o que mantém `token_id=42` — um
+# id, não um segredo — legível. Nada de âncora `[?&]`: o alvo também chega pela linha de fonte
+# de um frame (`RuntimeError("hub.verify_token=...")`), onde o caractere anterior é `"` —
+# exigir delimitador de query reabriria o vazamento pelo traceback, que é o buraco que
+# `test_a_redacao_cobre_o_traceback_e_nao_so_a_mensagem` fechou.
+#
+# O lookbehind é OUTRA coisa e é OBRIGATÓRIO: ele não exige delimitador, só proíbe COMEÇAR no
+# meio de um nome — as posições que só geram backtracking. Sem ele o `[^&\s"=]*` retenta em
+# cada posição de um corridão sem separador e o casamento vira O(n²). Não é teórico: o
+# `uvicorn.access` monta a mensagem com o path CRU (`get_path_with_query_string`), o teto de
+# uma request line é 16 KB (o default do `h11`, que é o parser em uso porque `httptools` não
+# está instalado), e 16 KB de path custavam 4 SEGUNDOS de CPU na thread do event loop — num GET
+# anônimo pro webhook público, que é a rota mais exposta do sistema. Com o lookbehind: 0,7 ms,
+# saída idêntica (fuzz diferencial de 300 mil strings, zero divergência).
+#
+# `re.escape` em cada sufixo é no-op hoje (são cinco palavras minúsculas) e existe pelo dia em
+# que a lista crescer, que é o ponto inteiro dela: um `api.key` interpolado cru viraria
+# curinga e passaria a redigir `apiXkey=`, e um `secret(` levantaria `re.error` NO IMPORT de
+# `app.logging_config` — a primeira linha de `app/main.py`, ou seja, o web process não sobe.
+# Uma lista de configuração não pode ter esse gatilho: é o oposto do fail-open barulhento que
+# `_nivel_do_env` pratica logo abaixo.
+#
+# `IGNORECASE` porque o nome do parâmetro é escolhido por quem chama, não por nós:
+# `?HUB_VERIFY_TOKEN=` é o mesmo segredo, e casar só minúscula seria a mesma falha de grafia
+# que motivou a fatia, um nível abaixo.
+_SEGREDOS_NA_URL = re.compile(
+    r"(?<![^&\s\"=])([^&\s\"=]*(?:"
+    + "|".join(re.escape(sufixo) for sufixo in _SUFIXOS_SENSIVEIS)
+    + r")=)[^&\s\"]+",
+    re.IGNORECASE,
+)
 
 
 def _redigir(mensagem: str) -> str:
