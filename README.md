@@ -373,9 +373,13 @@ Secrets in a query string are **redacted by the suffix of the parameter name** �
 `format_tb` includes each frame's source line. The uvicorn access log builds its message from the **raw
 query string**, and the WhatsApp handshake carries the one secret here that can be guessed by trial. This
 used to be a closed list of exact *names* holding a single entry, and it failed the way that design fails:
-Meta sends the same secret in two spellings in one query string (`hub.verify_token` and `hub_verify_token`),
-the escaped dot matched only the first, and the second reached the log in clear text — no error, no warning,
-no red test, because both existing tests fed only the dotted form. A list of names needs one entry per
+the handshake was observed in production carrying the same secret in two spellings in one query string
+(`hub.verify_token` and `hub_verify_token`), the escaped dot matched only the first, and the second reached
+the log in clear text — no error, no warning, no red test, because both existing tests fed only the dotted
+form. That report is from the field and the repo does not demonstrate it: the handler binds only the dotted
+alias, so nothing here produces or reads the underscore form. The rule does not rest on it — what condemns
+a list of exact names is its failure mode, which case and percent-encoding exercise just as well, and those
+the tests do pin. A list of names needs one entry per
 spelling, and whoever writes the list does not choose the spellings. The rule is still closed, just at a
 level a spelling cannot move; the `=` immediately after the suffix is what keeps it a *suffix* and not a
 substring, so `token_id=42` stays readable. What makes it safe is not precision but the direction of the

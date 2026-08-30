@@ -64,15 +64,36 @@ LOGGER_DO_APP = "app"
 # sem teste vermelho. Uma lista de nomes precisa de uma entrada por grafia, e quem escreve a
 # lista não controla quem escolhe as grafias.
 #
-# O que torna o sufixo seguro não é a precisão, é a DIREÇÃO do erro: ele redige a mais, nunca
-# a menos. O custo conhecido é cosmético e chega pelo `exc_traceback`, porque `format_tb`
-# inclui a linha de FONTE de cada frame: `app/rag/embedding.py` sai com
-# `voyageai.Client(api_key=<redigido> timeout=...)` — o nome da VARIÁVEL, não um segredo — e é
-# o único que de fato aparece, porque aquele frame está no caminho vivo do `rag_worker`; um
-# `mapped_column(primary_key=True)` de `app/models.py` faria o mesmo. Tipo, arquivo, linha e
-# cadeia de causas ficam intactos. `input_tokens=`/`max_tokens=` escapam só pelo `s` do plural,
-# e é a única coisa que os separa do mesmo destino.
+# O que torna o sufixo seguro não é a precisão, é a DIREÇÃO do erro: redige estritamente mais
+# que a lista de nomes exatos, e nunca menos.
+#
+# O preço é o `exc_traceback`, e ele é MAIOR do que "um kwarg ocasional" — vale medir antes de
+# achar que é detalhe. `format_tb` inclui a linha de FONTE de cada frame, e o alvo mais comum
+# não é `api_key=` e sim o `key=` PELADO de qualquer `sorted(..., key=...)`: nas dependências
+# que de fato aparecem nos tracebacks deste projeto são ~700 linhas de fonte afetadas
+# (sqlalchemy, alembic, anthropic, asyncpg, voyageai, httpx, fastapi). E o corte vai até o
+# próximo espaço, então leva junto o que vier depois:
+#   `[(k, d[k]) for k in sorted(d, key=key)]` -> `[(k, d[k]) for k in sorted(d, key=<redigido>`
+# Isso importa porque `_campos_da_excecao` descarta a MENSAGEM da exceção de propósito: a linha
+# de fonte é o único conteúdo que sobra pro operador. O que se preserva é a identidade da falha
+# — tipo, arquivo, número da linha e cadeia de causas —, e é ela que responde "o que quebrou".
+# Aceito conscientemente: o alvo desta redação é o log de acesso, onde o segredo é real, e o
+# traceback paga em legibilidade pra que a mesma regra não precise saber onde está rodando.
+# `input_tokens=`/`max_tokens=` escapam só pelo `s` do plural, e é a única coisa que os separa
+# do mesmo destino.
 _SUFIXOS_SENSIVEIS = ("token", "secret", "signature", "password", "key")
+
+# A tupla degenera em silêncio nas DUAS pontas, e as duas são o mesmo modo de falhar que esta
+# fatia existe pra matar — "cobre no papel, passa descoberto na prática". Vazia (ou com uma
+# entrada vazia), o `"|".join` produz `(?:)`, que casa string vazia: TODO `nome=valor` vira
+# `<redigido>` e o log de acesso inteiro é apagado, sem erro nenhum. Com o `=` colado
+# (`"key="`, natural pra quem lê a prosa aqui, que sempre escreve os sufixos com ele), o padrão
+# exige `==` literal e não casa NADA. Falha no import, que é onde qualquer teste esbarra.
+if not _SUFIXOS_SENSIVEIS or not all(s and "=" not in s for s in _SUFIXOS_SENSIVEIS):
+    raise ValueError(
+        "_SUFIXOS_SENSIVEIS não pode ser vazia nem conter entrada vazia ou com '=': "
+        f"{_SUFIXOS_SENSIVEIS!r}"
+    )
 
 # Sufixo e NÃO substring: o `=` logo depois da alternância é o que mantém `token_id=42` — um
 # id, não um segredo — legível. Nada de âncora `[?&]`: o alvo também chega pela linha de fonte
@@ -89,6 +110,14 @@ _SUFIXOS_SENSIVEIS = ("token", "secret", "signature", "password", "key")
 # anônimo pro webhook público, que é a rota mais exposta do sistema. Com o lookbehind: 0,7 ms,
 # saída idêntica (fuzz diferencial de 300 mil strings, zero divergência).
 #
+# O valor tem DUAS formas porque a aspa dupla termina o valor cru: sem a alternativa
+# `"[^"]*"`, um `Anthropic(api_key="sk-ant-...")` na linha de fonte de um frame não era
+# redigido de jeito nenhum — o `[^&\s"]+` exige um caractere que não seja aspa, e ali o
+# primeiro JÁ é. É a mesma tese da fatia um nível abaixo: alargamos o lado do NOME e o lado do
+# VALOR ficou pra trás, sendo que aspas também são uma grafia que quem escreve o log não
+# escolhe. A forma crua continua parando na aspa, que é o que impede o valor de comer o
+# `HTTP/1.1"` da linha de acesso.
+#
 # `re.escape` em cada sufixo é no-op hoje (são cinco palavras minúsculas) e existe pelo dia em
 # que a lista crescer, que é o ponto inteiro dela: um `api.key` interpolado cru viraria
 # curinga e passaria a redigir `apiXkey=`, e um `secret(` levantaria `re.error` NO IMPORT de
@@ -102,7 +131,7 @@ _SUFIXOS_SENSIVEIS = ("token", "secret", "signature", "password", "key")
 _SEGREDOS_NA_URL = re.compile(
     r"(?<![^&\s\"=])([^&\s\"=]*(?:"
     + "|".join(re.escape(sufixo) for sufixo in _SUFIXOS_SENSIVEIS)
-    + r")=)[^&\s\"]+",
+    + r")=)(?:\"[^\"]*\"|[^&\s\"]+)",
     re.IGNORECASE,
 )
 

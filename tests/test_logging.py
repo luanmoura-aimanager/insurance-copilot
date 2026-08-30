@@ -29,6 +29,8 @@ from sqlalchemy import text
 # Fixtures e constantes reaproveitadas: o `/ask` com grafo falso já está montado ali, e
 # duplicá-lo aqui criaria uma segunda versão pra manter. Mesmo padrão de
 # `tests/test_whatsapp_inbox.py`, que importa de `tests/test_whatsapp.py`.
+from app.logging_config import _SUFIXOS_SENSIVEIS, _redigir
+
 from tests.test_cost_graph import (  # noqa: F401 — as fixtures entram pelo namespace
     AUTH,
     CLIENTE,
@@ -38,7 +40,6 @@ from tests.test_cost_graph import (  # noqa: F401 — as fixtures entram pelo na
     cost_rows,
     fake_graph,
 )
-from app.logging_config import _SUFIXOS_SENSIVEIS, _redigir
 from tests.test_whatsapp import TELEFONE, TEXTO, WAMID
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -517,6 +518,48 @@ def test_a_redacao_cobre_as_duas_grafias_do_verify_token(linhas_json):
     assert "hub.challenge=9" in linha["message"]
 
 
+def test_a_grafia_em_MAIUSCULA_tambem_e_redigida(linhas_json):
+    """CAIXA é mais uma grafia que quem chama escolhe e nós não.
+
+    Sem este caso, `re.IGNORECASE` podia sair do `re.compile` com a suíte inteira verde
+    (verificado) — e o parâmetro voltaria a vazar por diferença de caixa, que é a mesma falha
+    de grafia que motivou a fatia, um nível abaixo. Todas as outras decisões do padrão têm um
+    teste que fica vermelho quando somem; esta era a única sem.
+    """
+    logging.getLogger("uvicorn.access").info(
+        '127.0.0.1:1 - "GET /w?HUB_VERIFY_TOKEN=%s&hub.mode=subscribe HTTP/1.1" 200',
+        "segredo-em-caixa-alta",
+    )
+
+    (linha,) = linhas_json()
+    assert "segredo-em-caixa-alta" not in json.dumps(linha)
+    assert "HUB_VERIFY_TOKEN=<redigido>" in linha["message"]
+
+
+def test_valor_entre_aspas_duplas_tambem_e_redigido(linhas_json):
+    """A aspa dupla TERMINA o valor cru, então o literal no fonte escapava inteiro.
+
+    `format_tb` inclui a linha de fonte de cada frame, e a forma que um segredo assume ali é
+    justamente `Client(api_key="sk-...")`. Sem a alternativa `"[^"]*"` no valor, o `[^&\\s"]+`
+    exige um caractere que não seja aspa e o primeiro JÁ é — nada casava, e o comentário do
+    módulo prometia exatamente esse caso. Alargar o lado do NOME e deixar o do VALOR para trás
+    é a mesma falha de grafia, um nível abaixo.
+    """
+    # Aqui o literal FICA no fonte de propósito, ao contrário do resto do arquivo: a linha de
+    # fonte deste `raise` É o objeto sob teste, porque é ela que `format_tb` copia pro log.
+    def _explode():
+        raise RuntimeError('Client(api_key="segredo-entre-aspas")')
+
+    try:
+        _explode()
+    except RuntimeError:
+        logging.getLogger("app.main").exception("falhou")
+
+    (linha,) = linhas_json()
+    assert "segredo-entre-aspas" not in json.dumps(linha)
+    assert "api_key=<redigido>" in linha["exc_traceback"]
+
+
 def test_um_parametro_nao_sensivel_continua_visivel(linhas_json):
     """Redigir por sufixo não pode virar redigir tudo — e sufixo não é substring.
 
@@ -573,18 +616,24 @@ def test_a_redacao_nao_e_quadratica_num_path_gigante():
     O limiar é folgado nos dois sentidos de propósito — com o lookbehind a redação leva
     ~1 ms, sem ele ~4000 ms —, então isto pega a regressão sem virar teste de relógio.
     """
-    mensagem = '127.0.0.1:1 - "GET /%s HTTP/1.1" 404' % ("a" * 16384)
+    def _custo(n: int) -> float:
+        mensagem = '127.0.0.1:1 - "GET /%s HTTP/1.1" 404' % ("a" * n)
+        # `min` de várias medidas: interferência só faz uma medida ficar MAIOR, então o
+        # mínimo é o que menos depende de a máquina estar ocupada.
+        melhor = float("inf")
+        for _ in range(5):
+            inicio = time.perf_counter()
+            _redigir(mensagem)
+            melhor = min(melhor, time.perf_counter() - inicio)
+        return melhor
 
-    # Cronometra `_redigir` e NÃO a chamada de log: medir o `logging.info` inteiro somaria a
-    # construção do registro, o `json.dumps` de 16 KB e a escrita no StringIO — ruído alheio à
-    # propriedade sob teste, num assert que já é de relógio. A folga continua enorme nos dois
-    # sentidos (~1 ms passando, ~4000 ms falhando), então isto pega a regressão sem virar
-    # teste de máquina ocupada.
-    inicio = time.perf_counter()
-    _redigir(mensagem)
-    decorrido = time.perf_counter() - inicio
+    # A asserção é a FORMA da curva, não um número de relógio: dobrar a entrada dobra o custo
+    # se for linear (~2x) e quadruplica se for quadrático (~4x). Um teto absoluto em segundos
+    # falharia num runner compartilhado por CPU alheia, e a mensagem leria como regressão de
+    # verdade — o pior tipo de teste vermelho, no único gate de merge do repositório.
+    razao = _custo(32768) / _custo(16384)
 
-    assert decorrido < 0.25, f"redação levou {decorrido:.3f}s — o padrão voltou a ser quadrático"
+    assert razao < 3, f"dobrar a entrada multiplicou o custo por {razao:.1f} — padrão quadrático"
 
 
 def test_um_segredo_num_path_gigante_continua_sendo_redigido(linhas_json):
@@ -604,6 +653,7 @@ def test_um_segredo_num_path_gigante_continua_sendo_redigido(linhas_json):
     (linha,) = linhas_json()
     assert "segredo-atras-do-enchimento" not in json.dumps(linha)
     assert "hub.verify_token=<redigido>" in linha["message"]
+
 
 def test_a_cadeia_da_excecao_entra_sem_a_mensagem(linhas_json):
     """Quem CAUSOU o erro tem tipo e frames no log — e continua sem texto de exceção.
